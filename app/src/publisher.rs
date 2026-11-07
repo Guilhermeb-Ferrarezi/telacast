@@ -239,8 +239,8 @@ fn run(
                 Ok(raw) => {
                     down_since = None;
                     let frame = make_frame(raw, base, (w as u32, h as u32), &mut scaler);
-                    // prévia da minha própria tela: uma cópia a cada ~50 ms vai à thread que a reduz
-                    if last_preview.elapsed() >= Duration::from_millis(50) {
+                    // prévia da minha própria tela: uma cópia a cada ~33 ms (30 por segundo, mesmo com a transmissão a 120) vai à thread que a reduz
+                    if last_preview.elapsed() >= Duration::from_millis(33) {
                         last_preview = Instant::now();
                         let _ = ptx.try_send((frame.clone(), w, h));
                     }

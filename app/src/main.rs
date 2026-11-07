@@ -3333,7 +3333,7 @@ impl App {
                 None => self.preview_tex = Some(ctx.load_texture("my-stream-preview", img, egui::TextureOptions::LINEAR)),
             }
         }
-        ctx.request_repaint_after(Duration::from_millis(50));
+        ctx.request_repaint_after(Duration::from_millis(33));
     }
 
     /// Visão do canal de voz: grade de participantes (16:9, linha incompleta centralizada) e barra de controles.
