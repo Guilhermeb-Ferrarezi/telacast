@@ -431,7 +431,7 @@ impl Session {
         self.upload_key += 1;
         let key = self.upload_key;
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "arquivo".into());
-        self.uploads.push(files::Upload { key, channel, name, state: files::UpState::Sending });
+        self.uploads.push(files::Upload { key, channel, name, path: path.clone(), state: files::UpState::Sending });
         let (base, token, tx, ctx) = (self.http_base.clone(), self.token.clone(), self.upload_tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
             let _ = tx.send((key, files::upload(&base, &token, channel, &path)));
@@ -1163,6 +1163,86 @@ fn attachment_view(ui: &mut egui::Ui, a: &p::Attachment, base: &str, token: &str
             });
         });
     let _ = (card, acts);
+}
+
+/// Tile de anexo pendente (120x120): miniatura "cobrir" com raio 8, nome 12 px embaixo,
+/// lixeira no hover, barra âmbar enquanto envia.
+fn upload_tile(ui: &mut egui::Ui, u: &files::Upload, images: &mut files::Images, acts: &mut Vec<Act>) {
+    let ext = std::path::Path::new(&u.name).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let is_img = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp");
+    let failed = matches!(u.state, files::UpState::Failed(_));
+    let ctx = ui.ctx().clone();
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(120.0, 120.0), egui::Sense::hover());
+        let mut shown = false;
+        if is_img {
+            match images.get_local(&ctx, u.key, &u.path) {
+                files::Img::Ready(tex) => {
+                    let sz = tex.size_vec2();
+                    // "cobrir": corta o excesso do lado maior, centralizado
+                    let (kx, ky) = if sz.x > sz.y { (sz.y / sz.x, 1.0) } else { (1.0, sz.x / sz.y) };
+                    let uv = egui::Rect::from_min_max(egui::pos2((1.0 - kx) / 2.0, (1.0 - ky) / 2.0), egui::pos2((1.0 + kx) / 2.0, (1.0 + ky) / 2.0));
+                    egui::Image::new(tex).uv(uv).corner_radius(egui::CornerRadius::same(8)).paint_at(ui, rect);
+                    shown = true;
+                }
+                files::Img::Loading => ctx.request_repaint_after(Duration::from_millis(200)),
+                files::Img::Failed => {}
+            }
+        }
+        let p = ui.painter();
+        if !shown {
+            p.rect_filled(rect, 8.0, L2);
+            p.rect_stroke(rect, 8.0, egui::Stroke::new(1.0, LINE2), egui::StrokeKind::Inside);
+            let label = if ext.is_empty() { "ARQ".to_string() } else { ext.to_uppercase().chars().take(5).collect() };
+            p.text(rect.center(), Align2::CENTER_CENTER, label, egui::FontId::proportional(20.0), TEXT2);
+        }
+        match &u.state {
+            files::UpState::Sending => {
+                p.rect_filled(rect, 8.0, egui::Color32::from_black_alpha(90));
+                // sem progresso real do envio: uma barra de 3 px corre pelo pé do tile
+                let t = ctx.input(|i| i.time) as f32;
+                let f = (t * 0.8).fract();
+                let (w, x0) = (rect.width() * 0.4, rect.left() - rect.width() * 0.4 + f * rect.width() * 1.4);
+                let bar = egui::Rect::from_min_max(egui::pos2(x0.max(rect.left()), rect.bottom() - 3.0), egui::pos2((x0 + w).min(rect.right()), rect.bottom()));
+                if bar.width() > 0.0 {
+                    p.rect_filled(bar, 0.0, AMBER);
+                }
+                ctx.request_repaint_after(Duration::from_millis(33));
+            }
+            files::UpState::Failed(_) => {
+                p.rect_filled(rect, 8.0, egui::Color32::from_black_alpha(150));
+                p.rect_stroke(rect, 8.0, egui::Stroke::new(1.0, RED), egui::StrokeKind::Inside);
+                p.text(rect.center(), Align2::CENTER_CENTER, "Falhou", egui::FontId::proportional(13.0), RED);
+            }
+            files::UpState::Done(_) => {}
+        }
+        // lixeira no hover (canto superior direito)
+        let pill = egui::Rect::from_min_size(egui::pos2(rect.right() - 34.0, rect.top() + 6.0), egui::vec2(28.0, 28.0));
+        let over = resp.hovered() || ui.rect_contains_pointer(pill);
+        if over {
+            let r = ui.interact(pill, egui::Id::new(("rm-upload", u.key)), egui::Sense::click());
+            let p = ui.painter();
+            p.rect_filled(pill, 8.0, if r.hovered() { L4 } else { L3 });
+            p.rect_stroke(pill, 8.0, egui::Stroke::new(1.0, LINE2), egui::StrokeKind::Inside);
+            let (c, st) = (pill.center(), egui::Stroke::new(1.5, RED));
+            p.line_segment([c + egui::vec2(-6.0, -4.0), c + egui::vec2(6.0, -4.0)], st);
+            p.line_segment([c + egui::vec2(-2.0, -6.5), c + egui::vec2(2.0, -6.5)], st);
+            p.rect_stroke(egui::Rect::from_min_max(c + egui::vec2(-4.5, -3.0), c + egui::vec2(4.5, 6.5)), 1.5, st, egui::StrokeKind::Inside);
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if r.clicked() {
+                acts.push(Act::RemoveUpload(u.key));
+            }
+        }
+        let cap: String = if u.name.chars().count() > 17 { format!("{}…", u.name.chars().take(16).collect::<String>()) } else { u.name.clone() };
+        let tip = match &u.state {
+            files::UpState::Failed(e) => format!("{}\n{e}", u.name),
+            _ => u.name.clone(),
+        };
+        ui.add_sized([120.0, 14.0], egui::Label::new(RichText::new(cap).size(12.0).color(if failed { RED } else { MUTED })).truncate()).on_hover_text(tip);
+    });
 }
 
 fn is_pending_or_own_echo(m: &p::Message, me: i64) -> bool {
@@ -2275,7 +2355,7 @@ impl App {
         let blocked_ids: HashSet<i64> = s.snap.blocked.iter().map(|u| u.id).collect();
         let replying_here = matches!(&s.replying, Some((c, _)) if *c == ch);
         let uploads_here = s.uploads.iter().any(|u| u.channel == ch);
-        let input_h = 82.0 + 22.0 + if replying_here { 38.0 } else { 0.0 } + if uploads_here { 50.0 } else { 0.0 };
+        let input_h = 82.0 + 22.0 + if replying_here { 38.0 } else { 0.0 } + if uploads_here { 172.0 } else { 0.0 };
         let h = (ui.available_height() - input_h).max(60.0);
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         // Esc dispensa o divisor "novas mensagens" (o canal já foi marcado como lido ao abrir)
@@ -2661,49 +2741,6 @@ impl App {
             }
         }
 
-        // arquivos a enviar junto com a mensagem
-        if s.uploads.iter().any(|u| u.channel == ch) {
-            egui::Frame::new()
-                .fill(L2)
-                .corner_radius(egui::CornerRadius::same(10))
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
-                        for u in s.uploads.iter().filter(|u| u.channel == ch) {
-                            egui::Frame::new()
-                                .fill(L3)
-                                .stroke(egui::Stroke::new(1.0, if matches!(u.state, files::UpState::Failed(_)) { RED } else { LINE2 }))
-                                .corner_radius(egui::CornerRadius::same(8))
-                                .inner_margin(egui::Margin::symmetric(10, 5))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let shown: String = if u.name.chars().count() > 28 { format!("{}…", u.name.chars().take(27).collect::<String>()) } else { u.name.clone() };
-                                        ui.label(RichText::new(shown).color(TEXT));
-                                        match &u.state {
-                                            files::UpState::Sending => {
-                                                ui.label(RichText::new("enviando…").size(12.0).color(MUTED));
-                                                ui.ctx().request_repaint_after(Duration::from_millis(400));
-                                            }
-                                            files::UpState::Done(a) => {
-                                                ui.label(RichText::new(files::human_size(a.size)).size(12.0).color(MUTED));
-                                            }
-                                            files::UpState::Failed(e) => {
-                                                ui.label(RichText::new(e).size(12.0).color(RED));
-                                            }
-                                        }
-                                        if small_button(ui, "✕", FIELD) {
-                                            acts.push(Act::RemoveUpload(u.key));
-                                        }
-                                    });
-                                });
-                        }
-                    });
-                });
-            ui.add_space(4.0);
-        }
-
         // entrada
         let input_id = egui::Id::new(("compose", ch));
         let focused = ctx.memory(|mem| mem.has_focus(input_id));
@@ -2714,6 +2751,23 @@ impl App {
             .inner_margin(egui::Margin { left: 10, right: 8, top: 8, bottom: 8 })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                // bandeja de anexos pendentes: no topo da caixa, miniaturas 120x120
+                if s.uploads.iter().any(|u| u.channel == ch) {
+                    ui.add_space(4.0);
+                    egui::ScrollArea::horizontal().id_salt(("tray", ch)).auto_shrink([false, true]).show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                            for u in s.uploads.iter().filter(|u| u.channel == ch) {
+                                upload_tile(ui, u, &mut s.images, acts);
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    let y = ui.cursor().top();
+                    let x = ui.max_rect().x_range();
+                    ui.painter().hline(egui::Rangef::new(x.min - 10.0, x.max + 8.0), y, egui::Stroke::new(1.0, LINE2));
+                    ui.add_space(9.0);
+                }
                 ui.horizontal(|ui| {
                     // "+" anexa um arquivo (também dá para arrastar e soltar na janela)
                     let (pr, presp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());

@@ -102,6 +102,7 @@ pub struct Upload {
     pub key: u64,
     pub channel: i64,
     pub name: String,
+    pub path: std::path::PathBuf,
     pub state: UpState,
 }
 
@@ -155,13 +156,26 @@ impl Images {
         self.load(-a.id, ctx, url(base, a, token), (4096, 4096))
     }
 
+    /// Miniatura de um arquivo local (bandeja de anexos pendentes). Chave própria por envio.
+    pub fn get_local(&mut self, ctx: &egui::Context, upload_key: u64, path: &std::path::Path) -> &Img {
+        let path = path.to_path_buf();
+        self.load_with(-(1 << 60) - upload_key as i64, ctx, move || {
+            let bytes = std::fs::read(&path).ok()?;
+            decode(&bytes, (480, 480))
+        })
+    }
+
     fn load(&mut self, key: i64, ctx: &egui::Context, u: String, lim: (u32, u32)) -> &Img {
+        self.load_with(key, ctx, move || fetch_image(&u, lim))
+    }
+
+    fn load_with(&mut self, key: i64, ctx: &egui::Context, f: impl FnOnce() -> Option<egui::ColorImage> + Send + 'static) -> &Img {
         if !self.map.contains_key(&key) && self.inflight < MAX_INFLIGHT {
             self.map.insert(key, Img::Loading);
             self.inflight += 1;
             let (tx, ctx2) = (self.tx.clone(), ctx.clone());
             std::thread::spawn(move || {
-                let _ = tx.send((key, fetch_image(&u, lim)));
+                let _ = tx.send((key, f()));
                 ctx2.request_repaint();
             });
         }
@@ -173,7 +187,11 @@ fn fetch_image(url: &str, lim: (u32, u32)) -> Option<egui::ColorImage> {
     let resp = agent().get(url).call().ok()?;
     let mut bytes = Vec::new();
     resp.into_reader().take(MAX_DOWNLOAD).read_to_end(&mut bytes).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?;
+    decode(&bytes, lim)
+}
+
+fn decode(bytes: &[u8], lim: (u32, u32)) -> Option<egui::ColorImage> {
+    let img = image::load_from_memory(bytes).ok()?;
     // miniatura do chat: mostra no máximo 400x300, guardamos 1200x900 para telas densas
     let img = if img.width() > lim.0 || img.height() > lim.1 { img.thumbnail(lim.0, lim.1) } else { img };
     let rgba = img.to_rgba8();
