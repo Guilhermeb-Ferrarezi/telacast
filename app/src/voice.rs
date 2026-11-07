@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SampleRate, SizedSample, Stream, StreamConfig};
+use nnnoiseless::DenoiseState;
 use opus::{Application, Bitrate, Channels, Decoder, Encoder, Signal};
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -51,6 +52,8 @@ const PLAYBACK_AHEAD_MS: usize = 40;
 const RING_SAMPLES: usize = 96_000;
 /// Pré-rolagem: quadros guardados antes de o VAD abrir, para não cortar o começo da fala.
 const PREROLL_FRAMES: usize = 2;
+/// Quadro do RNNoise (10 ms a 48 kHz); o quadro Opus de 20 ms leva dois.
+const DEN_FRAME: usize = DenoiseState::FRAME_SIZE;
 
 // ───────────────────────────── utilidades ─────────────────────────────
 
@@ -196,6 +199,9 @@ impl Vad {
     const MARGEM_ABRE: f32 = 9.0;
     const MARGEM_FECHA: f32 = 4.0;
     pub const PADRAO_DB: f32 = -42.0;
+    /// Probabilidade de voz mínima do RNNoise para abrir / para manter aberto.
+    pub const PROB_ABRE: f32 = 0.5;
+    pub const PROB_FECHA: f32 = 0.3;
 
     pub fn new(open_db: f32) -> Vad {
         Vad { open_db: open_db.clamp(-80.0, -10.0), piso: -60.0, aberto: false, resto: 0 }
@@ -224,20 +230,28 @@ impl Vad {
         self.process_db(rms_db(quadro))
     }
 
-    /// Mesma coisa a partir do nível já calculado (dBFS).
+    /// Mesma coisa a partir do nível já calculado (dBFS), só por energia.
     pub fn process_db(&mut self, db: f32) -> bool {
+        self.process_db_prob(db, None)
+    }
+
+    /// Energia (dBFS) mais, se houver, a probabilidade de voz do RNNoise (0.0..=1.0): para abrir exige
+    /// também `prob >= PROB_ABRE` e, aberto, só renova o hangover com `prob >= PROB_FECHA` (histerese).
+    pub fn process_db_prob(&mut self, db: f32, prob: Option<f32>) -> bool {
         let db = if db.is_finite() { db } else { -120.0 };
+        let ok_abre = prob.map_or(true, |p| p >= Self::PROB_ABRE);
+        let ok_fecha = prob.map_or(true, |p| p >= Self::PROB_FECHA);
         let abre = self.open_db.max(self.piso + Self::MARGEM_ABRE);
         let fecha = (self.open_db - Self::HISTERESE_DB).max(self.piso + Self::MARGEM_FECHA);
         if !self.aberto {
-            if db >= abre {
+            if db >= abre && ok_abre {
                 self.aberto = true;
                 self.resto = Self::HANGOVER_QUADROS;
             } else {
                 let k = if db < self.piso { 0.25 } else { 0.005 };
                 self.piso = (self.piso + (db - self.piso) * k).clamp(-90.0, -35.0);
             }
-        } else if db >= fecha {
+        } else if db >= fecha && ok_fecha {
             self.resto = Self::HANGOVER_QUADROS;
         } else if self.resto > 0 {
             self.resto -= 1;
@@ -620,6 +634,15 @@ pub struct SendPipeline {
     out: [u8; MAX_PACKET],
     level: f32,
     speaking: bool,
+    /// Supressão de ruído (RNNoise) ligada.
+    den_on: bool,
+    den_ativo: bool, // o denoiser rodou no quadro anterior (para o crossfade ao alternar)
+    den: Box<DenoiseState<'static>>,
+    prob: f32,
+    processou: bool,
+    den_buf: Vec<f32>,
+    den_in: [f32; DEN_FRAME],
+    den_out: [f32; DEN_FRAME],
 }
 
 impl SendPipeline {
@@ -650,7 +673,54 @@ impl SendPipeline {
             out: [0; MAX_PACKET],
             level: 0.0,
             speaking: false,
+            den_on: true,
+            den_ativo: true, // começa ligado: sem crossfade com o sinal cru no primeiro quadro
+            prob: 0.0,
+            processou: false,
+            den: DenoiseState::new(),
+            den_buf: vec![0.0; FRAME],
+            den_in: [0.0; DEN_FRAME],
+            den_out: [0.0; DEN_FRAME],
         })
+    }
+
+    /// Liga/desliga a supressão de ruído. Ao ligar o estado do RNNoise é reiniciado; a troca é
+    /// suavizada com um crossfade de um quadro, então não estala.
+    pub fn set_noise_suppression(&mut self, ligado: bool) {
+        if ligado && !self.den_on {
+            self.den = DenoiseState::new();
+        }
+        self.den_on = ligado;
+        if !self.processou {
+            self.den_ativo = ligado; // nada tocado ainda: não há o que suavizar
+        }
+    }
+
+    pub fn noise_suppression(&self) -> bool {
+        self.den_on
+    }
+
+    /// Áudio já processado (ganho + supressão) do último quadro, o que foi para o VAD e o Opus.
+    pub fn last_frame(&self) -> &[f32] {
+        &self.buf
+    }
+
+    /// Roda o RNNoise (2 × 480) sobre `self.buf` e deixa o resultado em `self.den_buf`; devolve a
+    /// probabilidade de voz (média das duas metades).
+    fn denoise(&mut self) -> f32 {
+        let mut prob = 0.0f32;
+        for h in 0..2 {
+            let ini = h * DEN_FRAME;
+            for (d, s) in self.den_in.iter_mut().zip(&self.buf[ini..ini + DEN_FRAME]) {
+                *d = s * 32768.0;
+            }
+            let p = self.den.process_frame(&mut self.den_out, &self.den_in);
+            prob += if p.is_finite() { p } else { 0.0 };
+            for (d, s) in self.den_buf[ini..ini + DEN_FRAME].iter_mut().zip(&self.den_out) {
+                *d = (s / 32768.0).clamp(-1.0, 1.0);
+            }
+        }
+        prob / 2.0
     }
 
     /// Nível para o medidor (0.0..=1.0) do último quadro.
@@ -670,6 +740,16 @@ impl SendPipeline {
         self.preroll.clear();
         self.level = 0.0;
         self.speaking = false;
+        if self.den_on {
+            self.den = DenoiseState::new();
+        }
+        self.den_ativo = self.den_on;
+        self.prob = 0.0;
+    }
+
+    /// Probabilidade de voz do RNNoise no último quadro (0 com a supressão desligada).
+    pub fn voice_prob(&self) -> f32 {
+        self.prob
     }
 
     /// Processa um quadro de `FRAME` amostras mono a 48 kHz; chama `send(seq, pacote)` se for o caso.
@@ -681,10 +761,38 @@ impl SendPipeline {
         for (d, s) in self.buf.iter_mut().zip(quadro) {
             *d = (s * g).clamp(-1.0, 1.0);
         }
+        // Supressão de ruído (depois do ganho, antes do VAD e do Opus). Ao alternar, crossfade linear
+        // de um quadro entre o sinal cru e o limpo.
+        let mut prob = None;
+        if self.den_on || self.den_ativo {
+            let p = self.denoise();
+            let n = FRAME as f32;
+            match (self.den_on, self.den_ativo) {
+                (true, true) => self.buf.copy_from_slice(&self.den_buf),
+                (true, false) => {
+                    for (i, (b, d)) in self.buf.iter_mut().zip(&self.den_buf).enumerate() {
+                        let t = (i + 1) as f32 / n;
+                        *b = *b * (1.0 - t) + d * t;
+                    }
+                }
+                (false, _) => {
+                    for (i, (b, d)) in self.buf.iter_mut().zip(&self.den_buf).enumerate() {
+                        let t = (i + 1) as f32 / n;
+                        *b = d * (1.0 - t) + *b * t;
+                    }
+                }
+            }
+            if self.den_on {
+                prob = Some(p);
+            }
+            self.prob = if self.den_on { p } else { 0.0 };
+        }
+        self.den_ativo = self.den_on;
+        self.processou = true;
         let db = rms_db(&self.buf);
         self.level = self.meter.update(db);
         let estava = self.vad.is_open();
-        let aberto = self.vad.process_db(db);
+        let aberto = self.vad.process_db_prob(db, prob);
         self.speaking = aberto;
 
         // O codificador roda em todo quadro (estado sempre aquecido, sem estalo no começo da fala).
@@ -723,6 +831,8 @@ struct Shared {
     nivel: AtomicU32,
     falando: AtomicBool,
     pendentes: AtomicUsize,
+    ruido: AtomicBool,
+    monitor: AtomicBool,
     subfluxos: AtomicU32,
     erro: Mutex<Option<String>>,
     ouvidos: Mutex<HashMap<i64, Instant>>,
@@ -739,6 +849,8 @@ impl Shared {
             nivel: AtomicU32::new(0),
             falando: AtomicBool::new(false),
             pendentes: AtomicUsize::new(0),
+            ruido: AtomicBool::new(true),
+            monitor: AtomicBool::new(false),
             subfluxos: AtomicU32::new(0),
             erro: Mutex::new(None),
             ouvidos: Mutex::new(HashMap::new()),
@@ -766,13 +878,38 @@ enum Cmd {
 
 // ───────────────────────────── threads de processamento ─────────────────────────────
 
+/// "Ouvir meu microfone": decodifica localmente o mesmo pacote que vai para a rede e entrega o PCM à thread
+/// do mixer (o usuário ouve exatamente o que os outros ouvem, com o mesmo VAD/hangover/pré-rolagem).
+struct Monitor {
+    dec: Decoder,
+    prod: Producer<f32>,
+    buf: Vec<f32>,
+}
+
+impl Monitor {
+    fn new(prod: Producer<f32>) -> Option<Monitor> {
+        let dec = Decoder::new(SAMPLE_RATE, Channels::Mono).ok()?;
+        Some(Monitor { dec, prod, buf: vec![0.0; FRAME] })
+    }
+
+    fn feed(&mut self, pacote: &[u8]) {
+        if let Ok(n) = self.dec.decode_float(pacote, &mut self.buf, false) {
+            let n = n.min(FRAME);
+            let _ = self.prod.push_partial_slice(&self.buf[..n]);
+        }
+    }
+}
+
 /// Thread do codificador: lê a fila de captura, reamostra para 48 kHz e alimenta o [`SendPipeline`].
 fn loop_captura(
     sh: Arc<Shared>,
     mut cons: Consumer<f32>,
     taxa: u32,
     mut send: Box<dyn FnMut(u32, &[u8]) + Send>,
+    mon_prod: Producer<f32>,
 ) {
+    let mut monitor = Monitor::new(mon_prod);
+    let mut monitor_antes = false;
     let mut pipe = match SendPipeline::new() {
         Ok(p) => p,
         Err(e) => {
@@ -784,6 +921,7 @@ fn loop_captura(
     let mut cru: Vec<f32> = Vec::with_capacity(8192);
     let mut a48: Vec<f32> = Vec::with_capacity(8192);
     let mut mudo_antes = false;
+    let mut ruido_antes = true;
     while !sh.parar.load(Relaxed) {
         let n = cons.slots();
         if n == 0 {
@@ -812,9 +950,30 @@ fn loop_captura(
         rs.process(&cru, &mut a48);
         pipe.gain = f32_from_bits(&sh.ganho);
         pipe.vad.set_open_db(f32_from_bits(&sh.vad_db));
+        let ruido = sh.ruido.load(Relaxed);
+        if ruido != ruido_antes {
+            ruido_antes = ruido;
+            pipe.set_noise_suppression(ruido);
+        }
+        // Monitor: só enquanto ligado e sem surdez; ao ligar começa com o decodificador limpo.
+        let mon_ligado = sh.monitor.load(Relaxed) && !sh.surdo.load(Relaxed);
+        if mon_ligado && !monitor_antes {
+            if let Some(m) = monitor.as_mut() {
+                let _ = m.dec.reset_state();
+            }
+        }
+        monitor_antes = mon_ligado;
+        let mut enviar = |seq: u32, pacote: &[u8]| {
+            send(seq, pacote);
+            if mon_ligado {
+                if let Some(m) = monitor.as_mut() {
+                    m.feed(pacote);
+                }
+            }
+        };
         let mut usados = 0;
         while a48.len() - usados >= FRAME {
-            pipe.process(&a48[usados..usados + FRAME], &mut *send);
+            pipe.process(&a48[usados..usados + FRAME], &mut enviar);
             usados += FRAME;
         }
         a48.drain(..usados);
@@ -824,7 +983,13 @@ fn loop_captura(
 }
 
 /// Thread do decodificador/mixer: mantém a fila de reprodução cheia (~40 ms à frente do dispositivo).
-fn loop_reproducao(sh: Arc<Shared>, rx: Receiver<Msg>, mut prod: Producer<f32>, taxa: u32) {
+fn loop_reproducao(
+    sh: Arc<Shared>,
+    rx: Receiver<Msg>,
+    mut prod: Producer<f32>,
+    taxa: u32,
+    mut mon_cons: Consumer<f32>,
+) {
     let mut usuarios: HashMap<i64, UserStream> = HashMap::new();
     let mut volumes: HashMap<i64, f32> = HashMap::new();
     let mut mixer = Mixer::new(FRAME);
@@ -834,6 +999,7 @@ fn loop_reproducao(sh: Arc<Shared>, rx: Receiver<Msg>, mut prod: Producer<f32>, 
     let capacidade = prod.buffer().capacity();
     let alvo = (taxa as usize * PLAYBACK_AHEAD_MS / 1000).max(1);
     let mut ultima_limpeza = Instant::now();
+    let mut mon_tocando = false;
 
     while !sh.parar.load(Relaxed) {
         // mensagens da rede/UI
@@ -873,7 +1039,18 @@ fn loop_reproducao(sh: Arc<Shared>, rx: Receiver<Msg>, mut prod: Producer<f32>, 
             }
         }
 
-        if sh.surdo.load(Relaxed) {
+        let surdo = sh.surdo.load(Relaxed);
+        let monitor = sh.monitor.load(Relaxed) && !surdo;
+        if !monitor {
+            // monitor desligado (ou surdo): descarta o que sobrou na fila para não tocar áudio velho
+            let n = mon_cons.slots();
+            if n > 0 {
+                if let Ok(c) = mon_cons.read_chunk(n) {
+                    c.commit_all();
+                }
+            }
+        }
+        if surdo {
             if !usuarios.is_empty() {
                 usuarios.clear();
             }
@@ -899,12 +1076,36 @@ fn loop_reproducao(sh: Arc<Shared>, rx: Receiver<Msg>, mut prod: Producer<f32>, 
 
         // enche a fila de reprodução
         let mut voltas = 0;
-        while !usuarios.is_empty() && capacidade.saturating_sub(prod.slots()) < alvo && voltas < 16 {
+        // atraso do monitor limitado a ~60 ms: se acumulou, descarta os quadros mais antigos
+        while mon_cons.slots() >= 3 * FRAME {
+            if let Ok(c) = mon_cons.read_chunk(FRAME) {
+                c.commit_all();
+            }
+        }
+        while capacidade.saturating_sub(prod.slots()) < alvo && voltas < 16 {
+            // O monitor é um fluxo contínuo de quadros de 20 ms: começa a tocar com 2 quadros guardados
+            // (absorve a diferença de fase entre o relógio do microfone e o da saída) e, se faltar quadro,
+            // volta a esperar em vez de intercalar silêncio.
+            let disponivel = mon_cons.slots();
+            let mon_quadro = monitor && disponivel >= if mon_tocando { FRAME } else { 2 * FRAME };
+            mon_tocando = mon_quadro;
+            if usuarios.is_empty() && !mon_quadro {
+                break;
+            }
             voltas += 1;
             mixer.begin();
             for (id, u) in usuarios.iter_mut() {
                 if u.render(&mut tmp) {
                     mixer.add(&tmp, volumes.get(id).copied().unwrap_or(1.0));
+                }
+            }
+            if mon_quadro {
+                if let Ok(c) = mon_cons.read_chunk(FRAME) {
+                    let (a, b) = c.as_slices();
+                    tmp[..a.len()].copy_from_slice(a);
+                    tmp[a.len()..a.len() + b.len()].copy_from_slice(b);
+                    c.commit_all();
+                    mixer.add(&tmp, 1.0);
                 }
             }
             let quadro = mixer.finish();
@@ -1281,6 +1482,7 @@ impl Engine {
         send: Box<dyn FnMut(u32, &[u8]) + Send>,
     ) -> Result<Engine, String> {
         let (tx, rx) = mpsc::channel();
+        let (mon_prod, mon_cons) = RingBuffer::<f32>::new(FRAME * 8);
         let mut threads = Vec::new();
         let mut falha = |e: std::io::Error| format!("Não foi possível iniciar a thread de áudio: {e}");
 
@@ -1289,7 +1491,7 @@ impl Engine {
             threads.push(
                 thread::Builder::new()
                     .name("telacast-audio-codificador".into())
-                    .spawn(move || loop_captura(s, cons, taxa, send))
+                    .spawn(move || loop_captura(s, cons, taxa, send, mon_prod))
                     .map_err(&mut falha)?,
             );
         }
@@ -1298,7 +1500,7 @@ impl Engine {
         threads.push(
             thread::Builder::new()
                 .name("telacast-audio-mixer".into())
-                .spawn(move || loop_reproducao(s, rx, prod, taxa))
+                .spawn(move || loop_reproducao(s, rx, prod, taxa, mon_cons))
                 .map_err(&mut falha)?,
         );
         Ok(Engine { sh, tx, cmd: None, threads })
@@ -1326,6 +1528,25 @@ impl Engine {
     pub fn set_user_volume(&self, user: i64, volume: f32) {
         let v = if volume.is_finite() { volume.clamp(0.0, 2.0) } else { 1.0 };
         let _ = self.tx.send(Msg::Volume(user, v));
+    }
+
+    /// Supressão de ruído (RNNoise) no microfone. Padrão: ligada. Pode alternar com a chamada em curso.
+    pub fn set_noise_suppression(&self, on: bool) {
+        self.sh.ruido.store(on, Relaxed);
+    }
+
+    pub fn noise_suppression(&self) -> bool {
+        self.sh.ruido.load(Relaxed)
+    }
+
+    /// "Ouvir meu microfone": toca localmente exatamente o que está sendo enviado (já com ganho e supressão,
+    /// só com o VAD aberto). Padrão: desligado. Mudo não toca; surdo não toca nada.
+    pub fn set_monitor(&self, on: bool) {
+        self.sh.monitor.store(on, Relaxed);
+    }
+
+    pub fn monitoring(&self) -> bool {
+        self.sh.monitor.load(Relaxed)
     }
 
     /// Ganho do microfone (linear, 0.0..=4.0; 1.0 = sem mudança). Extra em relação ao VOICE.md.
@@ -1467,6 +1688,7 @@ mod tests {
     #[test]
     fn opus_ida_e_volta_de_um_seno() {
         let mut p = SendPipeline::new().unwrap();
+        p.set_noise_suppression(false);
         let mut u = UserStream::new().unwrap();
         let mut pacotes = Vec::new();
         let tom = seno(440.0, 48000.0, 0.5, FRAME * 30, 0);
@@ -1496,6 +1718,7 @@ mod tests {
     #[test]
     fn opus_perda_usa_plc_sem_explodir() {
         let mut p = SendPipeline::new().unwrap();
+        p.set_noise_suppression(false);
         let mut u = UserStream::new().unwrap();
         let mut pacotes = Vec::new();
         for q in seno(300.0, 48000.0, 0.4, FRAME * 40, 0).chunks(FRAME) {
@@ -1896,6 +2119,7 @@ mod tests {
     #[test]
     fn envio_so_manda_com_vad_aberto_e_seq_contiguo() {
         let mut p = SendPipeline::new().unwrap();
+        p.set_noise_suppression(false);
         let mut pacotes: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut env = |pacotes: &mut Vec<(u32, Vec<u8>)>, q: &[f32]| {
             p.process(q, &mut |s, d| pacotes.push((s, d.to_vec())));
@@ -1925,6 +2149,7 @@ mod tests {
     #[test]
     fn envio_ganho_zero_cala_e_nivel_reflete() {
         let mut p = SendPipeline::new().unwrap();
+        p.set_noise_suppression(false);
         p.gain = 0.0;
         let mut n = 0;
         for q in seno(250.0, 48000.0, 0.3, FRAME * 10, 0).chunks(FRAME) {
@@ -1944,6 +2169,7 @@ mod tests {
         // dois falantes (440 Hz e 880 Hz) mandam 1 s de fala
         let gera = |freq: f32| {
             let mut p = SendPipeline::new().unwrap();
+            p.set_noise_suppression(false);
             let mut pacotes = Vec::new();
             for q in seno(freq, 48000.0, 0.4, FRAME * 50, 0).chunks(FRAME) {
                 p.process(q, &mut |s, d| pacotes.push((s, d.to_vec())));
@@ -2006,6 +2232,7 @@ mod tests {
             let _ = pk_tx.send((s, d.to_vec()));
         });
         let eng = Engine::liga_threads(sh, Some((cap_cons, 44100)), (play_prod, 44100), send).unwrap();
+        eng.set_noise_suppression(false); // tom puro seria tratado como ruído
         eng.set_user_volume(7, 1.0);
 
         // 1,2 s de microfone a 44,1 kHz em tempo real (10 ms por vez), loopback dos pacotes como usuário 7
@@ -2088,6 +2315,316 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
     }
 
+    // ── supressão de ruído ──
+
+    /// Ruído branco determinístico (LCG), amplitude de pico `amp`.
+    fn ruido_branco(amp: f32, n: usize, semente: u32) -> Vec<f32> {
+        let mut x = semente;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((x >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * amp
+            })
+            .collect()
+    }
+
+    /// "Fala" sintética: pitch de 120 Hz com harmônicos sob envelope de formantes, modulada a 4 Hz.
+    fn fala_sintetica(n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / 48000.0;
+                let mut v = 0.0;
+                for h in 1..40 {
+                    let f = 120.0 * h as f32;
+                    let env = (-((f - 700.0) / 400.0).powi(2)).exp() + 0.6 * (-((f - 1800.0) / 600.0).powi(2)).exp();
+                    v += env / h as f32 * (2.0 * PI * f * t).sin();
+                }
+                let sil = 0.5 + 0.5 * (2.0 * PI * 4.0 * t).sin().abs();
+                v * 0.25 * sil
+            })
+            .collect()
+    }
+
+    /// Passa o sinal pelo pipeline e devolve o áudio processado e a probabilidade/estado do último quadro.
+    fn processa(p: &mut SendPipeline, x: &[f32]) -> Vec<f32> {
+        let mut o = Vec::new();
+        for q in x.chunks_exact(FRAME) {
+            p.process(q, &mut |_, _| {});
+            o.extend_from_slice(p.last_frame());
+        }
+        o
+    }
+
+    /// Ruído "rosa" simples (passa-baixa de 1 polo sobre ruído branco), mais parecido com ruído de ambiente.
+    fn ruido_rosa(amp: f32, n: usize, semente: u32) -> Vec<f32> {
+        let mut y = 0.0f32;
+        ruido_branco(amp, n, semente)
+            .into_iter()
+            .map(|v| {
+                y = 0.95 * y + v;
+                y
+            })
+            .collect()
+    }
+
+    fn passo_max(x: &[f32]) -> f32 {
+        x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn denoiser_reduz_ruido_e_preserva_voz() {
+        let n = FRAME * 300;
+        // ruído branco (pico 0.03) e rosa (rms ~0.18): bem menos energia depois de estabilizar (~4 s)
+        for (nome, x) in [("branco", ruido_branco(0.03, n, 2)), ("rosa", ruido_rosa(0.1, n, 5))] {
+            let mut p = SendPipeline::new().unwrap();
+            let o = processa(&mut p, &x);
+            let (ent, sai) = (rms(&x[FRAME * 200..]), rms(&o[FRAME * 200..]));
+            assert!(sai < ent * 0.3, "{nome}: {ent} → {sai} (queda menor que 10 dB)");
+            assert!(o.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+        }
+        // sinais "de voz" (tom puro e fala sintética harmônica) passam quase intactos
+        for (nome, x) in [("tom", seno(1000.0, 48000.0, 0.3, n, 0)), ("fala", fala_sintetica(n))] {
+            let mut p = SendPipeline::new().unwrap();
+            let o = processa(&mut p, &x);
+            let (ent, sai) = (rms(&x[FRAME * 50..]), rms(&o[FRAME * 50..]));
+            assert!(sai > ent * 0.7, "{nome} não pode ser engolido: {ent} → {sai}");
+        }
+    }
+
+    #[test]
+    fn denoiser_desligado_nao_mexe_no_sinal() {
+        let x = seno(500.0, 48000.0, 0.3, FRAME * 10, 0);
+        let mut p = SendPipeline::new().unwrap();
+        p.set_noise_suppression(false);
+        assert!(!p.noise_suppression());
+        let o = processa(&mut p, &x);
+        assert_eq!(o, x);
+    }
+
+    #[test]
+    fn denoiser_alternar_nao_gera_nan_nem_salto() {
+        let n = FRAME * 120;
+        let voz = fala_sintetica(n);
+        let amb = ruido_rosa(0.02, n, 9);
+        let x: Vec<f32> = voz.iter().zip(&amb).map(|(a, b)| a + b).collect();
+        // referência: o maior passo entre amostras vizinhas com cada modo fixo
+        let mut base = 0f32;
+        for ligado in [true, false] {
+            let mut p = SendPipeline::new().unwrap();
+            p.set_noise_suppression(ligado);
+            base = base.max(passo_max(&processa(&mut p, &x)[FRAME * 5..]));
+        }
+        // alternando a cada 3 quadros
+        let mut p = SendPipeline::new().unwrap();
+        let mut o = Vec::new();
+        for (k, q) in x.chunks_exact(FRAME).enumerate() {
+            p.set_noise_suppression((k / 3) % 2 == 0);
+            p.process(q, &mut |_, _| {});
+            o.extend_from_slice(p.last_frame());
+        }
+        assert!(o.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+        let alt = passo_max(&o[FRAME * 5..]);
+        assert!(alt <= base * 2.0 + 0.02, "salto ao alternar: {alt} (referência {base})");
+    }
+
+    #[test]
+    fn vad_com_probabilidade_de_voz() {
+        let mut v = Vad::new(-42.0);
+        // energia alta mas probabilidade baixa (ruído forte): não abre
+        for _ in 0..10 {
+            assert!(!v.process_db_prob(-20.0, Some(0.1)));
+        }
+        assert!(v.process_db_prob(-20.0, Some(0.9)), "voz de verdade abre");
+        // histerese: entre PROB_FECHA e PROB_ABRE mantém aberto
+        for _ in 0..30 {
+            assert!(v.process_db_prob(-20.0, Some(0.35)));
+        }
+        // probabilidade abaixo de PROB_FECHA deixa o hangover correr e fecha
+        for _ in 0..Vad::HANGOVER_QUADROS {
+            assert!(v.process_db_prob(-20.0, Some(0.05)));
+        }
+        assert!(!v.process_db_prob(-20.0, Some(0.05)));
+        // sem probabilidade (denoiser desligado) é só energia, como antes
+        assert!(v.process_db_prob(-20.0, None));
+    }
+
+    #[test]
+    fn denoiser_segura_ruido_forte_que_o_vad_por_energia_abriria() {
+        let ruido = ruido_rosa(0.1, FRAME * 300, 11); // rms ≈ -15 dBFS
+        // pacotes enviados nos últimos 100 quadros (depois de o RNNoise se adaptar)
+        let conta = |ligado: bool| {
+            let mut p = SendPipeline::new().unwrap();
+            p.set_noise_suppression(ligado);
+            let mut n = 0;
+            for (k, q) in ruido.chunks_exact(FRAME).enumerate() {
+                p.process(q, &mut |_, _| n += (k >= 200) as usize);
+            }
+            n
+        };
+        assert!(conta(false) >= 99, "sem supressão o ruído alto abre o VAD");
+        assert!(conta(true) < 30, "com supressão o VAD quase não abre: {}", conta(true));
+        // e a fala sintética continua passando
+        let fala = fala_sintetica(FRAME * 80);
+        let mut p = SendPipeline::new().unwrap();
+        let mut n = 0;
+        for q in fala.chunks_exact(FRAME) {
+            p.process(q, &mut |_, _| n += 1);
+        }
+        assert!(n > 40, "fala bloqueada pelo VAD+RNNoise: {n}");
+    }
+
+    // ── monitor ("ouvir meu microfone") ──
+
+    struct Banco {
+        eng: Engine,
+        cap: Producer<f32>,
+        play: Consumer<f32>,
+        pacotes: Receiver<(u32, Vec<u8>)>,
+    }
+
+    fn banco() -> Banco {
+        let sh = Arc::new(Shared::new());
+        let (cap, cap_cons) = RingBuffer::<f32>::new(RING_SAMPLES);
+        let (play_prod, play) = RingBuffer::<f32>::new(RING_SAMPLES);
+        let (tx, pacotes) = mpsc::channel::<(u32, Vec<u8>)>();
+        let send = Box::new(move |s: u32, d: &[u8]| {
+            let _ = tx.send((s, d.to_vec()));
+        });
+        let eng = Engine::liga_threads(sh, Some((cap_cons, 48000)), (play_prod, 48000), send).unwrap();
+        eng.set_noise_suppression(false);
+        Banco { eng, cap, play, pacotes }
+    }
+
+    impl Banco {
+        /// Alimenta o "microfone" em tempo real (10 ms por vez) e consome a saída como um dispositivo faria.
+        fn roda(&mut self, x: &[f32], saida: &mut Vec<f32>) {
+            for b in x.chunks(480) {
+                let _ = self.cap.push_partial_slice(b);
+                thread::sleep(Duration::from_millis(10));
+                for _ in 0..480 {
+                    saida.push(self.play.pop().unwrap_or(0.0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn monitor_devolve_exatamente_o_que_foi_enviado() {
+        let mut b = banco();
+        assert!(!b.eng.monitoring() && b.eng.noise_suppression() == false);
+        b.eng.set_monitor(true);
+        assert!(b.eng.monitoring());
+        let mut saida = Vec::new();
+        // 0,3 s de silêncio: VAD fechado, nada enviado e nada tocado
+        b.roda(&vec![0.0; 14400], &mut saida);
+        assert!(b.pacotes.try_recv().is_err());
+        assert!(saida.iter().all(|v| v.abs() < 1e-9), "monitor com VAD fechado deve ficar mudo");
+        // 1 s de tom
+        let tom = seno(600.0, 48000.0, 0.3, 48000, 0);
+        b.roda(&tom, &mut saida);
+        b.roda(&vec![0.0; 9600], &mut saida);
+        let enviados: Vec<Vec<u8>> = b.pacotes.try_iter().map(|(_, d)| d).collect();
+        assert!(enviados.len() > 40, "enviou {}", enviados.len());
+        // o mesmo que um receptor decodificaria dos pacotes enviados
+        let mut dec = Decoder::new(SAMPLE_RATE, Channels::Mono).unwrap();
+        let mut esperado = Vec::new();
+        let mut q = vec![0f32; FRAME];
+        for d in &enviados {
+            let n = dec.decode_float(d, &mut q, false).unwrap();
+            esperado.extend_from_slice(&q[..n]);
+        }
+        // alinha pelo primeiro som audível de cada lado
+        let primeiro = |x: &[f32]| x.iter().position(|v| v.abs() > 1e-4).expect("há som");
+        let k = primeiro(&saida) - primeiro(&esperado);
+        let comparar = FRAME * 25;
+        let maior = (0..comparar).map(|i| (saida[k + i] - esperado[i]).abs()).fold(0f32, f32::max);
+        // tolerância de ~3 LSB de 16 bits: reset_state() do decodificador não zera 100% do estado interno
+        assert!(maior < 1e-4, "o monitor tocou algo diferente do enviado (dif máx {maior}, início {k})");
+        // Atraso do monitor: o tom começa no microfone em 14400 (0,3 s); no fluxo enviado o início do tom
+        // está depois da pré-rolagem de PREROLL_FRAMES quadros. Medido: ~37 ms com o monitor sozinho; com outros falando soma até 40 ms da fila de saída.
+        let inicio_tom = esperado.iter().position(|v| v.abs() > 0.05).expect("tom nos pacotes");
+        let atraso_ms = ((k + inicio_tom) as f32 - 14400.0) / 48.0;
+        eprintln!("atraso do monitor (microfone → saída, sem o buffer do dispositivo): {atraso_ms:.0} ms");
+        assert!(atraso_ms < 160.0, "atraso do monitor {atraso_ms} ms");
+    }
+
+    #[test]
+    fn monitor_respeita_mudo_e_surdo() {
+        let tom = seno(600.0, 48000.0, 0.3, 24000, 0);
+        let nada = |s: &[f32]| s.iter().all(|v| v.abs() < 1e-9);
+
+        // mudo: não envia nem toca
+        let mut b = banco();
+        b.eng.set_monitor(true);
+        b.eng.set_muted(true);
+        let mut saida = Vec::new();
+        b.roda(&tom, &mut saida);
+        assert!(b.pacotes.try_recv().is_err() && nada(&saida));
+        // desmutar volta a tocar
+        b.eng.set_muted(false);
+        let mut saida = Vec::new();
+        b.roda(&tom, &mut saida);
+        assert!(!nada(&saida), "depois de desmutar o monitor volta");
+        // desligar o monitor cala o retorno mas continua enviando
+        b.eng.set_monitor(false);
+        let mut lixo = Vec::new();
+        b.roda(&[0.0; 4800], &mut lixo); // deixa a fila esvaziar
+        while b.pacotes.try_recv().is_ok() {}
+        let mut saida = Vec::new();
+        b.roda(&tom, &mut saida);
+        assert!(nada(&saida), "monitor desligado não toca");
+        assert!(b.pacotes.try_recv().is_ok(), "mas o envio segue");
+
+        // surdo: não toca nada (nem o monitor)
+        let mut b = banco();
+        b.eng.set_monitor(true);
+        b.eng.set_deafened(true);
+        let mut lixo = Vec::new();
+        b.roda(&[0.0; 4800], &mut lixo);
+        let mut saida = Vec::new();
+        b.roda(&tom, &mut saida);
+        assert!(nada(&saida), "surdo não ouve o monitor");
+        // sem eco infinito: o monitor não vira pacote recebido nem 'speaking'
+        assert!(!b.eng.speaking(0));
+    }
+
+    // ── custo de CPU (manual: cargo test --release -- --ignored custo_cpu --nocapture) ──
+
+    #[test]
+    #[ignore]
+    fn custo_cpu_por_quadro() {
+        let n = 1000;
+        let x = fala_sintetica(FRAME * n);
+        let ruido = ruido_rosa(0.05, FRAME * n, 3);
+        let mix: Vec<f32> = x.iter().zip(&ruido).map(|(a, b)| a + b).collect();
+        let tempo = |ligado: bool| {
+            let mut p = SendPipeline::new().unwrap();
+            p.set_noise_suppression(ligado);
+            let mut bytes = 0usize;
+            let t = Instant::now();
+            for q in mix.chunks_exact(FRAME) {
+                p.process(q, &mut |_, d| bytes += d.len());
+            }
+            let dt = t.elapsed();
+            (dt.as_secs_f64() * 1e6 / n as f64, bytes)
+        };
+        let (sem, _) = tempo(false);
+        let (com, _) = tempo(true);
+        let mut d = DenoiseState::new();
+        let (mut i, mut o) = ([100f32; DEN_FRAME], [0f32; DEN_FRAME]);
+        let t = Instant::now();
+        for _ in 0..n * 2 {
+            std::hint::black_box(d.process_frame(&mut o, &i));
+            i[0] += 1.0;
+        }
+        let so_den = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        eprintln!(
+            "por quadro de 20 ms: pipeline sem RNNoise {sem:.0} µs, com RNNoise {com:.0} µs, só RNNoise (2×480) {so_den:.0} µs; \
+             uso de 1 núcleo: {:.2}% (orçamento 20000 µs)",
+            com / 200.0
+        );
+    }
+
     // ── dispositivo real (manual) ──
 
     /// Só roda com `cargo test -- --ignored`. Abre entrada e saída reais, **sem produzir som**
@@ -2111,7 +2648,16 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
             max = max.max(eng.mic_level());
         }
-        eprintln!("nível máx do microfone em 1 s: {max}; pacotes enviados: {}", enviados.load(Relaxed));
+        eprintln!("nível máx (supressão LIGADA, ruído de ambiente some): {max}; pacotes: {}", enviados.load(Relaxed));
+        // sem supressão o nível é o do ambiente (prova que a captura está chegando)
+        eng.set_noise_suppression(false);
+        thread::sleep(Duration::from_millis(100));
+        max = 0.0;
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(50));
+            max = max.max(eng.mic_level());
+        }
+        eprintln!("nível máx do microfone em 1 s (supressão desligada): {max}; pacotes enviados: {}", enviados.load(Relaxed));
         eprintln!("erro: {:?}; subfluxos: {}", eng.error(), eng.underruns());
         eng.set_muted(true);
         thread::sleep(Duration::from_millis(200));

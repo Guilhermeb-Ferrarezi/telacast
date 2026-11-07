@@ -119,7 +119,7 @@ Proposta do [R04]: começar simples, trocar o transporte depois.
 - [ ] **Volume por usuário**, seleção de dispositivos, push-to-talk dentro da janela. P1 **S**
 - [ ] **Áudio do sistema na transmissão de tela** (monitor do PipeWire/Pulse → Opus como 2º fluxo). P1 **M**
 - [x] **Diálogo "Transmitir" estilo Discord** (telas e janelas com miniaturas ao vivo, resolução 480p a 1440p ou a da fonte, 15 a 60 fps (90/120/144 em Avançado), atalhos Fluidez e Nitidez, resumo "1920x1080 · 60 fps · H.264 · ~9 Mbps", bitrate automático ou manual, botão Qualidade durante a transmissão). Falta: áudio da transmissão, câmera V4L2, limites por servidor.
-- [ ] P2: **UDP com fallback para WS** (**L**), supressão de ruído `nnnoiseless` e eco (**M**), câmera V4L2 (**M**), canal de palco (**M**)
+- [ ] P2: **UDP com fallback para WS** (**L**), eco (**M**); supressão de ruído `nnnoiseless` **feita** (RNNoise antes do VAD e do Opus, ligada por padrão, ~1% de um núcleo), "ouvir meu microfone" feito; falta ganho automático, câmera V4L2 (**M**), canal de palco (**M**)
 - [ ] P3: `webrtc-rs`, E2EE (MLS ou chave por sala), limites por plano, atalho global no Wayland
 
 ## Fase 3 — Cargos, permissões e moderação

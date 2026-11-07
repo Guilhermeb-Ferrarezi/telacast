@@ -241,6 +241,7 @@ enum Act {
     /// Abre o diálogo Transmitir (com o canal de voz como destino, ou o aberto se `None`).
     OpenGoLive(Option<i64>),
     OpenVoiceSettings,
+    SetVoiceOptions { ns: bool, monitor: bool },
     SetVoiceDevices { input: Option<String>, output: Option<String> },
     OpenProfile { user: i64, name: String, anchor: egui::Rect, left: bool },
     Reply(i64, p::Reply),
@@ -359,6 +360,11 @@ struct Session {
     voice_in: Option<String>,
     voice_out: Option<String>,
     voice_err_shown: bool,
+    /// Supressão de ruído (padrão ligada) e "ouvir meu microfone" (só com as configurações abertas).
+    voice_ns: bool,
+    voice_monitor: bool,
+    /// Motor só para testar o microfone nas configurações, quando não estou numa chamada.
+    test_engine: Option<std::sync::Arc<voice::Engine>>,
     /// Rolagem horizontal da bandeja de anexos e onde ela ficou na tela (para a roda do mouse).
     tray_x: f32,
     tray_rect: egui::Rect,
@@ -501,6 +507,9 @@ impl Session {
             voice_in: None,
             voice_out: None,
             voice_err_shown: false,
+            voice_ns: true,
+            voice_monitor: false,
+            test_engine: None,
             tray_x: 0.0,
             tray_rect: egui::Rect::NOTHING,
             upload_tx,
@@ -681,6 +690,8 @@ impl Session {
                 let e = std::sync::Arc::new(e);
                 e.set_muted(self.voice_muted || self.voice_deaf);
                 e.set_deafened(self.voice_deaf);
+                e.set_noise_suppression(self.voice_ns);
+                e.set_monitor(self.voice_monitor);
                 for (u, v) in &self.voice_volumes {
                     e.set_user_volume(*u, *v);
                 }
@@ -700,6 +711,34 @@ impl Session {
                 self.toast = Some((format!("Não consegui abrir o áudio: {e}"), Instant::now()));
                 self.gw.send(C2S::VoiceLeave);
             }
+        }
+    }
+
+    /// O motor que está com o microfone aberto agora (o da chamada ou o de teste das configurações).
+    fn mic_engine(&self) -> Option<&std::sync::Arc<voice::Engine>> {
+        self.engine.as_ref().or(self.test_engine.as_ref())
+    }
+
+    /// Abre só o microfone (sem enviar nada) para o medidor e o "ouvir meu microfone" das configurações.
+    fn start_test_engine(&mut self) {
+        if self.engine.is_some() || self.test_engine.is_some() {
+            return;
+        }
+        match voice::Engine::start(voice::Config { input: self.voice_in.clone(), output: self.voice_out.clone() }, Box::new(|_, _| {})) {
+            Ok(e) => {
+                let e = std::sync::Arc::new(e);
+                e.set_noise_suppression(self.voice_ns);
+                e.set_monitor(self.voice_monitor);
+                self.test_engine = Some(e);
+            }
+            Err(e) => self.toast = Some((format!("Não consegui abrir o microfone: {e}"), Instant::now())),
+        }
+    }
+
+    fn apply_voice_options(&self) {
+        for e in self.engine.iter().chain(self.test_engine.iter()) {
+            e.set_noise_suppression(self.voice_ns);
+            e.set_monitor(self.voice_monitor);
         }
     }
 
@@ -1246,6 +1285,7 @@ struct App {
     kbps: u32,
     voice_in: Option<String>,
     voice_out: Option<String>,
+    voice_ns: bool,
     monitors: Vec<String>,
     monitor: usize,
     golive: GoLive,
@@ -1291,6 +1331,7 @@ impl App {
             login,
             session: None,
             token_saved: token,
+            voice_ns: get("voice_ns") != "0",
             voice_in: Some(get("voice_in")).filter(|v| !v.is_empty()),
             voice_out: Some(get("voice_out")).filter(|v| !v.is_empty()),
             fps: get("fps").parse().unwrap_or(60),
@@ -1346,6 +1387,7 @@ impl App {
                     sess.check_update();
                     sess.voice_in = self.voice_in.clone();
                     sess.voice_out = self.voice_out.clone();
+                    sess.voice_ns = self.voice_ns;
                     self.session = Some(sess);
                     return;
                 }
@@ -1399,6 +1441,7 @@ impl App {
 
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string("voice_ns", if self.voice_ns { "1" } else { "0" }.into());
         storage.set_string("voice_in", self.voice_in.clone().unwrap_or_default());
         storage.set_string("voice_out", self.voice_out.clone().unwrap_or_default());
         storage.set_string("server", self.login.server.clone());
@@ -2344,6 +2387,16 @@ impl App {
                 Act::OpenVoiceSettings => {
                     // listar os dispositivos pode levar um instante (e o ALSA reclama no terminal; é normal)
                     s.modal = Modal::VoiceSettings(voice::list_devices());
+                    s.start_test_engine();
+                }
+                Act::SetVoiceOptions { ns, monitor } => {
+                    s.voice_ns = ns;
+                    self.voice_ns = ns;
+                    s.voice_monitor = monitor;
+                    if monitor {
+                        s.start_test_engine();
+                    }
+                    s.apply_voice_options();
                 }
                 Act::SetVoiceDevices { input, output } => {
                     let changed = s.voice_in != input || s.voice_out != output;
@@ -2355,6 +2408,10 @@ impl App {
                         // reabre os dispositivos já com a escolha nova
                         s.stop_voice_engine();
                         s.start_voice_engine();
+                    }
+                    if changed && s.test_engine.is_some() {
+                        s.test_engine = None;
+                        s.start_test_engine();
                     }
                 }
                 Act::OpenServer(id) => s.open_server(id),
@@ -4465,6 +4522,12 @@ impl App {
     fn modals(&mut self, ctx: &egui::Context, s: &mut Session, acts: &mut Vec<Act>) {
         let mut close = false;
         let mut dismissed = false; // Esc, clique fora ou X
+        // saiu das configurações de voz: solta o microfone de teste e desliga o "ouvir meu microfone"
+        if !matches!(s.modal, Modal::VoiceSettings(_)) && (s.test_engine.is_some() || s.voice_monitor) {
+            s.test_engine = None;
+            s.voice_monitor = false;
+            s.apply_voice_options();
+        }
         let cur = s.current_channel();
         match &mut s.modal {
             Modal::None => {}
@@ -4558,8 +4621,9 @@ impl App {
             }
             Modal::VoiceSettings(devs) => {
                 let (mut input, mut output) = (s.voice_in.clone(), s.voice_out.clone());
-                let level = s.engine.as_ref().map(|e| e.mic_level());
+                let level = s.engine.as_ref().or(s.test_engine.as_ref()).map(|e| e.mic_level());
                 let connected = s.engine.is_some();
+                let (mut ns, mut monitor) = (s.voice_ns, s.voice_monitor);
                 modal(ctx, "Configurações de voz", 440.0, &mut dismissed, |ui| {
                     ui.set_width(400.0);
                     let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "Padrão do sistema".into());
@@ -4595,6 +4659,12 @@ impl App {
                     if connected {
                         ui.label(RichText::new("Mudar o dispositivo reabre o áudio na hora.").size(12.0).color(MUTED));
                     }
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut ns, "Supressão de ruído");
+                    ui.label(RichText::new("Tira teclado, ventilador e barulho de fundo antes de enviar (RNNoise).").size(12.0).color(MUTED));
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut monitor, "Ouvir meu microfone");
+                    ui.label(RichText::new("Toca o que os outros ouvem. Use fone de ouvido: com caixa de som dá microfonia.").size(12.0).color(if monitor { AMBER } else { MUTED }));
                     ui.add_space(10.0);
                     if small_button(ui, "Fechar", FIELD) {
                         close = true;
@@ -4602,6 +4672,9 @@ impl App {
                 });
                 if input != s.voice_in || output != s.voice_out {
                     acts.push(Act::SetVoiceDevices { input, output });
+                }
+                if ns != s.voice_ns || monitor != s.voice_monitor {
+                    acts.push(Act::SetVoiceOptions { ns, monitor });
                 }
             }
             Modal::TextView(a) => {
