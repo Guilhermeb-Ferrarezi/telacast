@@ -80,6 +80,8 @@ struct App {
     hash_sem: Semaphore,
     auth_limit: Limiter,
     limits: Limiter,
+    /// Últimos `nonce` aceitos por usuário (evita duplicar mensagem reenviada após reconexão).
+    nonces: Mutex<(std::collections::HashSet<(i64, u64)>, std::collections::VecDeque<(i64, u64)>)>,
     /// Hash de uma senha qualquer, usado para gastar o mesmo tempo quando o usuário não existe.
     dummy_hash: String,
 }
@@ -329,6 +331,7 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         hash_sem: Semaphore::new(permits),
         auth_limit: Limiter::default(),
         limits: Limiter::default(),
+        nonces: Mutex::new(Default::default()),
         dummy_hash,
     });
     let router = Router::new()
@@ -649,7 +652,7 @@ async fn handle_authed(
                 }
             }
         }
-        C2S::Send { channel_id, content, reply_to } => {
+        C2S::Send { channel_id, content, reply_to, nonce } => {
             let content = content.trim();
             if content.is_empty() || content.chars().count() > 4000 {
                 return true;
@@ -666,8 +669,22 @@ async fn handle_authed(
                     return true;
                 }
             }
+            // reenvio com o mesmo nonce (cliente reconectou sem saber se a primeira chegou): ignora
+            if nonce != 0 {
+                let mut n = app.nonces.lock().unwrap_or_else(|e| e.into_inner());
+                if !n.0.insert((me, nonce)) {
+                    return true;
+                }
+                n.1.push_back((me, nonce));
+                if n.1.len() > 4096 {
+                    if let Some(old) = n.1.pop_front() {
+                        n.0.remove(&old);
+                    }
+                }
+            }
             match app.store.insert_message(app.sf.next(), channel_id, me, content, reply_to).await {
-                Ok(Some(msg)) => {
+                Ok(Some(mut msg)) => {
+                    msg.nonce = nonce;
                     let id = msg.id;
                     let to = app.store.participants(channel_id).await.unwrap_or_default();
                     let out = S2C::Message(msg);

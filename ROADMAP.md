@@ -78,7 +78,7 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 ### 0.3 Protocolo ([R06])
 - [x] **Heartbeat** (ping do servidor a cada 20 s, derruba conexão muda há 60 s; o cliente também detecta conexão morta, inclusive após suspender o PC). Falta o ACK por mensagem. P0 **S**
 - [x] **Reconexão automática** com espera 1, 2, 4, 8 e 15 s, faixa "Sem conexão… Nova tentativa em N s" com botão "Tentar agora", retoma a sessão e recarrega o canal aberto; o campo de mensagem não envia enquanto está fora. P0 **S**
-- [ ] **`nonce`** no envio, deduplicação e mensagem otimista. P0 **S**
+- [x] **`nonce`** no envio (o servidor devolve o `nonce` e descarta repetição), **mensagem otimista** (aparece apagada com "Enviando…", fica na fila se a conexão cair e é reenviada ao reconectar; "Não foi enviada" com "Tentar de novo"/"Descartar" após 15 s). P0 **S**
 - [x] **`ErrorCode` estáveis** (11 códigos, `Unknown` para código novo; o app só descarta a sessão salva com `SessionExpired`/`NotAuthenticated`/`VersionMismatch`). Mensagens desconhecidas (enum externo) o cliente já ignora. P0 **S**
 - [x] **`PROTO_VERSION`** (=1) em `Register`/`Login`/`Resume`; versão diferente, ou ausente (cliente antigo), recebe `VersionMismatch`. P1 **S**
 - [ ] **`seq` nos eventos + Resume** com buffer; re-sync por `after`. P1 **M**

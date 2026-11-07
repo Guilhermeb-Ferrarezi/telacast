@@ -74,6 +74,9 @@ enum Act {
     Reply(i64, p::Reply),
     CancelReply,
     JumpTo(i64),
+    SendMsg { ch: i64, content: String, reply: Option<p::Reply> },
+    Resend(u64),
+    Discard(u64),
     StartEdit(i64, String),
     CancelEdit,
     SaveEdit(i64, String),
@@ -122,6 +125,35 @@ struct Session {
     last_typing: Instant,
     focus_composer: bool,
     jump: Option<Jump>,
+    pending: Vec<Pending>,
+    nonce_seq: u64,
+}
+
+/// Mensagem enviada que o servidor ainda não confirmou (aparece apagada na lista).
+struct Pending {
+    ch: i64,
+    nonce: u64,
+    content: String,
+    reply_to: Option<i64>,
+    reply: Option<p::Reply>,
+    ts: i64,
+    since: Instant,
+}
+
+impl Pending {
+    fn provisional(&self, me: &p::User) -> p::Message {
+        p::Message {
+            id: -(self.nonce as i64),
+            channel_id: self.ch,
+            author_id: me.id,
+            author: me.name.clone(),
+            content: self.content.clone(),
+            ts: self.ts,
+            edited: false,
+            reply: self.reply.clone(),
+            nonce: self.nonce,
+        }
+    }
 }
 
 /// Destaque temporário de uma mensagem para a qual o usuário saltou.
@@ -160,6 +192,8 @@ impl Session {
             last_typing: Instant::now() - Duration::from_secs(60),
             focus_composer: false,
             jump: None,
+            pending: Vec::new(),
+            nonce_seq: 0,
         }
     }
 
@@ -205,6 +239,34 @@ impl Session {
             .unwrap_or(0);
         let loaded = self.msgs.get(&ch).and_then(|v| v.last()).map(|m| m.id).unwrap_or(0);
         snap.max(loaded)
+    }
+
+    /// Mostra a mensagem na hora (provisória) e manda ao servidor; se a conexão estiver fora, fica na fila.
+    fn send_message(&mut self, ch: i64, content: String, reply: Option<p::Reply>) {
+        self.nonce_seq += 1;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1);
+        // nonce positivo e menor que 2^62; o id provisório é o nonce negativo
+        let nonce = (((now_ms & 0xFFFF_FFFF_FFFF) << 8) | (self.nonce_seq & 0xFF)).max(1);
+        let reply_to = reply.as_ref().map(|r| r.id);
+        let pend = Pending { ch, nonce, content: content.clone(), reply_to, reply, ts: now_ms as i64, since: Instant::now() };
+        if self.requested.contains(&ch) {
+            let prov = pend.provisional(&self.me);
+            self.msgs.entry(ch).or_default().push(prov);
+        }
+        if matches!(self.link, Link::Up) {
+            self.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce });
+        }
+        self.pending.push(pend);
+    }
+
+    fn resend_pending(&mut self) {
+        for p in &mut self.pending {
+            p.since = Instant::now();
+            self.gw.send(C2S::Send { channel_id: p.ch, content: p.content.clone(), reply_to: p.reply_to, nonce: p.nonce });
+        }
     }
 
     /// Avisa o servidor que o canal foi lido até a última mensagem conhecida.
@@ -310,6 +372,8 @@ impl Session {
                         self.requested.insert(ch);
                         self.gw.send(C2S::History { channel_id: ch, before: None });
                     }
+                    // o servidor descarta o que já recebeu (mesmo nonce); o resto sai agora
+                    self.resend_pending();
                 }
                 Event::Msg(m) => match m {
                     S2C::Snapshot(sn) => {
@@ -333,6 +397,12 @@ impl Session {
                         let ch = m.channel_id;
                         let mine = m.author_id == self.me.id;
                         let (id, author) = (m.id, m.author_id);
+                        if mine && m.nonce != 0 {
+                            self.pending.retain(|p| p.nonce != m.nonce);
+                            if let Some(v) = self.msgs.get_mut(&ch) {
+                                v.retain(|x| x.id != -(m.nonce as i64));
+                            }
+                        }
                         if self.requested.contains(&ch) {
                             self.msgs.entry(ch).or_default().push(m);
                         }
@@ -360,7 +430,14 @@ impl Session {
                         self.typing.insert((channel_id, user_id), Instant::now());
                     }
                     S2C::History { channel_id, messages } => {
-                        self.msgs.insert(channel_id, messages);
+                        let mut v = messages;
+                        let me = self.me.clone();
+                        for p in self.pending.iter().filter(|p| p.ch == channel_id) {
+                            if !v.iter().any(|m| m.author_id == me.id && m.nonce == p.nonce) {
+                                v.push(p.provisional(&me));
+                            }
+                        }
+                        self.msgs.insert(channel_id, v);
                     }
                     S2C::DmOpened { channel_id } => self.open(View::Dm(channel_id)),
                     S2C::ServerJoined { server_id } => self.open_server(server_id),
@@ -624,6 +701,10 @@ impl App {
 
 /// Sigla do servidor: primeira letra de cada palavra, sem forçar maiúscula (regra do Discord).
 /// Consome um Enter sem Shift (Shift+Enter continua quebrando linha).
+fn is_pending_or_own_echo(m: &p::Message, me: i64) -> bool {
+    m.id < 0 || (m.author_id == me && m.nonce != 0)
+}
+
 fn take_plain_enter(ctx: &egui::Context) -> bool {
     ctx.input_mut(|i| {
         let pos = i.events.iter().position(|e| {
@@ -722,6 +803,20 @@ impl App {
                     s.focus_composer = true;
                 }
                 Act::CancelReply => s.replying = None,
+                Act::SendMsg { ch, content, reply } => s.send_message(ch, content, reply),
+                Act::Resend(nonce) => {
+                    if let Some(p) = s.pending.iter_mut().find(|p| p.nonce == nonce) {
+                        p.since = Instant::now();
+                        let (ch, content, reply_to) = (p.ch, p.content.clone(), p.reply_to);
+                        s.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce });
+                    }
+                }
+                Act::Discard(nonce) => {
+                    s.pending.retain(|p| p.nonce != nonce);
+                    for v in s.msgs.values_mut() {
+                        v.retain(|m| m.id != -(nonce as i64));
+                    }
+                }
                 Act::JumpTo(id) => {
                     let found = s
                         .current_channel()
@@ -1201,8 +1296,16 @@ impl App {
                         && m.ts - msgs[i - 1].ts < 5 * 60 * 1000
                         && m.reply.is_none();
                     let born = *s.seen.entry(m.id).or_insert_with(Instant::now);
-                    let age = born.elapsed().as_secs_f32() / 0.22;
+                    // a mensagem própria que acabou de ser confirmada não "entra" de novo
+                    let age = if is_pending_or_own_echo(m, me_id) { 1.0 } else { born.elapsed().as_secs_f32() / 0.22 };
                     let editing_this = matches!(&s.editing, Some((id, _)) if *id == m.id);
+                    let is_pending = m.id < 0;
+                    let pend = if is_pending {
+                        s.pending.iter().find(|p| p.nonce == (-m.id) as u64).map(|p| (p.nonce, p.since.elapsed()))
+                    } else {
+                        None
+                    };
+                    let link_up = matches!(s.link, Link::Up);
                     let mine = m.author_id == me_id;
                     let can_delete = mine || is_owner;
                     let reply_ref = p::Reply { id: m.id, author: m.author.clone(), content: m.content.chars().take(120).collect() };
@@ -1236,6 +1339,9 @@ impl App {
                         if age < 1.0 {
                             ui.set_opacity(ease_out(age));
                             ui.ctx().request_repaint();
+                        }
+                        if is_pending {
+                            ui.set_opacity(0.55);
                         }
                         if grouped {
                             ui.add_space(54.0);
@@ -1298,12 +1404,34 @@ impl App {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 0.0;
                                     let r = ui.add(egui::Label::new(RichText::new(&m.content).size(15.5).color(TEXT2)).selectable(true));
-                                    show_menu(&r, acts);
+                                    if !is_pending {
+                                        show_menu(&r, acts);
+                                    }
                                     ui.label(RichText::new(" (editado)").size(11.5).color(MUTED));
                                 });
                             } else {
                                 let r = ui.add(egui::Label::new(RichText::new(&m.content).size(15.5).color(TEXT2)).wrap().selectable(true));
-                                show_menu(&r, acts);
+                                if !is_pending {
+                                    show_menu(&r, acts);
+                                }
+                            }
+                            if let Some((nonce, waited)) = pend {
+                                ui.horizontal(|ui| {
+                                    if !link_up {
+                                        ui.label(RichText::new("Sem conexão. Será enviada ao reconectar.").size(11.5).color(MUTED));
+                                    } else if waited < Duration::from_secs(15) {
+                                        ui.label(RichText::new("Enviando…").size(11.5).color(MUTED));
+                                        ui.ctx().request_repaint_after(Duration::from_secs(1));
+                                    } else {
+                                        ui.label(RichText::new("Não foi enviada.").size(11.5).color(RED));
+                                        if small_button(ui, "Tentar de novo", FIELD) {
+                                            acts.push(Act::Resend(nonce));
+                                        }
+                                        if small_button(ui, "Descartar", FIELD) {
+                                            acts.push(Act::Discard(nonce));
+                                        }
+                                    }
+                                });
                             }
                         });
                     });
@@ -1323,7 +1451,7 @@ impl App {
                             ui.ctx().request_repaint();
                         }
                     }
-                    if !editing_this && ui.rect_contains_pointer(full) {
+                    if !editing_this && !is_pending && ui.rect_contains_pointer(full) {
                         ui.painter().set(bg, egui::Shape::rect_filled(full, 0.0, Color32::from_white_alpha(6)));
                         if grouped {
                             ui.painter().text(
@@ -1470,10 +1598,11 @@ impl App {
                     }
                     let enter = r.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
                     let clicked = small_button(ui, "Enviar", BLURPLE);
-                    if (enter || clicked) && !s.input.trim().is_empty() && matches!(s.link, Link::Up) {
-                        let reply_to = s.replying.as_ref().filter(|(c, _)| *c == ch).map(|(_, r)| r.id);
-                        acts.push(Act::Send(C2S::Send { channel_id: ch, content: std::mem::take(&mut s.input), reply_to }));
-                        if reply_to.is_some() {
+                    if (enter || clicked) && !s.input.trim().is_empty() {
+                        let reply = s.replying.as_ref().filter(|(c, _)| *c == ch).map(|(_, r)| r.clone());
+                        let had_reply = reply.is_some();
+                        acts.push(Act::SendMsg { ch, content: std::mem::take(&mut s.input), reply });
+                        if had_reply {
                             acts.push(Act::CancelReply);
                         }
                         r.request_focus();

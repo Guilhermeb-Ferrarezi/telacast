@@ -113,6 +113,10 @@ pub struct Message {
     pub ts: i64,
     pub edited: bool,
     pub reply: Option<Reply>,
+    /// Devolve o `nonce` que o autor mandou (0 se não houve ou se vem do histórico): o cliente troca
+    /// a mensagem provisória pela definitiva.
+    #[serde(default)]
+    pub nonce: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -127,7 +131,8 @@ pub enum C2S {
     JoinServer { code: String },
     /// `kind`: 0 texto ou 4 categoria. `parent_id`: categoria do novo canal (ignorado em categorias).
     CreateChannel { server_id: i64, name: String, kind: u8, parent_id: Option<i64> },
-    Send { channel_id: i64, content: String, reply_to: Option<i64> },
+    /// `nonce`: número escolhido pelo cliente (0 = sem). Repetir o mesmo `nonce` não duplica a mensagem.
+    Send { channel_id: i64, content: String, reply_to: Option<i64>, #[serde(default)] nonce: u64 },
     /// Só o autor edita.
     Edit { message_id: i64, content: String },
     /// O autor ou o dono do servidor apaga.

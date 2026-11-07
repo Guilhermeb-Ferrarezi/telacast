@@ -224,10 +224,10 @@ fn fluxo_completo() {
     assert_eq!(voz.parent, Some(cat_id));
 
     // categoria não recebe mensagem
-    ana.send(C2S::Send { channel_id: cat_id, content: "isso não vai".into(), reply_to: None });
+    ana.send(C2S::Send { channel_id: cat_id, content: "isso não vai".into(), reply_to: None, nonce: 0 });
 
     // --- mensagens em tempo real e histórico
-    ana.send(C2S::Send { channel_id: geral, content: "oi beto!".into(), reply_to: None });
+    ana.send(C2S::Send { channel_id: geral, content: "oi beto!".into(), reply_to: None, nonce: 0 });
     let msg = beto.wait("a mensagem", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
     assert_eq!(msg.content, "oi beto!");
     assert_eq!(msg.author, "ana");
@@ -239,7 +239,7 @@ fn fluxo_completo() {
 
     // quem não é do servidor não lê nem escreve
     carla.send(C2S::History { channel_id: geral, before: None });
-    carla.send(C2S::Send { channel_id: geral, content: "invasão".into(), reply_to: None });
+    carla.send(C2S::Send { channel_id: geral, content: "invasão".into(), reply_to: None, nonce: 0 });
     std::thread::sleep(Duration::from_millis(400));
     ana.send(C2S::History { channel_id: geral, before: None });
     let hist = ana.wait("o histórico da ana", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
@@ -255,7 +255,7 @@ fn fluxo_completo() {
     carla.send(C2S::FriendAccept { user_id: ana_id });
     carla.send(C2S::OpenDm { user_id: ana_id });
     let dm = carla.wait("DmOpened", |m| if let S2C::DmOpened { channel_id } = m { Some(*channel_id) } else { None });
-    carla.send(C2S::Send { channel_id: dm, content: "privado".into(), reply_to: None });
+    carla.send(C2S::Send { channel_id: dm, content: "privado".into(), reply_to: None, nonce: 0 });
     let m = ana.wait("DM na ana", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
     assert_eq!(m.content, "privado");
     let _ = beto_id;
@@ -302,17 +302,17 @@ fn responder_editar_apagar_e_ler() {
     beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
 
     // --- resposta
-    ana.send(C2S::Send { channel_id: geral, content: "primeira".into(), reply_to: None });
+    ana.send(C2S::Send { channel_id: geral, content: "primeira".into(), reply_to: None, nonce: 0 });
     let m1 = beto.wait("a primeira", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
     assert!(m1.reply.is_none() && !m1.edited);
-    beto.send(C2S::Send { channel_id: geral, content: "resposta".into(), reply_to: Some(m1.id) });
+    beto.send(C2S::Send { channel_id: geral, content: "resposta".into(), reply_to: Some(m1.id), nonce: 0 });
     let m2 = ana.wait("a resposta", |m| match m {
         S2C::Message(m) if m.content == "resposta" => Some(m.clone()),
         _ => None,
     });
     let r = m2.reply.expect("a resposta carrega a mensagem respondida");
     assert_eq!((r.id, r.author.as_str(), r.content.as_str()), (m1.id, "ana", "primeira"));
-    beto.send(C2S::Send { channel_id: geral, content: "órfã".into(), reply_to: Some(1) });
+    beto.send(C2S::Send { channel_id: geral, content: "órfã".into(), reply_to: Some(1), nonce: 0 });
     assert!(beto.error().contains("respondida"));
 
     // --- edição: só o autor
@@ -330,7 +330,7 @@ fn responder_editar_apagar_e_ler() {
     assert_eq!(hist.iter().find(|m| m.id == m2.id).unwrap().reply.as_ref().unwrap().id, m1.id);
 
     // --- apagar: o autor ou o dono do servidor
-    ana.send(C2S::Send { channel_id: geral, content: "da ana".into(), reply_to: None });
+    ana.send(C2S::Send { channel_id: geral, content: "da ana".into(), reply_to: None, nonce: 0 });
     let da_ana = beto.wait("a mensagem da ana", |m| match m {
         S2C::Message(m) if m.content == "da ana" => Some(m.clone()),
         _ => None,
@@ -389,4 +389,34 @@ fn versao_do_protocolo_e_codigos_de_erro() {
     let mut n = env.client();
     n.send(C2S::CreateServer { name: "sem login".into() });
     assert_eq!(n.error_code().0, ErrorCode::NotAuthenticated);
+}
+
+#[test]
+fn nonce_nao_duplica_mensagem() {
+    let env = Env::start();
+    let code = env.invite(2);
+    let mut ana = env.client();
+    ana.register("ana", &code);
+    let mut beto = env.client();
+    beto.register("beto", &code);
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    let geral = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
+    beto.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
+    beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+
+    // o mesmo nonce duas vezes (reenvio depois de reconectar) vira UMA mensagem, que devolve o nonce
+    ana.send(C2S::Send { channel_id: geral, content: "oi".into(), reply_to: None, nonce: 777 });
+    ana.send(C2S::Send { channel_id: geral, content: "oi".into(), reply_to: None, nonce: 777 });
+    ana.send(C2S::Send { channel_id: geral, content: "tchau".into(), reply_to: None, nonce: 778 });
+    let primeira = beto.wait("a primeira", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
+    assert_eq!((primeira.content.as_str(), primeira.nonce), ("oi", 777));
+    let segunda = beto.wait("a segunda", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
+    assert_eq!((segunda.content.as_str(), segunda.nonce), ("tchau", 778), "a repetição foi descartada");
+    beto.send(C2S::History { channel_id: geral, before: None });
+    let hist = beto.wait("o histórico", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
+    assert_eq!(hist.len(), 2);
 }

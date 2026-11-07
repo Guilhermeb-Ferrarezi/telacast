@@ -333,6 +333,7 @@ impl Store {
             ts: ts_ms(id),
             edited: false,
             reply,
+            nonce: 0,
         }))
     }
 
@@ -407,6 +408,7 @@ impl Store {
                     (Some(id), Some(author), Some(content)) => Some(Reply { id, author, content }),
                     _ => None,
                 },
+                nonce: 0,
             })
             .collect();
         v.reverse();
