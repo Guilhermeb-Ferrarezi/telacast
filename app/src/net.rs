@@ -45,7 +45,7 @@ pub fn connect_ws(url: &str) -> anyhow::Result<Ws> {
 }
 
 /// Raízes públicas (webpki) e, se existir, o certificado de `TELACAST_CA_FILE` (CA própria ou teste).
-fn tls_config() -> Arc<rustls::ClientConfig> {
+pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if let Ok(path) = std::env::var("TELACAST_CA_FILE") {

@@ -1,6 +1,7 @@
 //! Telacast: gateway de chat (JSON/WebSocket) + retransmissão de tela (H.264), com PostgreSQL.
 mod auth;
 mod ids;
+mod files;
 mod store;
 
 use axum::{
@@ -373,6 +374,8 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         .route("/ws", get(gateway))
         .route("/publish/{channel}", get(publish))
         .route("/watch/{channel}", get(watch))
+        .route("/upload", axum::routing::post(files::upload).layer(axum::extract::DefaultBodyLimit::max(files::max_upload())))
+        .route("/files/{id}/{name}", get(files::download))
         .route("/health", get(|| async { "ok" }))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
@@ -731,9 +734,13 @@ async fn handle_authed(
                 }
             }
         }
-        C2S::Send { channel_id, content, reply_to, nonce } => {
+        C2S::Send { channel_id, content, reply_to, nonce, attachments } => {
             let content = content.trim();
-            if content.is_empty() || content.chars().count() > 4000 {
+            if (content.is_empty() && attachments.is_empty()) || content.chars().count() > 4000 {
+                return true;
+            }
+            if attachments.len() > 10 {
+                err(ErrorCode::InvalidInput, "No máximo 10 anexos por mensagem");
                 return true;
             }
             if busy("send", 12, 10) {
@@ -752,6 +759,10 @@ async fn handle_authed(
                 err(ErrorCode::Forbidden, "Você não pode enviar mensagens para esta pessoa");
                 return true;
             }
+            if !attachments.is_empty() && !app.store.pending_ok(&attachments, me, channel_id).await.unwrap_or(false) {
+                err(ErrorCode::InvalidInput, "Anexo inválido ou já usado");
+                return true;
+            }
             // reenvio com o mesmo nonce (cliente reconectou sem saber se a primeira chegou): ignora
             if nonce != 0 {
                 let mut n = app.nonces.lock().unwrap_or_else(|e| e.into_inner());
@@ -768,6 +779,12 @@ async fn handle_authed(
             match app.store.insert_message(app.sf.next(), channel_id, me, content, reply_to).await {
                 Ok(Some(mut msg)) => {
                     msg.nonce = nonce;
+                    if !attachments.is_empty() {
+                        if let Err(e) = app.store.link_attachments(msg.id, &attachments).await {
+                            error!("link_attachments: {e}");
+                        }
+                        let _ = app.store.attach_files(std::slice::from_mut(&mut msg)).await;
+                    }
                     let id = msg.id;
                     if let Err(e) = app.store.add_mentions(channel_id, me, &msg.content).await {
                         error!("add_mentions: {e}");

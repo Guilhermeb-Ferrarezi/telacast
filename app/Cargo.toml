@@ -11,6 +11,8 @@ openh264 = "0.9.9"
 tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 webpki-roots = "1"
+ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 x11rb = { version = "0.14.0", features = ["randr"] }
 nvidia-video-codec-sdk = { path = "../vendor/nvidia-video-codec-sdk" }
 cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12080"] }

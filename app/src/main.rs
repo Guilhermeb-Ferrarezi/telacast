@@ -1,4 +1,5 @@
 mod gateway;
+mod files;
 mod gpu;
 mod md_view;
 mod net;
@@ -78,7 +79,10 @@ enum Act {
     Reply(i64, p::Reply),
     CancelReply,
     JumpTo(i64),
-    SendMsg { ch: i64, content: String, reply: Option<p::Reply> },
+    SendMsg { ch: i64, content: String, reply: Option<p::Reply>, attachments: Vec<p::Attachment> },
+    PickFile,
+    AddFile(std::path::PathBuf),
+    RemoveUpload(u64),
     Resend(u64),
     Discard(u64),
     ToggleSpoiler(i64, u32),
@@ -154,6 +158,17 @@ struct Session {
     search: Option<SearchState>,
     /// Seletor de emoji aberto para uma mensagem: (id, posição na tela).
     picker: Option<(i64, egui::Pos2)>,
+    /// Servidor HTTP dos anexos (o mesmo endereço do WebSocket, com http/https).
+    http_base: String,
+    images: files::Images,
+    /// Arquivos sendo enviados para o campo de mensagem (por canal) e o canal por onde chegam os resultados.
+    uploads: Vec<files::Upload>,
+    upload_key: u64,
+    upload_tx: std::sync::mpsc::Sender<(u64, Result<p::Attachment, String>)>,
+    upload_rx: std::sync::mpsc::Receiver<(u64, Result<p::Attachment, String>)>,
+    /// Caminhos escolhidos no seletor de arquivos (a janela roda em outra thread).
+    picked_tx: std::sync::mpsc::Sender<std::path::PathBuf>,
+    picked_rx: std::sync::mpsc::Receiver<std::path::PathBuf>,
     /// Painel de fixadas aberto e a lista do canal atual.
     pins_open: bool,
     pins: Vec<p::Message>,
@@ -193,6 +208,7 @@ struct Pending {
     content: String,
     reply_to: Option<i64>,
     reply: Option<p::Reply>,
+    attachments: Vec<p::Attachment>,
     ts: i64,
     since: Instant,
 }
@@ -212,6 +228,7 @@ impl Pending {
             reactions: Vec::new(),
             kind: 0,
             pinned: false,
+            attachments: self.attachments.clone(),
         }
     }
 }
@@ -225,6 +242,9 @@ struct Jump {
 
 impl Session {
     fn new(gw: Gateway, server: String, ctx: egui::Context, token: String, me: p::User) -> Self {
+        let http_base = files::http_base(&server);
+        let (upload_tx, upload_rx) = std::sync::mpsc::channel();
+        let (picked_tx, picked_rx) = std::sync::mpsc::channel();
         Self {
             server,
             ctx,
@@ -260,6 +280,14 @@ impl Session {
             visits: HashMap::new(),
             recent: Vec::new(),
             search: None,
+            http_base,
+            images: files::Images::new(),
+            uploads: Vec::new(),
+            upload_key: 0,
+            upload_tx,
+            upload_rx,
+            picked_tx,
+            picked_rx,
             picker: None,
             pins_open: false,
             pins: Vec::new(),
@@ -349,7 +377,7 @@ impl Session {
     }
 
     /// Mostra a mensagem na hora (provisória) e manda ao servidor; se a conexão estiver fora, fica na fila.
-    fn send_message(&mut self, ch: i64, content: String, reply: Option<p::Reply>) {
+    fn send_message(&mut self, ch: i64, content: String, reply: Option<p::Reply>, attachments: Vec<p::Attachment>) {
         // "@nome" de quem está neste canal vira a menção `<@id>` (o chat mostra o nome atual)
         let users: Vec<&p::User> = match self.snap.servers.iter().find(|s| s.channels.iter().any(|c| c.id == ch)) {
             Some(sv) => sv.members.iter().collect(),
@@ -364,15 +392,30 @@ impl Session {
         // nonce positivo e menor que 2^62; o id provisório é o nonce negativo
         let nonce = (((now_ms & 0xFFFF_FFFF_FFFF) << 8) | (self.nonce_seq & 0xFF)).max(1);
         let reply_to = reply.as_ref().map(|r| r.id);
-        let pend = Pending { ch, nonce, content: content.clone(), reply_to, reply, ts: now_ms as i64, since: Instant::now() };
+        let pend = Pending { ch, nonce, content: content.clone(), reply_to, reply, attachments, ts: now_ms as i64, since: Instant::now() };
         if self.requested.contains(&ch) {
             let prov = pend.provisional(&self.me);
             self.msgs.entry(ch).or_default().push(prov);
         }
         if matches!(self.link, Link::Up) {
-            self.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce });
+            let ids = pend.attachments.iter().map(|a| a.id).collect();
+            self.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce, attachments: ids });
         }
         self.pending.push(pend);
+    }
+
+    /// Começa a enviar um arquivo para o canal aberto; o resultado volta por `upload_rx`.
+    fn start_upload(&mut self, path: std::path::PathBuf) {
+        let Some(channel) = self.current_channel() else { return };
+        self.upload_key += 1;
+        let key = self.upload_key;
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "arquivo".into());
+        self.uploads.push(files::Upload { key, channel, name, state: files::UpState::Sending });
+        let (base, token, tx, ctx) = (self.http_base.clone(), self.token.clone(), self.upload_tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((key, files::upload(&base, &token, channel, &path)));
+            ctx.request_repaint();
+        });
     }
 
     /// Rola até a mensagem `id` do canal aberto; se não estiver carregada, busca páginas antigas.
@@ -402,7 +445,8 @@ impl Session {
     fn resend_pending(&mut self) {
         for p in &mut self.pending {
             p.since = Instant::now();
-            self.gw.send(C2S::Send { channel_id: p.ch, content: p.content.clone(), reply_to: p.reply_to, nonce: p.nonce });
+            let ids = p.attachments.iter().map(|a| a.id).collect();
+            self.gw.send(C2S::Send { channel_id: p.ch, content: p.content.clone(), reply_to: p.reply_to, nonce: p.nonce, attachments: ids });
         }
     }
 
@@ -470,6 +514,17 @@ impl Session {
             } else {
                 self.ctx.request_repaint_after(Duration::from_millis(500));
             }
+        }
+        while let Ok((key, res)) = self.upload_rx.try_recv() {
+            if let Some(u) = self.uploads.iter_mut().find(|u| u.key == key) {
+                u.state = match res {
+                    Ok(a) => files::UpState::Done(a),
+                    Err(e) => files::UpState::Failed(e),
+                };
+            }
+        }
+        while let Ok(path) = self.picked_rx.try_recv() {
+            self.start_upload(path);
         }
         while let Ok(ev) = self.gw.rx.try_recv() {
             match ev {
@@ -1026,6 +1081,58 @@ fn system_row(ui: &mut egui::Ui, m: &p::Message, acts: &mut Vec<Act>) {
     ui.add_space(6.0);
 }
 
+/// Anexo de uma mensagem: imagem (até 400x300) ou cartão do arquivo; clicar abre no navegador.
+fn attachment_view(ui: &mut egui::Ui, a: &p::Attachment, base: &str, token: &str, images: &mut files::Images, acts: &mut Vec<Act>) {
+    let open = |ui: &egui::Ui| ui.ctx().open_url(egui::OpenUrl::new_tab(files::url(base, a, token)));
+    ui.add_space(4.0);
+    if a.mime.starts_with("image/") && a.width > 0 && a.height > 0 {
+        let scale = (400.0 / a.width as f32).min(300.0 / a.height as f32).min(1.0);
+        let size = egui::vec2(a.width as f32 * scale, a.height as f32 * scale).max(egui::vec2(40.0, 40.0));
+        let ctx = ui.ctx().clone();
+        match images.get(&ctx, base, token, a) {
+            files::Img::Ready(tex) => {
+                let r = ui.add(egui::Image::new(tex).fit_to_exact_size(size).corner_radius(egui::CornerRadius::same(8)).sense(egui::Sense::click()));
+                if r.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if r.clicked() {
+                    open(ui);
+                }
+                return;
+            }
+            files::Img::Loading => {
+                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                ui.painter().rect_filled(rect, 8.0, L3);
+                ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Carregando…", egui::FontId::proportional(13.0), MUTED);
+                ui.ctx().request_repaint_after(Duration::from_millis(300));
+                return;
+            }
+            files::Img::Failed => {}
+        }
+    }
+    // arquivo comum (ou imagem que não carregou)
+    let card = egui::Frame::new()
+        .fill(L3)
+        .stroke(egui::Stroke::new(1.0, LINE2))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_max_width(360.0);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.label(RichText::new(&a.name).color(AMBER).strong());
+                    ui.label(RichText::new(files::human_size(a.size)).size(12.0).color(MUTED));
+                });
+                ui.add_space(14.0);
+                if small_button(ui, "Baixar", FIELD) {
+                    open(ui);
+                }
+            });
+        });
+    let _ = (card, acts);
+}
+
 fn is_pending_or_own_echo(m: &p::Message, me: i64) -> bool {
     m.id < 0 || (m.author_id == me && m.nonce != 0)
 }
@@ -1093,6 +1200,27 @@ impl App {
     /// Desenha a sessão. Devolve false se o usuário saiu.
     fn session_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &mut Session) -> bool {
         let mut acts: Vec<Act> = Vec::new();
+
+        s.images.pump(ctx);
+        // arrastar arquivos para a janela anexa ao canal aberto
+        if !matches!(s.view, View::Home) {
+            let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+            for f in dropped {
+                acts.push(Act::AddFile(f.path().to_path_buf()));
+            }
+            if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+                let screen = ctx.content_rect();
+                let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop-hint")));
+                p.rect_filled(screen, 0.0, Color32::from_black_alpha(170));
+                p.text(screen.center(), Align2::CENTER_CENTER, "Solte para anexar", egui::FontId::new(26.0, serif_family()), TEXT);
+            }
+            // gancho de teste: anexa esse arquivo uma vez, ao abrir um canal
+            if let Ok(path) = std::env::var("TELACAST_ATTACH") {
+                if s.uploads.is_empty() && s.upload_key == 0 && s.current_channel().is_some() {
+                    acts.push(Act::AddFile(path.into()));
+                }
+            }
+        }
 
         // Ctrl+F abre e fecha o painel de busca (só dentro de um canal ou conversa)
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) && !matches!(s.view, View::Home) {
@@ -1259,12 +1387,30 @@ impl App {
                     s.focus_composer = true;
                 }
                 Act::CancelReply => s.replying = None,
-                Act::SendMsg { ch, content, reply } => s.send_message(ch, content, reply),
+                Act::SendMsg { ch, content, reply, attachments } => {
+                    // os arquivos já foram usados: saem do campo
+                    let used: Vec<i64> = attachments.iter().map(|a| a.id).collect();
+                    s.uploads.retain(|u| !matches!(&u.state, files::UpState::Done(a) if used.contains(&a.id)));
+                    s.send_message(ch, content, reply, attachments);
+                }
+                Act::PickFile => {
+                    let tx = s.picked_tx.clone();
+                    let ctx2 = ctx.clone();
+                    std::thread::spawn(move || {
+                        if let Some(path) = files::pick_file() {
+                            let _ = tx.send(path);
+                            ctx2.request_repaint();
+                        }
+                    });
+                }
+                Act::AddFile(path) => s.start_upload(path),
+                Act::RemoveUpload(key) => s.uploads.retain(|u| u.key != key),
                 Act::Resend(nonce) => {
                     if let Some(p) = s.pending.iter_mut().find(|p| p.nonce == nonce) {
                         p.since = Instant::now();
                         let (ch, content, reply_to) = (p.ch, p.content.clone(), p.reply_to);
-                        s.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce });
+                        let ids = p.attachments.iter().map(|a| a.id).collect();
+                        s.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce, attachments: ids });
                     }
                 }
                 Act::CloseSearch => s.search = None,
@@ -2085,9 +2231,11 @@ impl App {
         let me_id = s.me.id;
         let is_owner = s.snap.servers.iter().any(|sv| sv.owner == me_id && sv.channels.iter().any(|c| c.id == ch));
         let can_pin = is_owner || matches!(s.view, View::Dm(_));
+        let (http_base, token) = (s.http_base.clone(), s.token.clone());
         let blocked_ids: HashSet<i64> = s.snap.blocked.iter().map(|u| u.id).collect();
         let replying_here = matches!(&s.replying, Some((c, _)) if *c == ch);
-        let input_h = 82.0 + 22.0 + if replying_here { 38.0 } else { 0.0 };
+        let uploads_here = s.uploads.iter().any(|u| u.channel == ch);
+        let input_h = 82.0 + 22.0 + if replying_here { 38.0 } else { 0.0 } + if uploads_here { 50.0 } else { 0.0 };
         let h = (ui.available_height() - input_h).max(60.0);
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         // Esc dispensa o divisor "novas mensagens" (o canal já foi marcado como lido ao abrir)
@@ -2281,6 +2429,9 @@ impl App {
                                     }
                                 }
                             }
+                            for a in &m.attachments {
+                                attachment_view(ui, a, &http_base, &token, &mut s.images, acts);
+                            }
                             if !m.reactions.is_empty() && !is_pending {
                                 ui.add_space(2.0);
                                 ui.horizontal_wrapped(|ui| {
@@ -2470,6 +2621,49 @@ impl App {
             }
         }
 
+        // arquivos a enviar junto com a mensagem
+        if s.uploads.iter().any(|u| u.channel == ch) {
+            egui::Frame::new()
+                .fill(L2)
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                        for u in s.uploads.iter().filter(|u| u.channel == ch) {
+                            egui::Frame::new()
+                                .fill(L3)
+                                .stroke(egui::Stroke::new(1.0, if matches!(u.state, files::UpState::Failed(_)) { RED } else { LINE2 }))
+                                .corner_radius(egui::CornerRadius::same(8))
+                                .inner_margin(egui::Margin::symmetric(10, 5))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let shown: String = if u.name.chars().count() > 28 { format!("{}…", u.name.chars().take(27).collect::<String>()) } else { u.name.clone() };
+                                        ui.label(RichText::new(shown).color(TEXT));
+                                        match &u.state {
+                                            files::UpState::Sending => {
+                                                ui.label(RichText::new("enviando…").size(12.0).color(MUTED));
+                                                ui.ctx().request_repaint_after(Duration::from_millis(400));
+                                            }
+                                            files::UpState::Done(a) => {
+                                                ui.label(RichText::new(files::human_size(a.size)).size(12.0).color(MUTED));
+                                            }
+                                            files::UpState::Failed(e) => {
+                                                ui.label(RichText::new(e).size(12.0).color(RED));
+                                            }
+                                        }
+                                        if small_button(ui, "✕", FIELD) {
+                                            acts.push(Act::RemoveUpload(u.key));
+                                        }
+                                    });
+                                });
+                        }
+                    });
+                });
+            ui.add_space(4.0);
+        }
+
         // entrada
         let input_id = egui::Id::new(("compose", ch));
         let focused = ctx.memory(|mem| mem.has_focus(input_id));
@@ -2477,10 +2671,21 @@ impl App {
             .fill(L3)
             .stroke(egui::Stroke::new(1.0, if focused { AMBER } else { LINE2 }))
             .corner_radius(egui::CornerRadius::same(12))
-            .inner_margin(egui::Margin { left: 16, right: 8, top: 8, bottom: 8 })
+            .inner_margin(egui::Margin { left: 10, right: 8, top: 8, bottom: 8 })
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    // "+" anexa um arquivo (também dá para arrastar e soltar na janela)
+                    let (pr, presp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
+                    let hot = presp.hovered();
+                    ui.painter().circle_filled(pr.center(), 14.0, if hot { L4 } else { L2 });
+                    ui.painter().text(pr.center(), Align2::CENTER_CENTER, "+", egui::FontId::proportional(20.0), if hot { TEXT } else { TEXT2 });
+                    if hot {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if presp.on_hover_text("Anexar arquivo").clicked() {
+                        acts.push(Act::PickFile);
+                    }
                     let r = ui.add_sized(
                         [ui.available_width() - 84.0, 32.0],
                         egui::TextEdit::singleline(&mut s.input)
@@ -2503,10 +2708,17 @@ impl App {
                     }
                     let enter = r.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
                     let clicked = small_button(ui, "Enviar", BLURPLE);
-                    if (enter || clicked) && !s.input.trim().is_empty() {
+                    let atts: Vec<p::Attachment> = s
+                        .uploads
+                        .iter()
+                        .filter(|u| u.channel == ch)
+                        .filter_map(|u| if let files::UpState::Done(a) = &u.state { Some(a.clone()) } else { None })
+                        .collect();
+                    let uploading = s.uploads.iter().any(|u| u.channel == ch && matches!(u.state, files::UpState::Sending));
+                    if (enter || clicked) && (!s.input.trim().is_empty() || !atts.is_empty()) && !uploading {
                         let reply = s.replying.as_ref().filter(|(c, _)| *c == ch).map(|(_, r)| r.clone());
                         let had_reply = reply.is_some();
-                        acts.push(Act::SendMsg { ch, content: std::mem::take(&mut s.input), reply });
+                        acts.push(Act::SendMsg { ch, content: std::mem::take(&mut s.input), reply, attachments: atts });
                         if had_reply {
                             acts.push(Act::CancelReply);
                         }

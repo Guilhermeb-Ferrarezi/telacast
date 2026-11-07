@@ -2,7 +2,7 @@
 use crate::ids::ts_ms;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
-use telacast_proto::{Message, Reaction, Reply};
+use telacast_proto::{Attachment, Message, Reaction, Reply};
 
 pub type R<T> = Result<T, sqlx::Error>;
 
@@ -347,6 +347,7 @@ impl Store {
             reactions: Vec::new(),
             kind: 0,
             pinned: false,
+            attachments: Vec::new(),
         }))
     }
 
@@ -483,6 +484,7 @@ impl Store {
             reactions: Vec::new(),
             kind: kind as u8,
             pinned: false,
+            attachments: Vec::new(),
         })
     }
 
@@ -557,9 +559,11 @@ impl Store {
                 reactions: Vec::new(),
                 kind: 0,
                 pinned: true,
+                attachments: Vec::new(),
             })
             .collect();
         self.attach_reactions(&mut v, me).await?;
+        self.attach_files(&mut v).await?;
         Ok(v)
     }
 
@@ -631,6 +635,89 @@ impl Store {
         Ok(r.0)
     }
 
+    // --------------------------------------------------------------- anexos
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_attachment(
+        &self,
+        id: i64,
+        uploader: i64,
+        channel: i64,
+        name: &str,
+        mime: &str,
+        size: i64,
+        width: Option<i32>,
+        height: Option<i32>,
+        hash: &str,
+    ) -> R<()> {
+        sqlx::query(
+            "INSERT INTO attachments(id, uploader_id, channel_id, name, mime, size, width, height, hash)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(id)
+        .bind(uploader)
+        .bind(channel)
+        .bind(name)
+        .bind(mime)
+        .bind(size)
+        .bind(width)
+        .bind(height)
+        .bind(hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// (canal, nome, tipo, hash) de um anexo.
+    pub async fn attachment_row(&self, id: i64) -> R<Option<(i64, String, String, String)>> {
+        sqlx::query_as("SELECT channel_id, name, mime, hash FROM attachments WHERE id = $1").bind(id).fetch_optional(&self.pool).await
+    }
+
+    /// Todos os `ids` são arquivos seus, deste canal, ainda sem mensagem, e sem repetição?
+    pub async fn pending_ok(&self, ids: &[i64], uploader: i64, channel: i64) -> R<bool> {
+        let mut uniq = ids.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        if uniq.len() != ids.len() {
+            return Ok(false);
+        }
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM attachments WHERE id = ANY($1) AND uploader_id = $2 AND channel_id = $3 AND message_id IS NULL",
+        )
+        .bind(ids)
+        .bind(uploader)
+        .bind(channel)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n as usize == ids.len())
+    }
+
+    pub async fn link_attachments(&self, message: i64, ids: &[i64]) -> R<()> {
+        sqlx::query("UPDATE attachments SET message_id = $1 WHERE id = ANY($2)").bind(message).bind(ids).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Preenche `attachments` das mensagens.
+    pub async fn attach_files(&self, msgs: &mut [Message]) -> R<()> {
+        if msgs.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+        let rows: Vec<(i64, i64, String, String, i64, Option<i32>, Option<i32>)> = sqlx::query_as(
+            "SELECT message_id, id, name, mime, size, width, height FROM attachments
+             WHERE message_id = ANY($1) ORDER BY message_id, id",
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+        for (mid, id, name, mime, size, w, h) in rows {
+            if let Some(m) = msgs.iter_mut().find(|m| m.id == mid) {
+                m.attachments.push(Attachment { id, name, mime, size: size as u64, width: w.unwrap_or(0) as u32, height: h.unwrap_or(0) as u32 });
+            }
+        }
+        Ok(())
+    }
+
     pub async fn is_member(&self, server: i64, user: i64) -> R<bool> {
         let r: (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM members WHERE server_id = $1 AND user_id = $2)")
             .bind(server)
@@ -675,15 +762,17 @@ impl Store {
             .into_iter()
             .map(|(id, channel_id, channel_name, author_id, author, content, edited, kind, pinned)| {
                 (
-                    Message { id, channel_id, author_id, author, content, ts: ts_ms(id), edited, reply: None, nonce: 0, reactions: Vec::new(), kind: kind as u8, pinned },
+                    Message { id, channel_id, author_id, author, content, ts: ts_ms(id), edited, reply: None, nonce: 0, reactions: Vec::new(), kind: kind as u8, pinned, attachments: Vec::new() },
                     channel_name,
                 )
             })
             .collect();
         let mut msgs: Vec<Message> = out.iter().map(|x| x.0.clone()).collect();
         self.attach_reactions(&mut msgs, me).await?;
+        self.attach_files(&mut msgs).await?;
         for (o, m) in out.iter_mut().zip(msgs) {
             o.0.reactions = m.reactions;
+            o.0.attachments = m.attachments;
         }
         Ok(out)
     }
@@ -736,10 +825,12 @@ impl Store {
                 reactions: Vec::new(),
                 kind: kind as u8,
                 pinned,
+                attachments: Vec::new(),
             })
             .collect();
         v.reverse();
         self.attach_reactions(&mut v, me).await?;
+        self.attach_files(&mut v).await?;
         Ok(v)
     }
 

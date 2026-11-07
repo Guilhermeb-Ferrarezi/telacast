@@ -15,6 +15,7 @@ struct Env {
     port: u16,
     db: String,
     db_url: String,
+    files: String,
     rt: tokio::runtime::Runtime,
 }
 
@@ -35,16 +36,18 @@ impl Env {
             pool.close().await;
         });
         let db_url = format!("postgres://telacast:telacast_dev@127.0.0.1:5432/{db}");
+        let files = format!("/tmp/telacast_test_files_{nanos}");
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let child = Command::new(env!("CARGO_BIN_EXE_telacast-server"))
             .env("DATABASE_URL", &db_url)
             .env("TELACAST_ADDR", format!("127.0.0.1:{port}"))
             .env("RUST_LOG", "warn")
+            .env("TELACAST_FILES_DIR", &files)
             .envs(extra.iter().copied())
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
-        let env = Env { child, port, db, db_url, rt };
+        let env = Env { child, port, db, db_url, files, rt };
         let start = Instant::now();
         while TcpStream::connect(("127.0.0.1", port)).is_err() {
             assert!(start.elapsed() < Duration::from_secs(30), "o servidor não subiu");
@@ -82,6 +85,7 @@ impl Drop for Env {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.files);
         let db = self.db.clone();
         self.rt.block_on(async {
             if let Ok(pool) = sqlx::PgPool::connect(ADMIN_URL).await {
@@ -229,10 +233,10 @@ fn fluxo_completo() {
     assert_eq!(voz.parent, Some(cat_id));
 
     // categoria não recebe mensagem
-    ana.send(C2S::Send { channel_id: cat_id, content: "isso não vai".into(), reply_to: None, nonce: 0 });
+    ana.send(C2S::Send { channel_id: cat_id, content: "isso não vai".into(), reply_to: None, nonce: 0, attachments: vec![] });
 
     // --- mensagens em tempo real e histórico
-    ana.send(C2S::Send { channel_id: geral, content: "oi beto!".into(), reply_to: None, nonce: 0 });
+    ana.send(C2S::Send { channel_id: geral, content: "oi beto!".into(), reply_to: None, nonce: 0, attachments: vec![] });
     let msg = beto.wait("a mensagem", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
     assert_eq!(msg.content, "oi beto!");
     assert_eq!(msg.author, "ana");
@@ -244,7 +248,7 @@ fn fluxo_completo() {
 
     // quem não é do servidor não lê nem escreve
     carla.send(C2S::History { channel_id: geral, before: None });
-    carla.send(C2S::Send { channel_id: geral, content: "invasão".into(), reply_to: None, nonce: 0 });
+    carla.send(C2S::Send { channel_id: geral, content: "invasão".into(), reply_to: None, nonce: 0, attachments: vec![] });
     std::thread::sleep(Duration::from_millis(400));
     ana.send(C2S::History { channel_id: geral, before: None });
     let hist = ana.wait("o histórico da ana", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
@@ -260,7 +264,7 @@ fn fluxo_completo() {
     carla.send(C2S::FriendAccept { user_id: ana_id });
     carla.send(C2S::OpenDm { user_id: ana_id });
     let dm = carla.wait("DmOpened", |m| if let S2C::DmOpened { channel_id } = m { Some(*channel_id) } else { None });
-    carla.send(C2S::Send { channel_id: dm, content: "privado".into(), reply_to: None, nonce: 0 });
+    carla.send(C2S::Send { channel_id: dm, content: "privado".into(), reply_to: None, nonce: 0, attachments: vec![] });
     let m = ana.wait("DM na ana", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
     assert_eq!(m.content, "privado");
     let _ = beto_id;
@@ -307,17 +311,17 @@ fn responder_editar_apagar_e_ler() {
     beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
 
     // --- resposta
-    ana.send(C2S::Send { channel_id: geral, content: "primeira".into(), reply_to: None, nonce: 0 });
+    ana.send(C2S::Send { channel_id: geral, content: "primeira".into(), reply_to: None, nonce: 0, attachments: vec![] });
     let m1 = beto.wait("a primeira", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
     assert!(m1.reply.is_none() && !m1.edited);
-    beto.send(C2S::Send { channel_id: geral, content: "resposta".into(), reply_to: Some(m1.id), nonce: 0 });
+    beto.send(C2S::Send { channel_id: geral, content: "resposta".into(), reply_to: Some(m1.id), nonce: 0, attachments: vec![] });
     let m2 = ana.wait("a resposta", |m| match m {
         S2C::Message(m) if m.content == "resposta" => Some(m.clone()),
         _ => None,
     });
     let r = m2.reply.expect("a resposta carrega a mensagem respondida");
     assert_eq!((r.id, r.author.as_str(), r.content.as_str()), (m1.id, "ana", "primeira"));
-    beto.send(C2S::Send { channel_id: geral, content: "órfã".into(), reply_to: Some(1), nonce: 0 });
+    beto.send(C2S::Send { channel_id: geral, content: "órfã".into(), reply_to: Some(1), nonce: 0, attachments: vec![] });
     assert!(beto.error().contains("respondida"));
 
     // --- edição: só o autor
@@ -335,7 +339,7 @@ fn responder_editar_apagar_e_ler() {
     assert_eq!(hist.iter().find(|m| m.id == m2.id).unwrap().reply.as_ref().unwrap().id, m1.id);
 
     // --- apagar: o autor ou o dono do servidor
-    ana.send(C2S::Send { channel_id: geral, content: "da ana".into(), reply_to: None, nonce: 0 });
+    ana.send(C2S::Send { channel_id: geral, content: "da ana".into(), reply_to: None, nonce: 0, attachments: vec![] });
     let da_ana = beto.wait("a mensagem da ana", |m| match m {
         S2C::Message(m) if m.content == "da ana" => Some(m.clone()),
         _ => None,
@@ -414,9 +418,9 @@ fn nonce_nao_duplica_mensagem() {
     beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
 
     // o mesmo nonce duas vezes (reenvio depois de reconectar) vira UMA mensagem, que devolve o nonce
-    ana.send(C2S::Send { channel_id: geral, content: "oi".into(), reply_to: None, nonce: 777 });
-    ana.send(C2S::Send { channel_id: geral, content: "oi".into(), reply_to: None, nonce: 777 });
-    ana.send(C2S::Send { channel_id: geral, content: "tchau".into(), reply_to: None, nonce: 778 });
+    ana.send(C2S::Send { channel_id: geral, content: "oi".into(), reply_to: None, nonce: 777, attachments: vec![] });
+    ana.send(C2S::Send { channel_id: geral, content: "oi".into(), reply_to: None, nonce: 777, attachments: vec![] });
+    ana.send(C2S::Send { channel_id: geral, content: "tchau".into(), reply_to: None, nonce: 778, attachments: vec![] });
     let primeira = beto.wait("a primeira", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
     assert_eq!((primeira.content.as_str(), primeira.nonce), ("oi", 777));
     let segunda = beto.wait("a segunda", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
@@ -503,13 +507,13 @@ fn mencoes_contam_ate_ler() {
         let s = c.wait("snapshot do login", |m| if let S2C::Snapshot(s) = m { Some(s.clone()) } else { None });
         s.servers[0].channels.iter().find(|c| c.id == geral).unwrap().mentions
     };
-    ana.send(C2S::Send { channel_id: geral, content: format!("oi <@{beto_id}>"), reply_to: None, nonce: 0 });
-    ana.send(C2S::Send { channel_id: geral, content: "mensagem sem menção".into(), reply_to: None, nonce: 0 });
-    ana.send(C2S::Send { channel_id: geral, content: format!("de novo <@!{beto_id}>"), reply_to: None, nonce: 0 });
+    ana.send(C2S::Send { channel_id: geral, content: format!("oi <@{beto_id}>"), reply_to: None, nonce: 0, attachments: vec![] });
+    ana.send(C2S::Send { channel_id: geral, content: "mensagem sem menção".into(), reply_to: None, nonce: 0, attachments: vec![] });
+    ana.send(C2S::Send { channel_id: geral, content: format!("de novo <@!{beto_id}>"), reply_to: None, nonce: 0, attachments: vec![] });
     std::thread::sleep(Duration::from_millis(600));
     assert_eq!(mencoes(&env, "beto"), 2, "o beto foi citado duas vezes");
     assert_eq!(mencoes(&env, "carla"), 0, "a carla não foi citada");
-    ana.send(C2S::Send { channel_id: geral, content: "@everyone atenção".into(), reply_to: None, nonce: 0 });
+    ana.send(C2S::Send { channel_id: geral, content: "@everyone atenção".into(), reply_to: None, nonce: 0, attachments: vec![] });
     std::thread::sleep(Duration::from_millis(400));
     assert_eq!(mencoes(&env, "carla"), 1, "@everyone conta para todos");
     assert_eq!(mencoes(&env, "beto"), 3);
@@ -544,7 +548,7 @@ fn busca_de_mensagens() {
         (1, "a transmissão do jogo começa às nove"),
     ] {
         let c = if quem == 0 { &mut ana } else { &mut beto };
-        c.send(C2S::Send { channel_id: geral, content: t.into(), reply_to: None, nonce: 0 });
+        c.send(C2S::Send { channel_id: geral, content: t.into(), reply_to: None, nonce: 0, attachments: vec![] });
         std::thread::sleep(Duration::from_millis(80));
     }
     std::thread::sleep(Duration::from_millis(300));
@@ -601,7 +605,7 @@ fn reacoes_com_emoji() {
     let geral = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
     beto.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
     beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
-    ana.send(C2S::Send { channel_id: geral, content: "reaja a isto".into(), reply_to: None, nonce: 0 });
+    ana.send(C2S::Send { channel_id: geral, content: "reaja a isto".into(), reply_to: None, nonce: 0, attachments: vec![] });
     let msg = beto.wait("a mensagem", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
 
     // o beto reage; a ana recebe o evento
@@ -667,7 +671,7 @@ fn fixadas_e_avisos_de_sistema() {
     });
     assert_eq!((aviso.author_id, aviso.channel_id), (beto_id, geral));
 
-    ana.send(C2S::Send { channel_id: geral, content: "regras do canal".into(), reply_to: None, nonce: 0 });
+    ana.send(C2S::Send { channel_id: geral, content: "regras do canal".into(), reply_to: None, nonce: 0, attachments: vec![] });
     let msg = beto.wait("a mensagem", |m| match m {
         S2C::Message(m) if m.kind == 0 => Some(m.clone()),
         _ => None,
@@ -740,7 +744,7 @@ fn bloquear_usuario() {
     beto.send(C2S::FriendAccept { user_id: ana_id });
     ana.send(C2S::OpenDm { user_id: beto_id });
     let dm = ana.wait("DmOpened", |m| if let S2C::DmOpened { channel_id } = m { Some(*channel_id) } else { None });
-    ana.send(C2S::Send { channel_id: dm, content: "oi".into(), reply_to: None, nonce: 0 });
+    ana.send(C2S::Send { channel_id: dm, content: "oi".into(), reply_to: None, nonce: 0, attachments: vec![] });
     beto.wait("a DM", |m| matches!(m, S2C::Message(m) if m.content == "oi").then_some(()));
 
     // a ana bloqueia o beto: a amizade some e ele aparece na lista de bloqueados dela
@@ -752,14 +756,14 @@ fn bloquear_usuario() {
     assert_eq!(s.blocked[0].id, beto_id);
     assert!(s.friends.is_empty(), "a amizade é desfeita");
     // o beto não manda mais mensagem na DM existente, não abre DM nova e não pede amizade
-    beto.send(C2S::Send { channel_id: dm, content: "ainda aí?".into(), reply_to: None, nonce: 0 });
+    beto.send(C2S::Send { channel_id: dm, content: "ainda aí?".into(), reply_to: None, nonce: 0, attachments: vec![] });
     assert_eq!(beto.error_code().0, telacast_proto::ErrorCode::Forbidden);
     beto.send(C2S::OpenDm { user_id: ana_id });
     assert_eq!(beto.error_code().0, telacast_proto::ErrorCode::Forbidden);
     beto.send(C2S::FriendRequest { username: "ana".into() });
     assert_eq!(beto.error_code().0, telacast_proto::ErrorCode::NotFound, "quem foi bloqueado não descobre o bloqueio");
     // a ana também não manda nem pede amizade enquanto bloqueia
-    ana.send(C2S::Send { channel_id: dm, content: "e agora?".into(), reply_to: None, nonce: 0 });
+    ana.send(C2S::Send { channel_id: dm, content: "e agora?".into(), reply_to: None, nonce: 0, attachments: vec![] });
     assert_eq!(ana.error_code().0, telacast_proto::ErrorCode::Forbidden);
     ana.send(C2S::FriendRequest { username: "beto".into() });
     assert_eq!(ana.error_code().0, telacast_proto::ErrorCode::InvalidInput);
@@ -771,7 +775,7 @@ fn bloquear_usuario() {
         S2C::Snapshot(s) if s.blocked.is_empty() => Some(()),
         _ => None,
     });
-    beto.send(C2S::Send { channel_id: dm, content: "voltei".into(), reply_to: None, nonce: 0 });
+    beto.send(C2S::Send { channel_id: dm, content: "voltei".into(), reply_to: None, nonce: 0, attachments: vec![] });
     ana.wait("a DM do beto", |m| matches!(m, S2C::Message(m) if m.content == "voltei").then_some(()));
 }
 
@@ -789,4 +793,100 @@ fn limite_de_conexoes_por_ip() {
     let d = tungstenite::connect(&url);
     assert!(d.is_ok(), "com uma vaga livre a conexão passa de novo");
     drop((b, c, d));
+}
+
+/// Requisição HTTP mínima (sem dependência): devolve (status, cabeçalhos em minúsculas, corpo).
+fn http(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, String, Vec<u8>) {
+    use std::io::{Read, Write};
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(s, "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+    s.write_all(body).unwrap();
+    let mut raw = Vec::new();
+    let _ = s.read_to_end(&mut raw);
+    let cut = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("resposta HTTP");
+    let head = String::from_utf8_lossy(&raw[..cut]).to_lowercase();
+    let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, head, raw[cut + 4..].to_vec())
+}
+
+/// PNG de 1x1 pixel.
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63,
+    0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+#[test]
+fn anexos() {
+    let env = Env::start_with(&[("TELACAST_MAX_UPLOAD_MB", "1")]);
+    let code = env.invite(2);
+    let mut ana = env.client();
+    let (ana_tok, _) = ana.register("ana", &code);
+    let mut beto = env.client();
+    let (beto_tok, _) = beto.register("beto", &code);
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    let geral = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
+    let code2 = env.invite(1);
+    let mut fora = env.client();
+    let (fora_tok, _) = fora.register("carla", &code2);
+    beto.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
+    beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+
+    let up = |tok: &str, ch: i64, name: &str, body: &[u8]| http(env.port, "POST", &format!("/upload?token={tok}&channel={ch}&name={name}"), body);
+    // sem token, de fora do canal e grande demais
+    assert_eq!(up("invalido", geral, "a.png", PNG_1X1).0, 401);
+    assert_eq!(up(&fora_tok, geral, "a.png", PNG_1X1).0, 403, "quem não é do servidor não envia");
+    assert_eq!(up(&ana_tok, geral, "grande.bin", &vec![7u8; (1 << 20) + 10]).0, 413, "acima de 1 MiB neste teste");
+    assert_eq!(up(&ana_tok, geral, "vazio.bin", &[]).0, 400);
+    // envio normal: o tipo e as dimensões vêm do conteúdo (o nome "../foto.txt" é limpo)
+    let (st, _, body) = up(&ana_tok, geral, "..%2Ffoto.png", PNG_1X1);
+    assert_eq!(st, 200, "upload do PNG");
+    let j: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let (id, mime, w) = (j["id"].as_i64().unwrap(), j["mime"].as_str().unwrap().to_string(), j["width"].as_u64().unwrap());
+    assert_eq!((mime.as_str(), w, j["height"].as_u64().unwrap()), ("image/png", 1, 1));
+    assert_eq!(j["name"].as_str().unwrap(), "foto.png", "sem pastas no nome");
+    // um arquivo qualquer não é imagem, mesmo que diga ser
+    let (_, _, body2) = up(&ana_tok, geral, "nota.png", b"isto e texto puro");
+    let j2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+    assert_eq!(j2["mime"].as_str().unwrap(), "application/octet-stream");
+    let id2 = j2["id"].as_i64().unwrap();
+
+    // mensagem só com anexos (texto vazio); o beto recebe com os metadados
+    ana.send(C2S::Send { channel_id: geral, content: "".into(), reply_to: None, nonce: 0, attachments: vec![id, id2] });
+    let msg = beto.wait("a mensagem com anexos", |m| match m {
+        S2C::Message(m) if m.kind == 0 => Some(m.clone()),
+        _ => None,
+    });
+    assert_eq!(msg.attachments.len(), 2);
+    assert_eq!((msg.attachments[0].width, msg.attachments[0].height, msg.attachments[0].mime.as_str()), (1, 1, "image/png"));
+    // o histórico também traz
+    beto.send(C2S::History { channel_id: geral, before: None });
+    let hist = beto.wait("o histórico", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
+    assert_eq!(hist.iter().find(|m| m.kind == 0).unwrap().attachments.len(), 2);
+    // anexo já usado ou de outra pessoa é recusado
+    ana.send(C2S::Send { channel_id: geral, content: "de novo".into(), reply_to: None, nonce: 0, attachments: vec![id] });
+    assert_eq!(ana.error_code().0, telacast_proto::ErrorCode::InvalidInput);
+    // download: imagem inline, outro tipo como anexo; sem token ou de fora, recusado
+    let (st, head, bytes) = http(env.port, "GET", &format!("/files/{id}/foto.png?token={beto_tok}"), &[]);
+    assert_eq!(st, 200);
+    assert_eq!(bytes, PNG_1X1);
+    assert!(head.contains("content-type: image/png") && head.contains("inline") && head.contains("nosniff"), "{head}");
+    let (st, head, _) = http(env.port, "GET", &format!("/files/{id2}/nota.png?token={beto_tok}"), &[]);
+    assert_eq!(st, 200);
+    assert!(head.contains("application/octet-stream") && head.contains("attachment"), "{head}");
+    assert_eq!(http(env.port, "GET", &format!("/files/{id}/x?token="), &[]).0, 401);
+    assert_eq!(http(env.port, "GET", &format!("/files/{id}/x?token={fora_tok}"), &[]).0, 403);
+    assert_eq!(http(env.port, "GET", &format!("/files/999/x?token={beto_tok}"), &[]).0, 404);
+    // mensagem vazia e sem anexos é ignorada
+    ana.send(C2S::Send { channel_id: geral, content: "  ".into(), reply_to: None, nonce: 0, attachments: vec![] });
+    ana.send(C2S::Send { channel_id: geral, content: "fim".into(), reply_to: None, nonce: 0, attachments: vec![] });
+    let m = beto.wait("a próxima mensagem", |m| match m {
+        S2C::Message(m) if m.kind == 0 => Some(m.content.clone()),
+        _ => None,
+    });
+    assert_eq!(m, "fim");
 }

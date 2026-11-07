@@ -126,6 +126,18 @@ pub struct Reply {
     pub content: String,
 }
 
+/// Arquivo anexado a uma mensagem. O download é por HTTP: `GET /files/{id}/{name}?token=...`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Attachment {
+    pub id: i64,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    /// 0 se não for imagem (ou se as dimensões não puderam ser lidas).
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Reações de um emoji numa mensagem: quantas pessoas e se você é uma delas.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Reaction {
@@ -157,6 +169,8 @@ pub struct Message {
     pub kind: u8,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
 }
 
 /// Um resultado de busca: a mensagem e onde ela está.
@@ -179,7 +193,16 @@ pub enum C2S {
     /// `kind`: 0 texto ou 4 categoria. `parent_id`: categoria do novo canal (ignorado em categorias).
     CreateChannel { server_id: i64, name: String, kind: u8, parent_id: Option<i64> },
     /// `nonce`: número escolhido pelo cliente (0 = sem). Repetir o mesmo `nonce` não duplica a mensagem.
-    Send { channel_id: i64, content: String, reply_to: Option<i64>, #[serde(default)] nonce: u64 },
+    Send {
+        channel_id: i64,
+        content: String,
+        reply_to: Option<i64>,
+        #[serde(default)]
+        nonce: u64,
+        /// Ids de arquivos já enviados por HTTP (`POST /upload`); a mensagem pode ter só anexos.
+        #[serde(default)]
+        attachments: Vec<i64>,
+    },
     /// Só o autor edita.
     Edit { message_id: i64, content: String },
     /// O autor ou o dono do servidor apaga.

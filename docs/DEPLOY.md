@@ -37,8 +37,10 @@ sudo useradd --system --home /var/lib/telacast --create-home telacast
 ```
 DATABASE_URL=postgres://telacast:TROQUE-ESTA-SENHA@127.0.0.1:5432/telacast
 TELACAST_ADDR=127.0.0.1:8080
-# opcional: conexões simultâneas por IP (padrão 30)
+TELACAST_FILES_DIR=/var/lib/telacast/files
+# opcionais: conexões simultâneas por IP (padrão 30) e tamanho máximo de anexo em MB (padrão 10)
 # TELACAST_MAX_CONNS_PER_IP=30
+# TELACAST_MAX_UPLOAD_MB=10
 ```
 
 `/etc/systemd/system/telacast.service`:
@@ -59,6 +61,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+ReadWritePaths=/var/lib/telacast
 
 [Install]
 WantedBy=multi-user.target
@@ -104,7 +107,7 @@ O app **recusa** `ws://` para qualquer servidor fora da sua máquina e da rede l
 
 ## 6. Manutenção
 
-- **Backup** diário: `pg_dump -Fc telacast > /var/backups/telacast-$(date +%F).dump` (cron), guardando uma cópia fora da VPS.
+- **Backup** diário: `pg_dump -Fc telacast > /var/backups/telacast-$(date +%F).dump` (cron) **e** a pasta dos anexos (`/var/lib/telacast/files`), guardando uma cópia fora da VPS.
 - **Atualizar**: `git pull && cargo build --release -p telacast-server && sudo install ... && sudo systemctl restart telacast`.
 - **Logs**: `journalctl -u telacast`. `RUST_LOG=info` (ou `debug`) no arquivo de ambiente aumenta o detalhe.
 - **Certificado próprio** (CA interna, sem Let's Encrypt): no app, defina `TELACAST_CA_FILE=/caminho/ca.pem`.
