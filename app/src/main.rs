@@ -1089,6 +1089,34 @@ impl App {
                     let born = *s.seen.entry(m.id).or_insert_with(Instant::now);
                     let age = born.elapsed().as_secs_f32() / 0.22;
                     let editing_this = matches!(&s.editing, Some((id, _)) if *id == m.id);
+                    let mine = m.author_id == me_id;
+                    let can_delete = mine || is_owner;
+                    let reply_ref = p::Reply { id: m.id, author: m.author.clone(), content: m.content.chars().take(120).collect() };
+                    // menu do botão direito, aberto em cima do texto (que continua selecionável)
+                    let show_menu = |resp: &egui::Response, acts: &mut Vec<Act>| {
+                        egui::Popup::context_menu(resp).width(190.0).show(|ui| {
+                            ui.set_min_width(180.0);
+                            if ui.button("Responder").clicked() {
+                                acts.push(Act::Reply(ch, reply_ref.clone()));
+                                ui.close();
+                            }
+                            if mine && ui.button("Editar mensagem").clicked() {
+                                acts.push(Act::StartEdit(m.id, m.content.clone()));
+                                ui.close();
+                            }
+                            if ui.button("Copiar mensagem inteira").clicked() {
+                                acts.push(Act::Copy(m.content.clone()));
+                                ui.close();
+                            }
+                            if can_delete {
+                                ui.separator();
+                                if ui.button(RichText::new("Apagar mensagem").color(RED)).clicked() {
+                                    acts.push(Act::AskDelete(m.id, m.content.clone()));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    };
                     let bg = ui.painter().add(egui::Shape::Noop);
                     let row = ui.horizontal_top(|ui| {
                         if age < 1.0 {
@@ -1145,11 +1173,13 @@ impl App {
                             } else if m.edited {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 0.0;
-                                    ui.label(RichText::new(&m.content).size(15.5).color(TEXT2));
+                                    let r = ui.add(egui::Label::new(RichText::new(&m.content).size(15.5).color(TEXT2)).selectable(true));
+                                    show_menu(&r, acts);
                                     ui.label(RichText::new(" (editado)").size(11.5).color(MUTED));
                                 });
                             } else {
-                                ui.add(egui::Label::new(RichText::new(&m.content).size(15.5).color(TEXT2)).wrap());
+                                let r = ui.add(egui::Label::new(RichText::new(&m.content).size(15.5).color(TEXT2)).wrap().selectable(true));
+                                show_menu(&r, acts);
                             }
                         });
                     });
@@ -1158,33 +1188,6 @@ impl App {
                         egui::pos2(ui.max_rect().left() - 28.0, rc.top()),
                         egui::pos2(ui.max_rect().right() + 28.0, rc.bottom() + 0.5),
                     );
-                    let mine = m.author_id == me_id;
-                    let can_delete = mine || is_owner;
-                    let reply_ref = p::Reply { id: m.id, author: m.author.clone(), content: m.content.chars().take(120).collect() };
-                    // a linha inteira é um alvo de clique: botão direito abre o menu da mensagem
-                    let hit = ui.interact(full, egui::Id::new(("msg", m.id)), egui::Sense::click());
-                    egui::Popup::context_menu(&hit).width(190.0).show(|ui| {
-                        ui.set_min_width(180.0);
-                        if ui.button("Responder").clicked() {
-                            acts.push(Act::Reply(ch, reply_ref.clone()));
-                            ui.close();
-                        }
-                        if mine && ui.button("Editar mensagem").clicked() {
-                            acts.push(Act::StartEdit(m.id, m.content.clone()));
-                            ui.close();
-                        }
-                        if ui.button("Copiar texto").clicked() {
-                            acts.push(Act::Copy(m.content.clone()));
-                            ui.close();
-                        }
-                        if can_delete {
-                            ui.separator();
-                            if ui.button(RichText::new("Apagar mensagem").color(RED)).clicked() {
-                                acts.push(Act::AskDelete(m.id, m.content.clone()));
-                                ui.close();
-                            }
-                        }
-                    });
                     if !editing_this && ui.rect_contains_pointer(full) {
                         ui.painter().set(bg, egui::Shape::rect_filled(full, 0.0, Color32::from_white_alpha(6)));
                         if grouped {
