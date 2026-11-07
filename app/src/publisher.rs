@@ -20,15 +20,18 @@ pub struct Handle {
     pub stop: Arc<AtomicBool>,
     pub status: Arc<Mutex<String>>,
     pub preview: Preview,
+    /// Largura (em pixels físicos) em que a prévia é mostrada; a captura reduz exatamente a isso (sem 2º reescalonamento).
+    pub preview_width: Arc<std::sync::atomic::AtomicU32>,
 }
 
-/// Reduz um quadro BGRA `w`x`h` para no máximo 1280 de largura com média de área (sem serrilhado) e vira RGBA.
-/// Quadros que já cabem não são reduzidos. Custa alguns ms; roda ~10 vezes por segundo.
-fn make_preview(frame: &[u8], w: usize, h: usize, scaler: &mut Scaler) -> Option<(u32, u32, Vec<u8>)> {
+/// Reduz um quadro BGRA `w`x`h` para `target` pixels de largura (no máximo, nunca amplia) com média de área
+/// e vira RGBA. Com `target` igual ao tamanho em que a prévia aparece, a imagem sai 1:1, sem reescalonar de novo.
+fn make_preview(frame: &[u8], w: usize, h: usize, target: usize, scaler: &mut Scaler) -> Option<(u32, u32, Vec<u8>)> {
     if w == 0 || h == 0 || frame.len() < w * h * 4 {
         return None;
     }
-    let (pw, ph) = if w > 1280 { (1280, (h * 1280 / w).max(1)) } else { (w, h) };
+    let tw = target.clamp(320, 3840);
+    let (pw, ph) = if w > tw { (tw, (h * tw / w).max(1)) } else { (w, h) };
     let mut out = vec![0u8; pw * ph * 4];
     scaler.scale(frame, w, w, h, &mut out, pw, pw, ph);
     // BGRA -> RGBA, opaco
@@ -132,15 +135,16 @@ pub fn start_source(url: String, source: Source, q: Quality) -> Handle {
     let stop = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new("conectando…".to_string()));
     let preview: Preview = Arc::new(Mutex::new(None));
-    let (s, st, pv) = (stop.clone(), status.clone(), preview.clone());
+    let preview_width = Arc::new(std::sync::atomic::AtomicU32::new(1280));
+    let (s, st, pv, pw) = (stop.clone(), status.clone(), preview.clone(), preview_width.clone());
     std::thread::spawn(move || {
-        let msg = match run(&url, &source, &q, &s, &st, &pv) {
+        let msg = match run(&url, &source, &q, &s, &st, &pv, &pw) {
             Ok(()) => "parado".to_string(),
             Err(e) => format!("erro: {e:#}"),
         };
         *st.lock().unwrap() = msg;
     });
-    Handle { stop, status, preview }
+    Handle { stop, status, preview, preview_width }
 }
 
 /// Quanto tempo uma janela pode ficar indisponível (minimizada, em outra área de
@@ -186,6 +190,7 @@ fn run(
     stop: &AtomicBool,
     status: &Mutex<String>,
     preview: &Preview,
+    preview_width: &Arc<std::sync::atomic::AtomicU32>,
 ) -> anyhow::Result<()> {
     let fps = q.fps.clamp(1, 240);
     let kbps = q.kbps;
@@ -201,27 +206,43 @@ fn run(
     let cap_stop = Arc::new(AtomicBool::new(false));
     let cs = cap_stop.clone();
     let (fail_tx, fail_rx) = std::sync::mpsc::channel::<String>();
-    let preview = preview.clone();
+    // A prévia é reduzida numa thread própria (até ~20 por segundo), para não roubar tempo da captura a 60 fps.
+    let (ptx, prx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize, usize)>(1);
+    {
+        let (preview, pw, stop_p) = (preview.clone(), preview_width.clone(), cap_stop.clone());
+        std::thread::spawn(move || {
+            let mut sc = Scaler::default();
+            while !stop_p.load(Ordering::Relaxed) {
+                match prx.recv_timeout(Duration::from_millis(250)) {
+                    Ok((frame, w, h)) => {
+                        let target = pw.load(Ordering::Relaxed) as usize;
+                        if let Some(p) = make_preview(&frame, w, h, target, &mut sc) {
+                            if let Ok(mut g) = preview.lock() {
+                                *g = Some(p);
+                            }
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+    }
     let capture = std::thread::spawn(move || -> anyhow::Result<()> {
         let period = Duration::from_secs_f64(1.0 / fps as f64);
         let mut scaler = Scaler::default();
         let mut down_since: Option<Instant> = None;
         let mut last_preview = Instant::now() - Duration::from_secs(1);
-        let mut preview_scaler = Scaler::default();
         while !cs.load(Ordering::Relaxed) {
             let tick = Instant::now();
             match grabber.grab() {
                 Ok(raw) => {
                     down_since = None;
                     let frame = make_frame(raw, base, (w as u32, h as u32), &mut scaler);
-                    // prévia da minha própria tela: um quadro reduzido a cada ~100 ms, do mesmo que vai ao encoder
-                    if last_preview.elapsed() >= Duration::from_millis(100) {
+                    // prévia da minha própria tela: uma cópia a cada ~50 ms vai à thread que a reduz
+                    if last_preview.elapsed() >= Duration::from_millis(50) {
                         last_preview = Instant::now();
-                        if let Some(p) = make_preview(&frame, w, h, &mut preview_scaler) {
-                            if let Ok(mut g) = preview.lock() {
-                                *g = Some(p);
-                            }
-                        }
+                        let _ = ptx.try_send((frame.clone(), w, h));
                     }
                     // Se o encoder ainda está ocupado, descarta o quadro.
                     let _ = tx.try_send(frame);

@@ -3321,8 +3321,10 @@ impl App {
     }
 
     /// Pega o quadro de prévia mais recente da minha transmissão (o publisher entrega ~10 por segundo).
-    fn refresh_preview(&mut self, ctx: &egui::Context) {
+    fn refresh_preview(&mut self, ctx: &egui::Context, shown_width_points: f32) {
         let Some((_, h)) = &self.publishing else { return };
+        // pede a captura já no tamanho em que a prévia aparece (pixels físicos): sai nítida, sem 2º reescalonamento
+        h.preview_width.store((shown_width_points * ctx.pixels_per_point()).round().max(320.0) as u32, Ordering::Relaxed);
         let frame = h.preview.lock().ok().and_then(|mut g| g.take());
         if let Some((w, hgt, rgba)) = frame {
             let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, hgt as usize], &rgba);
@@ -3331,7 +3333,7 @@ impl App {
                 None => self.preview_tex = Some(ctx.load_texture("my-stream-preview", img, egui::TextureOptions::LINEAR)),
             }
         }
-        ctx.request_repaint_after(Duration::from_millis(100));
+        ctx.request_repaint_after(Duration::from_millis(50));
     }
 
     /// Visão do canal de voz: grade de participantes (16:9, linha incompleta centralizada) e barra de controles.
@@ -3371,7 +3373,10 @@ impl App {
         let sharing = self.publishing.as_ref().is_some_and(|(c, _)| *c == mv.channel_id);
         let preview_here = sharing && !watching_here;
         if preview_here {
-            self.refresh_preview(ctx);
+            // tamanho em que a prévia aparece: limitado pela largura ou pela altura do palco (menos a faixa de participantes)
+            let aspect = self.preview_tex.as_ref().map(|t| t.size_vec2().x / t.size_vec2().y).unwrap_or(16.0 / 9.0);
+            let shown_w = stage.width().min((stage.height() - 128.0) * aspect);
+            self.refresh_preview(ctx, shown_w.max(320.0));
         }
         // foco: um participante grande no palco e os outros na faixa (duplo clique num tile; "Grade" ou Esc voltam)
         let focus = s.voice_focus.filter(|u| members.iter().any(|m| m.user_id == *u));
