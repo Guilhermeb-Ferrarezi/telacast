@@ -79,8 +79,8 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 - [x] **Heartbeat** (ping do servidor a cada 20 s, derruba conexão muda há 60 s; o cliente também detecta conexão morta, inclusive após suspender o PC). Falta o ACK por mensagem. P0 **S**
 - [x] **Reconexão automática** com espera 1, 2, 4, 8 e 15 s, faixa "Sem conexão… Nova tentativa em N s" com botão "Tentar agora", retoma a sessão e recarrega o canal aberto; o campo de mensagem não envia enquanto está fora. P0 **S**
 - [ ] **`nonce`** no envio, deduplicação e mensagem otimista. P0 **S**
-- [ ] **`ErrorCode` estáveis** + variante `Unknown` nos enums (cliente antigo não quebra). P0 **S**
-- [ ] **`PROTO_VERSION`** no login. P1 **S**
+- [x] **`ErrorCode` estáveis** (11 códigos, `Unknown` para código novo; o app só descarta a sessão salva com `SessionExpired`/`NotAuthenticated`/`VersionMismatch`). Mensagens desconhecidas (enum externo) o cliente já ignora. P0 **S**
+- [x] **`PROTO_VERSION`** (=1) em `Register`/`Login`/`Resume`; versão diferente, ou ausente (cliente antigo), recebe `VersionMismatch`. P1 **S**
 - [ ] **`seq` nos eventos + Resume** com buffer; re-sync por `after`. P1 **M**
 - [x] Testes automáticos do servidor (hoje só o script manual que usei) — **[minha decisão]** **S/M**
 

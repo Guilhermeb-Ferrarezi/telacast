@@ -116,13 +116,17 @@ impl Client {
         }
     }
 
+    fn error_code(&mut self) -> (telacast_proto::ErrorCode, String) {
+        self.wait("um erro com código", |m| if let S2C::Error { code, msg } = m { Some((*code, msg.clone())) } else { None })
+    }
+
     fn error(&mut self) -> String {
-        self.wait("um erro", |m| if let S2C::Error { msg } = m { Some(msg.clone()) } else { None })
+        self.wait("um erro", |m| if let S2C::Error { msg, .. } = m { Some(msg.clone()) } else { None })
     }
 
     /// Cadastra e devolve (token, id).
     fn register(&mut self, name: &str, invite: &str) -> (String, i64) {
-        self.send(C2S::Register { username: name.into(), password: "segredo-forte-1".into(), invite: invite.into() });
+        self.send(C2S::Register { username: name.into(), password: "segredo-forte-1".into(), invite: invite.into(), proto: telacast_proto::PROTO_VERSION });
         self.wait("o Auth do cadastro", |m| {
             if let S2C::Auth { token, me } = m {
                 Some((token.clone(), me.id))
@@ -139,7 +143,7 @@ fn fluxo_completo() {
 
     // --- cadastro fechado: sem convite válido não entra
     let mut c = env.client();
-    c.send(C2S::Register { username: "intruso".into(), password: "segredo-forte-1".into(), invite: "NAOEXISTE".into() });
+    c.send(C2S::Register { username: "intruso".into(), password: "segredo-forte-1".into(), invite: "NAOEXISTE".into(), proto: telacast_proto::PROTO_VERSION });
     assert!(c.error().contains("convite"), "esperava recusa por convite");
 
     // --- convite de 2 usos: duas contas entram, a terceira não
@@ -149,13 +153,13 @@ fn fluxo_completo() {
     let mut beto = env.client();
     let (_, beto_id) = beto.register("beto", &code.to_lowercase()); // minúsculas também valem
     let mut carla = env.client();
-    carla.send(C2S::Register { username: "carla".into(), password: "segredo-forte-1".into(), invite: code.clone() });
+    carla.send(C2S::Register { username: "carla".into(), password: "segredo-forte-1".into(), invite: code.clone(), proto: telacast_proto::PROTO_VERSION });
     assert!(carla.error().contains("convite"), "o convite esgotado deveria ser recusado");
 
     // nome já usado
     let code2 = env.invite(1);
     let mut dup = env.client();
-    dup.send(C2S::Register { username: "ANA".into(), password: "segredo-forte-1".into(), invite: code2.clone() });
+    dup.send(C2S::Register { username: "ANA".into(), password: "segredo-forte-1".into(), invite: code2.clone(), proto: telacast_proto::PROTO_VERSION });
     assert!(dup.error().contains("em uso"));
     // a falha não consumiu o convite: ainda dá para usá-lo
     let mut carla = env.client();
@@ -164,10 +168,10 @@ fn fluxo_completo() {
 
     // --- login
     let mut bad = env.client();
-    bad.send(C2S::Login { username: "ana".into(), password: "errada-errada".into() });
+    bad.send(C2S::Login { username: "ana".into(), password: "errada-errada".into(), proto: telacast_proto::PROTO_VERSION });
     assert!(bad.error().contains("incorretos"));
     let mut bad2 = env.client();
-    bad2.send(C2S::Login { username: "ninguem".into(), password: "errada-errada".into() });
+    bad2.send(C2S::Login { username: "ninguem".into(), password: "errada-errada".into(), proto: telacast_proto::PROTO_VERSION });
     assert!(bad2.error().contains("incorretos"), "usuário inexistente deve dar a mesma mensagem");
 
     // --- servidor, canal e convite de servidor
@@ -258,12 +262,12 @@ fn fluxo_completo() {
 
     // --- sessão: Resume funciona; Logout revoga o token
     let mut again = env.client();
-    again.send(C2S::Resume { token: ana_token.clone() });
+    again.send(C2S::Resume { token: ana_token.clone(), proto: telacast_proto::PROTO_VERSION });
     again.wait("Auth do Resume", |m| matches!(m, S2C::Auth { .. }).then_some(()));
     again.send(C2S::Logout);
     std::thread::sleep(Duration::from_millis(300));
     let mut after = env.client();
-    after.send(C2S::Resume { token: ana_token });
+    after.send(C2S::Resume { token: ana_token, proto: telacast_proto::PROTO_VERSION });
     assert!(after.error().contains("expirada"), "o token revogado não deve valer");
 }
 
@@ -273,7 +277,7 @@ fn limite_de_tentativas_de_login() {
     let mut last = String::new();
     for _ in 0..12 {
         let mut c = env.client();
-        c.send(C2S::Login { username: "alguem".into(), password: "errada-errada".into() });
+        c.send(C2S::Login { username: "alguem".into(), password: "errada-errada".into(), proto: telacast_proto::PROTO_VERSION });
         last = c.error();
     }
     assert!(last.contains("Muitas tentativas"), "depois de várias tentativas deveria bloquear: {last}");
@@ -348,7 +352,7 @@ fn responder_editar_apagar_e_ler() {
     // --- não lidos: o beto só leu quando mandar Ack
     let unread = |env: &Env| -> (i64, i64) {
         let mut c = env.client();
-        c.send(C2S::Login { username: "beto".into(), password: "segredo-forte-1".into() });
+        c.send(C2S::Login { username: "beto".into(), password: "segredo-forte-1".into(), proto: telacast_proto::PROTO_VERSION });
         let s = c.wait("snapshot do login", |m| if let S2C::Snapshot(s) = m { Some(s.clone()) } else { None });
         let ch = s.servers[0].channels.iter().find(|c| c.id == geral).unwrap();
         (ch.last_message_id, ch.last_read_id)
@@ -359,4 +363,30 @@ fn responder_editar_apagar_e_ler() {
     std::thread::sleep(Duration::from_millis(300));
     let (ultima2, lida2) = unread(&env);
     assert_eq!(lida2, ultima2, "depois do Ack o canal está lido");
+}
+
+#[test]
+fn versao_do_protocolo_e_codigos_de_erro() {
+    use telacast_proto::ErrorCode;
+    let env = Env::start();
+    // versão errada (ou ausente: cliente antigo manda 0) é recusada com código estável
+    let mut old = env.client();
+    old.send(C2S::Login { username: "ana".into(), password: "segredo-forte-1".into(), proto: 0 });
+    assert_eq!(old.error_code().0, ErrorCode::VersionMismatch);
+    let mut newer = env.client();
+    newer.send(C2S::Resume { token: "x".into(), proto: telacast_proto::PROTO_VERSION + 1 });
+    assert_eq!(newer.error_code().0, ErrorCode::VersionMismatch);
+    // códigos dos erros mais comuns
+    let mut c = env.client();
+    c.send(C2S::Login { username: "ninguem".into(), password: "errada-errada".into(), proto: telacast_proto::PROTO_VERSION });
+    assert_eq!(c.error_code().0, ErrorCode::InvalidCredentials);
+    let mut r = env.client();
+    r.send(C2S::Register { username: "ana".into(), password: "segredo-forte-1".into(), invite: "NAOEXISTE".into(), proto: telacast_proto::PROTO_VERSION });
+    assert_eq!(r.error_code().0, ErrorCode::InvalidInvite);
+    let mut s = env.client();
+    s.send(C2S::Resume { token: "sessao-que-nao-existe".into(), proto: telacast_proto::PROTO_VERSION });
+    assert_eq!(s.error_code().0, ErrorCode::SessionExpired);
+    let mut n = env.client();
+    n.send(C2S::CreateServer { name: "sem login".into() });
+    assert_eq!(n.error_code().0, ErrorCode::NotAuthenticated);
 }

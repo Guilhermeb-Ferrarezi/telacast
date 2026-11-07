@@ -15,7 +15,7 @@ use axum::{
 };
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use p::{C2S, S2C};
+use p::{ErrorCode, C2S, S2C, PROTO_VERSION};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -86,6 +86,7 @@ struct App {
 
 const ERR_BUSY: &str = "Muitas ações em pouco tempo. Aguarde um instante.";
 const ERR_INTERNAL: &str = "Erro interno do servidor.";
+const ERR_VERSION: &str = "Versão do app incompatível com o servidor. Atualize o Telacast.";
 
 impl App {
     async fn hash_password(&self, pw: String) -> Result<String, String> {
@@ -433,14 +434,14 @@ async fn finish_login(
             let t = auth::new_token();
             if let Err(e) = app.store.create_session(app.sf.next(), uid, &auth::hash_token(&t)).await {
                 error!("create_session: {e}");
-                let _ = tx.send(S2C::Error { msg: ERR_INTERNAL.into() });
+                let _ = tx.send(S2C::Error { code: ErrorCode::Internal, msg: ERR_INTERNAL.into() });
                 return;
             }
             t
         }
     };
     let Ok(Some(name)) = app.store.display_name(uid).await else {
-        let _ = tx.send(S2C::Error { msg: ERR_INTERNAL.into() });
+        let _ = tx.send(S2C::Error { code: ErrorCode::Internal, msg: ERR_INTERNAL.into() });
         return;
     };
     *session = Some(Session { uid, token_hash: auth::hash_token(&token) });
@@ -458,65 +459,73 @@ async fn handle(
     ip: &str,
     m: C2S,
 ) -> bool {
-    let err = |s: &str| {
-        let _ = tx.send(S2C::Error { msg: s.into() });
+    let err = |code: ErrorCode, s: &str| {
+        let _ = tx.send(S2C::Error { code, msg: s.into() });
     };
     match m {
-        C2S::Register { username, password, invite } => {
+        C2S::Register { username, password, invite, proto } => {
             if session.is_some() {
                 return true;
             }
+            if proto != PROTO_VERSION {
+                err(ErrorCode::VersionMismatch, ERR_VERSION);
+                return true;
+            }
             if !app.auth_limit.allow(&format!("auth:{ip}"), 10, Duration::from_secs(300)) {
-                err("Muitas tentativas. Tente de novo em alguns minutos.");
+                err(ErrorCode::RateLimited, "Muitas tentativas. Tente de novo em alguns minutos.");
                 return true;
             }
             let name = username.trim();
             let valid = (3..=32).contains(&name.chars().count())
                 && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-'));
             if !valid {
-                err("Nome de usuário: 3 a 32 caracteres (letras, números, _ . -)");
+                err(ErrorCode::InvalidInput, "Nome de usuário: 3 a 32 caracteres (letras, números, _ . -)");
                 return true;
             }
             if !(8..=128).contains(&password.chars().count()) {
-                err("A senha precisa ter de 8 a 128 caracteres");
+                err(ErrorCode::InvalidInput, "A senha precisa ter de 8 a 128 caracteres");
                 return true;
             }
             let code = auth::normalize_code(&invite);
             if code.is_empty() {
-                err("Informe o código de convite");
+                err(ErrorCode::InvalidInvite, "Informe o código de convite");
                 return true;
             }
             let Ok(hash) = app.hash_password(password).await else {
-                err(ERR_INTERNAL);
+                err(ErrorCode::Internal, ERR_INTERNAL);
                 return true;
             };
             match app.store.register(app.sf.next(), name, &hash, &auth::hash_token(&code)).await {
                 Ok(id) => finish_login(app, tx, session, cid, id, None).await,
-                Err(RegisterError::InvalidInvite) => err("Código de convite inválido, expirado ou já usado"),
-                Err(RegisterError::Taken) => err("Esse nome de usuário já está em uso"),
+                Err(RegisterError::InvalidInvite) => err(ErrorCode::InvalidInvite, "Código de convite inválido, expirado ou já usado"),
+                Err(RegisterError::Taken) => err(ErrorCode::UsernameTaken, "Esse nome de usuário já está em uso"),
                 Err(RegisterError::Db(e)) => {
                     error!("register: {e}");
-                    err(ERR_INTERNAL);
+                    err(ErrorCode::Internal, ERR_INTERNAL);
                 }
             }
             true
         }
-        C2S::Login { username, password } => {
+        C2S::Login { username, password, proto } => {
             if session.is_some() {
+                return true;
+            }
+            if proto != PROTO_VERSION {
+                err(ErrorCode::VersionMismatch, ERR_VERSION);
                 return true;
             }
             let uname = username.trim().to_lowercase();
             if !app.auth_limit.allow(&format!("auth:{ip}"), 10, Duration::from_secs(300))
                 || !app.auth_limit.allow(&format!("login:{uname}"), 10, Duration::from_secs(300))
             {
-                err("Muitas tentativas. Tente de novo em alguns minutos.");
+                err(ErrorCode::RateLimited, "Muitas tentativas. Tente de novo em alguns minutos.");
                 return true;
             }
             let row = match app.store.user_by_username(&uname).await {
                 Ok(r) => r,
                 Err(e) => {
                     error!("login: {e}");
-                    err(ERR_INTERNAL);
+                    err(ErrorCode::Internal, ERR_INTERNAL);
                     return true;
                 }
             };
@@ -528,27 +537,31 @@ async fn handle(
             let ok = app.verify_password(password, hash).await;
             match id {
                 Some(id) if ok => finish_login(app, tx, session, cid, id, None).await,
-                _ => err("Usuário ou senha incorretos"),
+                _ => err(ErrorCode::InvalidCredentials, "Usuário ou senha incorretos"),
             }
             true
         }
-        C2S::Resume { token } => {
+        C2S::Resume { token, proto } => {
             if session.is_some() {
+                return true;
+            }
+            if proto != PROTO_VERSION {
+                err(ErrorCode::VersionMismatch, ERR_VERSION);
                 return true;
             }
             match app.store.session_user(&auth::hash_token(&token)).await {
                 Ok(Some(id)) => finish_login(app, tx, session, cid, id, Some(token)).await,
-                Ok(None) => err("Sessão expirada"),
+                Ok(None) => err(ErrorCode::SessionExpired, "Sessão expirada"),
                 Err(e) => {
                     error!("resume: {e}");
-                    err(ERR_INTERNAL);
+                    err(ErrorCode::Internal, ERR_INTERNAL);
                 }
             }
             true
         }
         other => {
             let Some(s) = session.as_ref() else {
-                err("Faça login primeiro");
+                err(ErrorCode::NotAuthenticated, "Faça login primeiro");
                 return true;
             };
             let (me, token_hash) = (s.uid, s.token_hash.clone());
@@ -564,13 +577,13 @@ async fn handle_authed(
     token_hash: &[u8],
     m: C2S,
 ) -> bool {
-    let err = |s: &str| {
-        let _ = tx.send(S2C::Error { msg: s.into() });
+    let err = |code: ErrorCode, s: &str| {
+        let _ = tx.send(S2C::Error { code, msg: s.into() });
     };
     let busy = |key: &str, max: usize, secs: u64| !app.limits.allow(&format!("{key}:{me}"), max, Duration::from_secs(secs));
     let db_err = |what: &str, e: sqlx::Error| {
         error!("{what}: {e}");
-        let _ = tx.send(S2C::Error { msg: ERR_INTERNAL.into() });
+        let _ = tx.send(S2C::Error { code: ErrorCode::Internal, msg: ERR_INTERNAL.into() });
     };
     match m {
         C2S::Logout => {
@@ -580,9 +593,9 @@ async fn handle_authed(
         C2S::CreateServer { name } => {
             let name = name.trim();
             if name.is_empty() || name.chars().count() > 50 {
-                err("Nome do servidor: 1 a 50 caracteres");
+                err(ErrorCode::InvalidInput, "Nome do servidor: 1 a 50 caracteres");
             } else if busy("mkserver", 5, 3600) {
-                err(ERR_BUSY);
+                err(ErrorCode::RateLimited, ERR_BUSY);
             } else {
                 let sid = app.sf.next();
                 match app.store.create_server(sid, app.sf.next(), app.sf.next(), me, name, &auth::new_code()).await {
@@ -596,7 +609,7 @@ async fn handle_authed(
         }
         C2S::JoinServer { code } => {
             if busy("join", 10, 600) {
-                err(ERR_BUSY);
+                err(ErrorCode::RateLimited, ERR_BUSY);
             } else {
                 match app.store.join_by_invite(&auth::normalize_code(&code), me).await {
                     Ok(Some(sid)) => {
@@ -604,7 +617,7 @@ async fn handle_authed(
                         app.push_many(&ids).await;
                         let _ = tx.send(S2C::ServerJoined { server_id: sid });
                     }
-                    Ok(None) => err("Convite inválido, expirado ou esgotado"),
+                    Ok(None) => err(ErrorCode::InvalidInvite, "Convite inválido, expirado ou esgotado"),
                     Err(e) => db_err("join_by_invite", e),
                 }
             }
@@ -617,13 +630,13 @@ async fn handle_authed(
                 .map(|c| if c.is_whitespace() { '-' } else { c })
                 .collect();
             if kind != 0 && kind != 4 {
-                err("Tipo de canal inválido");
+                err(ErrorCode::InvalidInput, "Tipo de canal inválido");
             } else if name.is_empty() || name.chars().count() > 32 {
-                err("Nome do canal: 1 a 32 caracteres");
+                err(ErrorCode::InvalidInput, "Nome do canal: 1 a 32 caracteres");
             } else if busy("mkchan", 20, 3600) {
-                err(ERR_BUSY);
+                err(ErrorCode::RateLimited, ERR_BUSY);
             } else if app.store.server_owner(server_id).await.ok().flatten() != Some(me) {
-                err("Só o dono do servidor cria canais");
+                err(ErrorCode::Forbidden, "Só o dono do servidor cria canais");
             } else {
                 let parent = if kind == 4 { None } else { parent_id };
                 match app.store.create_channel(app.sf.next(), server_id, &name, kind as i16, parent).await {
@@ -631,7 +644,7 @@ async fn handle_authed(
                         let ids = app.store.server_member_ids(server_id).await.unwrap_or_default();
                         app.push_many(&ids).await;
                     }
-                    Ok(false) => err("Categoria não encontrada"),
+                    Ok(false) => err(ErrorCode::NotFound, "Categoria não encontrada"),
                     Err(e) => db_err("create_channel", e),
                 }
             }
@@ -642,7 +655,7 @@ async fn handle_authed(
                 return true;
             }
             if busy("send", 12, 10) {
-                err(ERR_BUSY);
+                err(ErrorCode::RateLimited, ERR_BUSY);
                 return true;
             }
             match app.store.can_access(channel_id, me).await {
@@ -664,16 +677,16 @@ async fn handle_authed(
                     // quem escreve já leu a própria mensagem
                     let _ = app.store.ack(me, channel_id, id).await;
                 }
-                Ok(None) => err("A mensagem respondida não existe mais"),
+                Ok(None) => err(ErrorCode::NotFound, "A mensagem respondida não existe mais"),
                 Err(e) => db_err("insert_message", e),
             }
         }
         C2S::Edit { message_id, content } => {
             let content = content.trim();
             if content.is_empty() || content.chars().count() > 4000 {
-                err("A mensagem precisa ter de 1 a 4000 caracteres");
+                err(ErrorCode::InvalidInput, "A mensagem precisa ter de 1 a 4000 caracteres");
             } else if busy("edit", 20, 30) {
-                err(ERR_BUSY);
+                err(ErrorCode::RateLimited, ERR_BUSY);
             } else {
                 match app.store.edit_message(message_id, me, content).await {
                     Ok(Some(channel_id)) => {
@@ -682,14 +695,14 @@ async fn handle_authed(
                             app.send_to(u, &out);
                         }
                     }
-                    Ok(None) => err("Só o autor edita a mensagem"),
+                    Ok(None) => err(ErrorCode::Forbidden, "Só o autor edita a mensagem"),
                     Err(e) => db_err("edit_message", e),
                 }
             }
         }
         C2S::Delete { message_id } => {
             if busy("delete", 30, 30) {
-                err(ERR_BUSY);
+                err(ErrorCode::RateLimited, ERR_BUSY);
             } else {
                 match app.store.delete_message(message_id, me).await {
                     Ok(Some(channel_id)) => {
@@ -698,7 +711,7 @@ async fn handle_authed(
                             app.send_to(u, &out);
                         }
                     }
-                    Ok(None) => err("Você não pode apagar esta mensagem"),
+                    Ok(None) => err(ErrorCode::Forbidden, "Você não pode apagar esta mensagem"),
                     Err(e) => db_err("delete_message", e),
                 }
             }
@@ -732,17 +745,17 @@ async fn handle_authed(
         },
         C2S::FriendRequest { username } => {
             if busy("friend", 20, 3600) {
-                err(ERR_BUSY);
+                err(ErrorCode::RateLimited, ERR_BUSY);
                 return true;
             }
             let Ok(Some(other)) = app.store.find_user_id(username.trim()).await else {
-                err("Usuário não encontrado");
+                err(ErrorCode::NotFound, "Usuário não encontrado");
                 return true;
             };
             if other == me {
-                err("Você não pode adicionar a si mesmo");
+                err(ErrorCode::InvalidInput, "Você não pode adicionar a si mesmo");
             } else if app.store.are_friends(me, other).await.unwrap_or(false) {
-                err("Vocês já são amigos");
+                err(ErrorCode::InvalidInput, "Vocês já são amigos");
             } else if let Err(e) = app.store.friend_request(me, other).await {
                 db_err("friend_request", e);
             } else {
@@ -766,7 +779,7 @@ async fn handle_authed(
         C2S::OpenDm { user_id } => {
             let allowed = app.store.related_users(me).await.unwrap_or_default().contains(&user_id);
             if !allowed {
-                err("Você só pode conversar com amigos ou membros dos seus servidores");
+                err(ErrorCode::Forbidden, "Você só pode conversar com amigos ou membros dos seus servidores");
             } else {
                 match app.store.open_dm(app.sf.next(), me, user_id).await {
                     Ok(channel_id) => {

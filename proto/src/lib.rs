@@ -1,6 +1,30 @@
 //! Protocolo do gateway (JSON sobre WebSocket) entre cliente e servidor.
 use serde::{Deserialize, Serialize};
 
+/// Versão do protocolo. Sobe quando uma mudança quebra clientes antigos; o servidor recusa outra versão
+/// no login com `ErrorCode::VersionMismatch`.
+pub const PROTO_VERSION: u32 = 1;
+
+/// Motivo estável de um erro, para o cliente decidir o que fazer sem ler o texto.
+/// Um código desconhecido (servidor mais novo) vira `Unknown`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ErrorCode {
+    InvalidCredentials,
+    InvalidInvite,
+    UsernameTaken,
+    SessionExpired,
+    NotAuthenticated,
+    RateLimited,
+    Forbidden,
+    NotFound,
+    InvalidInput,
+    VersionMismatch,
+    Internal,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct User {
     pub id: i64,
@@ -94,9 +118,9 @@ pub struct Message {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum C2S {
     /// `invite`: código de convite da instância (cadastro fechado).
-    Register { username: String, password: String, invite: String },
-    Login { username: String, password: String },
-    Resume { token: String },
+    Register { username: String, password: String, invite: String, #[serde(default)] proto: u32 },
+    Login { username: String, password: String, #[serde(default)] proto: u32 },
+    Resume { token: String, #[serde(default)] proto: u32 },
     /// Encerra a sessão (revoga o token) e fecha a conexão.
     Logout,
     CreateServer { name: String },
@@ -123,7 +147,11 @@ pub enum C2S {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum S2C {
     Auth { token: String, me: User },
-    Error { msg: String },
+    Error {
+        #[serde(default)]
+        code: ErrorCode,
+        msg: String,
+    },
     Snapshot(Snapshot),
     Message(Message),
     /// Mensagens em ordem cronológica.
@@ -133,4 +161,23 @@ pub enum S2C {
     Typing { channel_id: i64, user_id: i64 },
     DmOpened { channel_id: i64 },
     ServerJoined { server_id: i64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codigo_desconhecido_vira_unknown() {
+        let c: ErrorCode = serde_json::from_str("\"CodigoDoFuturo\"").unwrap();
+        assert_eq!(c, ErrorCode::Unknown);
+        let e: S2C = serde_json::from_str(r#"{"Error":{"msg":"x"}}"#).unwrap();
+        assert!(matches!(e, S2C::Error { code: ErrorCode::Unknown, .. }), "servidor antigo sem código também lê");
+    }
+
+    #[test]
+    fn login_antigo_sem_versao_le_como_zero() {
+        let m: C2S = serde_json::from_str(r#"{"Login":{"username":"a","password":"b"}}"#).unwrap();
+        assert!(matches!(m, C2S::Login { proto: 0, .. }));
+    }
 }

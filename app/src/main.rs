@@ -266,7 +266,7 @@ impl Session {
             if Instant::now() >= *retry_at {
                 let attempt = *attempt;
                 self.gw = gateway::open(&self.server, self.ctx.clone());
-                self.gw.send(C2S::Resume { token: self.token.clone() });
+                self.gw.send(C2S::Resume { token: self.token.clone(), proto: p::PROTO_VERSION });
                 self.link = Link::Resuming { attempt };
             } else {
                 self.ctx.request_repaint_after(Duration::from_millis(500));
@@ -286,9 +286,20 @@ impl Session {
                     break;
                 }
                 Event::Connected => {}
-                Event::Msg(S2C::Error { msg }) if matches!(self.link, Link::Resuming { .. }) => {
-                    // o servidor recusou a sessão (expirou ou foi revogada): volta para o login
-                    return Some(msg);
+                Event::Msg(S2C::Error { code, msg }) if matches!(self.link, Link::Resuming { .. }) => {
+                    use p::ErrorCode::*;
+                    if matches!(code, SessionExpired | NotAuthenticated | VersionMismatch | InvalidCredentials) {
+                        // a sessão não vale mais (ou o app ficou velho demais): volta para o login
+                        return Some(msg);
+                    }
+                    // erro passageiro (limite, falha interna): tenta de novo mais tarde
+                    let attempt = match &self.link {
+                        Link::Resuming { attempt } => attempt + 1,
+                        _ => 1,
+                    };
+                    let wait = (1u64 << (attempt - 1).min(4)).min(15);
+                    self.link = Link::Down { attempt, retry_at: Instant::now() + Duration::from_secs(wait), why: msg };
+                    break;
                 }
                 Event::Msg(S2C::Auth { .. }) if matches!(self.link, Link::Resuming { .. }) => {
                     self.link = Link::Up;
@@ -353,7 +364,7 @@ impl Session {
                     }
                     S2C::DmOpened { channel_id } => self.open(View::Dm(channel_id)),
                     S2C::ServerJoined { server_id } => self.open_server(server_id),
-                    S2C::Error { msg } => self.toast = Some((msg, Instant::now())),
+                    S2C::Error { msg, .. } => self.toast = Some((msg, Instant::now())),
                     S2C::Auth { .. } => {}
                 },
             }
@@ -408,7 +419,7 @@ impl App {
         let token = get("token");
         if !token.is_empty() {
             login.gw = Some(gateway::open(&login.server, cc.egui_ctx.clone()));
-            login.pending = Some(C2S::Resume { token: token.clone() });
+            login.pending = Some(C2S::Resume { token: token.clone(), proto: p::PROTO_VERSION });
             login.resuming = true;
         }
         Self {
@@ -432,9 +443,9 @@ impl App {
         l.gw = Some(gateway::open(&l.server, ctx.clone()));
         let (username, password, invite) = (l.user.trim().to_string(), l.pass.clone(), l.invite.clone());
         l.pending = Some(if l.register {
-            C2S::Register { username, password, invite }
+            C2S::Register { username, password, invite, proto: p::PROTO_VERSION }
         } else {
-            C2S::Login { username, password }
+            C2S::Login { username, password, proto: p::PROTO_VERSION }
         });
     }
 
@@ -456,9 +467,14 @@ impl App {
                     self.session = Some(Session::new(gw, self.login.server.clone(), ctx.clone(), token, me));
                     return;
                 }
-                Event::Msg(S2C::Error { msg }) => {
+                Event::Msg(S2C::Error { code, msg }) => {
                     if self.login.resuming {
-                        self.token_saved.clear();
+                        // só descarta a sessão salva se o servidor disse que ela não vale mais
+                        if matches!(code, p::ErrorCode::SessionExpired | p::ErrorCode::NotAuthenticated | p::ErrorCode::VersionMismatch) {
+                            self.token_saved.clear();
+                        } else {
+                            self.login.error = msg;
+                        }
                     } else {
                         self.login.error = msg;
                     }
