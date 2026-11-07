@@ -36,7 +36,7 @@ Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação,
 | Cadastro | **fechado, só com convite** da instância (`telacast-server invite`) | O código aparece uma vez; no banco fica o hash |
 | Tokens | opacos, só o hash no banco, com validade (30 dias deslizantes) e `Logout` | |
 | Hospedagem | **VPS Oracle, Ampere A1 (ARM), 2 núcleos e 12 GB**; compilar na própria VPS | Local por enquanto (Marco A ainda não chegou) |
-| Plataformas | Desktop agora; **Android depois** (ver "Plano Android") | O protocolo JSON/WebSocket precisa ficar estável e documentado |
+| Plataformas | Desktop agora; **Android só depois de terminar o desktop** (Fases 0 a 4; ver "Plano Android") | O protocolo JSON/WebSocket precisa ficar estável e documentado |
 | Git | repositório criado; commits sem linha de coautoria | |
 | Medições | PC do desenvolvimento: Ryzen 7 5700X (16 threads), RTX 5060 Ti, 15 GB de RAM (apertada) | O gargalo do PC é memória, não CPU |
 
@@ -198,14 +198,23 @@ Nenhum número errado entrou neste roadmap.
 **Decodificação na placa (NVDEC) rebaixada:** com um Ryzen 7 5700X, decodificar 1080p a 60 fps por software cabe num núcleo.
 Fica relevante só para 4K ou 144 fps.
 
-## Plano Android (depois do desktop)
+## Plano Android (só depois do desktop)
 
-Caminho recomendado: **app nativo Kotlin + Jetpack Compose**, falando o mesmo protocolo (captura por `MediaProjection`, vídeo
-por `MediaCodec`). Alternativa: egui no Android com JNI (uma linguagem só, experiência mais crua no celular). Tauri descartado
-para o desktop por causa do vídeo no WebKitGTK.
-Exigências para o servidor, já na Fase 0: **TLS obrigatório** (o Android bloqueia `ws://`), protocolo **versionado e
-documentado**, token por dispositivo, e **notificações push** (Firebase ou serviço próprio). Escopo a definir: só chat e assistir,
-ou também transmitir a tela do celular. Precisa de Android Studio, SDK e NDK.
+**Ordem decidida (2026-11-07):** o Android **só começa quando o desktop estiver terminado**, isto é, Fases 0 a 4 concluídas (a Fase 5, extensibilidade, é opcional e não bloqueia). Até lá, nada de código Android.
+
+**Plano detalhado:** [`docs/MOBILE-PLAN.md`](docs/MOBILE-PLAN.md) (stack, passos A1–D3, protocolo de execução sem supervisão, riscos). Resumo:
+- App nativo **Kotlin + Jetpack Compose** com o tema Grafite; mesmo protocolo JSON/WebSocket do desktop, garantido por arquivos de exemplo (`proto/fixtures/`) lidos pelo Rust e pelo Kotlin; telas conferidas por captura (Paparazzi), sem aparelho.
+- Vídeo por `MediaCodec` (assistir) e `MediaProjection` (transmitir); notificações locais primeiro, push (FCM) só depois do servidor público.
+- Egui no Android descartado (sem campo de texto nativo nem acessibilidade; tudo de vídeo e notificação viraria JNI).
+
+**Exigências para o servidor** (entram nas Fases 0 a 4 do desktop, para o mobile não pedir retrabalho): TLS (`wss://`, o Android bloqueia `ws://` fora de debug), protocolo **versionado** e estável, token por dispositivo, histórico paginado por id, e push (Firebase ou serviço próprio) quando houver servidor público.
+
+**Ambiente (já existe):** JDK 21, Android SDK 34, Gradle 8.9 em `~/Android/gradle-8.9` e a receita de build com pouca memória do projeto do widget. **NDK não é necessário** (Kotlin puro). Celular de teste: Redmi Note 9S (`f9b56d3c`); não tocar na tela sem pedir.
+
+**Já feito de preparação (nada disso é código do app):**
+- Plano e stack escritos (`docs/MOBILE-PLAN.md`).
+- APK do Discord Android 352.17 puxado do celular para `~/discord-mobile/apk/` (fora do repositório; **não commitar**). Achado: o app é **React Native com JavaScript em bytecode Hermes versão 98** (`assets/index.android.bundle`, 70 MB), então a interface não sai legível por decompilação comum. O que dá para extrair: textos (JSON de internacionalização em `res/raw`), recursos e cores (`resources.arsc`), layouts nativos (172), classes Kotlin (3 `.dex`) e bibliotecas nativas. Análise com o REA fica para essa fase; o REA pede um JAR do JADX que ainda não está instalado.
+- Para o desktop, os 10 documentos de `docs/ui-spec/` (extraídos do cliente web) servem de referência de comportamento; no mobile, o que muda é o layout (gaveta, folhas inferiores, toque longo), não as regras.
 
 ## Fora do escopo (decisão: não fazer por enquanto)
 
