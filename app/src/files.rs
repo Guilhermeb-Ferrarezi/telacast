@@ -138,7 +138,7 @@ impl Images {
             self.map.insert(
                 id,
                 match img {
-                    Some(ci) => Img::Ready(ctx.load_texture(format!("att-{id}"), ci, egui::TextureOptions::LINEAR)),
+                    Some(ci) => Img::Ready(ctx.load_texture(format!("att{id}"), ci, egui::TextureOptions::LINEAR)),
                     None => Img::Failed,
                 },
             );
@@ -147,26 +147,35 @@ impl Images {
     }
 
     pub fn get(&mut self, ctx: &egui::Context, base: &str, token: &str, a: &p::Attachment) -> &Img {
-        if !self.map.contains_key(&a.id) && self.inflight < MAX_INFLIGHT {
-            self.map.insert(a.id, Img::Loading);
+        self.load(a.id, ctx, url(base, a, token), (1200, 900))
+    }
+
+    /// Versão grande para a prévia (até 4096 px de lado). Fica sob a chave `-id`.
+    pub fn get_full(&mut self, ctx: &egui::Context, base: &str, token: &str, a: &p::Attachment) -> &Img {
+        self.load(-a.id, ctx, url(base, a, token), (4096, 4096))
+    }
+
+    fn load(&mut self, key: i64, ctx: &egui::Context, u: String, lim: (u32, u32)) -> &Img {
+        if !self.map.contains_key(&key) && self.inflight < MAX_INFLIGHT {
+            self.map.insert(key, Img::Loading);
             self.inflight += 1;
-            let (tx, ctx2, u, id) = (self.tx.clone(), ctx.clone(), url(base, a, token), a.id);
+            let (tx, ctx2) = (self.tx.clone(), ctx.clone());
             std::thread::spawn(move || {
-                let _ = tx.send((id, fetch_image(&u)));
+                let _ = tx.send((key, fetch_image(&u, lim)));
                 ctx2.request_repaint();
             });
         }
-        self.map.get(&a.id).unwrap_or(&Img::Loading)
+        self.map.get(&key).unwrap_or(&Img::Loading)
     }
 }
 
-fn fetch_image(url: &str) -> Option<egui::ColorImage> {
+fn fetch_image(url: &str, lim: (u32, u32)) -> Option<egui::ColorImage> {
     let resp = agent().get(url).call().ok()?;
     let mut bytes = Vec::new();
     resp.into_reader().take(MAX_DOWNLOAD).read_to_end(&mut bytes).ok()?;
     let img = image::load_from_memory(&bytes).ok()?;
-    // miniatura: o chat mostra no máximo 400x300, mas guardamos 2x para telas densas
-    let img = if img.width() > 1200 || img.height() > 900 { img.thumbnail(1200, 900) } else { img };
+    // miniatura do chat: mostra no máximo 400x300, guardamos 1200x900 para telas densas
+    let img = if img.width() > lim.0 || img.height() > lim.1 { img.thumbnail(lim.0, lim.1) } else { img };
     let rgba = img.to_rgba8();
     Some(egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
 }

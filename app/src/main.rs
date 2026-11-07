@@ -84,6 +84,7 @@ enum Modal {
     DeleteMsg { id: i64, preview: String },
     ConfirmBlock { user_id: i64, name: String },
     Account { old: String, new: String, again: String },
+    Preview(p::Attachment),
 }
 
 enum Act {
@@ -1127,7 +1128,7 @@ fn attachment_view(ui: &mut egui::Ui, a: &p::Attachment, base: &str, token: &str
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
                 if r.clicked() {
-                    open(ui);
+                    acts.push(Act::Modal(Modal::Preview(a.clone())));
                 }
                 return;
             }
@@ -3053,6 +3054,52 @@ impl App {
                             close = true;
                         }
                     });
+            }
+            Modal::Preview(a) => {
+                let (base, token) = (s.http_base.clone(), s.token.clone());
+                let thumb = match s.images.get(ctx, &base, &token, a) {
+                    files::Img::Ready(t) => Some(t.clone()),
+                    _ => None,
+                };
+                let tex = match s.images.get_full(ctx, &base, &token, a) {
+                    files::Img::Ready(t) => Some(t.clone()),
+                    _ => thumb,
+                };
+                let screen = ctx.content_rect();
+                let max = egui::vec2((screen.width() - 120.0).max(200.0), (screen.height() - 150.0).max(150.0));
+                let m = egui::Modal::new(egui::Id::new("img-preview"))
+                    .backdrop_color(egui::Color32::from_black_alpha(220))
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            match &tex {
+                                Some(t) => {
+                                    let sz = t.size_vec2();
+                                    let k = (max.x / sz.x).min(max.y / sz.y);
+                                    ui.add(egui::Image::new(t).fit_to_exact_size(sz * k).corner_radius(egui::CornerRadius::same(6)));
+                                }
+                                None => {
+                                    ui.add_space(max.y / 2.0);
+                                    ui.label(RichText::new("Carregando…").color(MUTED));
+                                    ui.add_space(max.y / 2.0);
+                                    ctx.request_repaint_after(Duration::from_millis(200));
+                                }
+                            }
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("{} · {}", a.name, files::human_size(a.size))).size(13.0).color(TEXT2));
+                                if small_button(ui, "Baixar", FIELD) {
+                                    ctx.open_url(egui::OpenUrl::new_tab(files::url(&base, a, &token)));
+                                }
+                                if small_button(ui, "Fechar", FIELD) {
+                                    ui.close();
+                                }
+                            });
+                        });
+                    });
+                if m.should_close() {
+                    dismissed = true;
+                }
             }
             Modal::Account { old, new, again } => {
                 let sessions = s.sessions.clone();
