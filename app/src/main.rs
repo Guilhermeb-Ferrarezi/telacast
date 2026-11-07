@@ -104,6 +104,96 @@ struct Profile {
     more: bool,
 }
 
+/// Um item da grade do diálogo "Transmitir": a fonte e a miniatura mais recente.
+struct GoItem {
+    info: capture::SourceInfo,
+    tex: Option<egui::TextureHandle>,
+}
+
+type GoRaw = Vec<(capture::SourceInfo, Option<capture::Thumb>)>;
+
+/// Estado do diálogo "Transmitir" (fonte + qualidade).
+struct GoLive {
+    /// 0 = telas, 1 = janelas.
+    tab: u8,
+    source: Option<capture::Source>,
+    /// Altura final; `None` = a da fonte.
+    res: Option<u32>,
+    /// 0 personalizado, 1 fluidez, 2 nitidez.
+    preset: u8,
+    advanced: bool,
+    /// Bitrate manual (kbps); `None` = automático pela resolução e taxa.
+    kbps: Option<u32>,
+    items: Vec<GoItem>,
+    rx: Option<std::sync::mpsc::Receiver<GoRaw>>,
+    last: Option<Instant>,
+    busy: bool,
+}
+
+impl GoLive {
+    fn new() -> Self {
+        Self { tab: 0, source: None, res: Some(1080), preset: 1, advanced: false, kbps: None, items: Vec::new(), rx: None, last: None, busy: false }
+    }
+
+    /// Atualiza as miniaturas em segundo plano (a cada ~2 s enquanto o diálogo está aberto).
+    fn refresh(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.rx {
+            if let Ok(raw) = rx.try_recv() {
+                self.items = raw
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (info, th))| GoItem {
+                        info,
+                        tex: th.map(|t| {
+                            ctx.load_texture(
+                                format!("golive-{i}"),
+                                egui::ColorImage::from_rgba_unmultiplied([t.width as usize, t.height as usize], &t.rgba),
+                                egui::TextureOptions::LINEAR,
+                            )
+                        }),
+                    })
+                    .collect();
+                self.busy = false;
+                if self.source.is_none() || !self.items.iter().any(|i| Some(&i.info.source) == self.source.as_ref()) {
+                    // sem escolha (ou a janela escolhida sumiu): a primeira tela
+                    if self.source.is_none() {
+                        self.source = self.items.iter().find(|i| matches!(i.info.source, capture::Source::Monitor(_))).map(|i| i.info.source.clone());
+                    }
+                }
+            }
+        }
+        if !self.busy && self.last.map_or(true, |t| t.elapsed() > Duration::from_secs(2)) {
+            let (tx, ctx2) = {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.rx = Some(rx);
+                (tx, ctx.clone())
+            };
+            self.busy = true;
+            self.last = Some(Instant::now());
+            std::thread::spawn(move || {
+                let mut out: GoRaw = Vec::new();
+                for info in capture::list_monitors().into_iter().chain(capture::list_windows()) {
+                    let th = capture::thumbnail(&info.source, 312);
+                    out.push((info, th));
+                }
+                let _ = tx.send(out);
+                ctx2.request_repaint();
+            });
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
+    fn selected(&self) -> Option<&capture::SourceInfo> {
+        self.items.iter().map(|i| &i.info).find(|i| Some(&i.source) == self.source.as_ref())
+    }
+
+    /// Qualidade escolhida para a fonte `info`.
+    fn quality(&self, info: &capture::SourceInfo, fps: u32) -> publisher::Quality {
+        let out_h = publisher::output_size(info.width, info.height, self.res).1;
+        publisher::Quality { height: self.res, fps, kbps: self.kbps.unwrap_or_else(|| publisher::suggested_kbps(out_h, fps)) }
+    }
+}
+
 /// Anexos por mensagem e envios simultâneos.
 const MAX_ATTACH: usize = 10;
 const MAX_PARALLEL: usize = 3;
@@ -1156,6 +1246,7 @@ struct App {
     voice_out: Option<String>,
     monitors: Vec<String>,
     monitor: usize,
+    golive: GoLive,
     publishing: Option<(i64, publisher::Handle)>,
     watching: Option<(i64, viewer::Handle)>,
     texture: Option<egui::TextureHandle>,
@@ -1201,6 +1292,7 @@ impl App {
             fps: get("fps").parse().unwrap_or(60),
             kbps: get("kbps").parse().unwrap_or(8000),
             monitors: publisher::monitor_names(),
+            golive: GoLive::new(),
             monitor: 0,
             publishing: None,
             watching: None,
@@ -2414,7 +2506,11 @@ impl App {
                 Act::Publish(ch) => {
                     self.stop_publish();
                     let url = net::url(&self.login.server, "publish", ch, &s.token);
-                    self.publishing = Some((ch, publisher::start(url, self.monitor, self.fps, self.kbps)));
+                    let (source, q) = match self.golive.selected() {
+                        Some(info) => (info.source.clone(), self.golive.quality(info, self.fps)),
+                        None => (capture::Source::Monitor(self.monitor), publisher::Quality { height: self.golive.res, fps: self.fps, kbps: self.kbps }),
+                    };
+                    self.publishing = Some((ch, publisher::start_source(url, source, q)));
                 }
                 Act::StopPublish => self.stop_publish(),
                 Act::Fullscreen => {
@@ -3363,6 +3459,9 @@ impl App {
                         let done = st.starts_with("erro") || st == "parado";
                         if small_button(ui, if done { "Fechar" } else { "Parar transmissão" }, RED) {
                             acts.push(Act::StopPublish);
+                        }
+                        if !done && small_button(ui, "Qualidade", FIELD) {
+                            acts.push(Act::Modal(Modal::GoLive));
                         }
                         dot(ui, status_color(&st));
                         ui.label(RichText::new(if *pch == ch { st } else { format!("{st} (outro canal)") }).size(12.0));
@@ -4583,42 +4682,179 @@ impl App {
                     });
             }
             Modal::GoLive => {
-                modal(ctx, "Transmitir tela", 360.0, &mut dismissed, |ui| {
-                        ui.set_width(320.0);
-                        ui.label(caps(&"TELA"));
-                        egui::ComboBox::from_id_salt("mon")
-                            .width(ui.available_width())
-                            .selected_text(self.monitors.get(self.monitor).cloned().unwrap_or_default())
-                            .show_ui(ui, |ui| {
-                                for (i, n) in self.monitors.iter().enumerate() {
-                                    ui.selectable_value(&mut self.monitor, i, n);
-                                }
-                            });
-                        ui.label(caps(&"QUADROS POR SEGUNDO"));
-                        ui.horizontal_wrapped(|ui| {
-                            for f in [30, 60, 90, 120, 144] {
-                                ui.selectable_value(&mut self.fps, f, f.to_string());
-                            }
-                        });
-                        ui.label(caps(&"QUALIDADE (MBPS)"));
-                        ui.horizontal_wrapped(|ui| {
-                            for (k, l) in [(4000, "4"), (8000, "8"), (15000, "15"), (30000, "30")] {
-                                ui.selectable_value(&mut self.kbps, k, l);
-                            }
-                        });
-                        ui.add_space(4.0);
-                        if let Some(ch) = cur {
-                            if big_button(ui, "Ao vivo", GREEN) {
-                                acts.push(Act::Publish(ch));
-                                close = true;
-                            }
-                        } else {
-                            ui.label(RichText::new("Abra um canal ou conversa para transmitir.").color(MUTED));
+                self.golive.refresh(ctx);
+                let live = self.publishing.is_some();
+                let place = cur
+                    .and_then(|c| s.snap.servers.iter().find_map(|sv| sv.channels.iter().find(|x| x.id == c).map(|x| format!("{} / {}", x.name, sv.name))))
+                    .or_else(|| cur.and_then(|c| s.snap.dms.iter().find(|d| d.channel_id == c).map(|d| d.user.name.clone())))
+                    .unwrap_or_default();
+                let mut go_publish = false;
+                let mut go_stop = false;
+                let gl = &mut self.golive;
+                let fps = &mut self.fps;
+                modal(ctx, "Transmitir", 540.0, &mut dismissed, |ui| {
+                    ui.set_width(500.0);
+                    ui.label(RichText::new("Compartilhar uma tela ou janela").size(12.0).color(MUTED));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut gl.tab, 0, "Telas");
+                        ui.selectable_value(&mut gl.tab, 1, "Janelas");
+                    });
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(12.0, 8.0);
+                        let want_window = gl.tab == 1;
+                        let shown: Vec<usize> = (0..gl.items.len()).filter(|i| matches!(gl.items[*i].info.source, capture::Source::Window(_)) == want_window).collect();
+                        if shown.is_empty() {
+                            ui.label(RichText::new(if gl.busy || gl.items.is_empty() { "Procurando…" } else { "Nenhuma janela aberta para compartilhar." }).color(MUTED));
                         }
+                        ui.horizontal_wrapped(|ui| {
+                            for i in shown {
+                                let (info, tex) = (&gl.items[i].info, &gl.items[i].tex);
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 4.0;
+                                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(156.0, 88.0), egui::Sense::click());
+                                    match tex {
+                                        Some(t) => {
+                                            egui::Image::new(t).corner_radius(egui::CornerRadius::same(6)).paint_at(ui, rect);
+                                        }
+                                        None => {
+                                            ui.painter().rect_filled(rect, 6.0, L2);
+                                        }
+                                    }
+                                    let sel = gl.source.as_ref() == Some(&info.source);
+                                    ui.painter().rect_stroke(
+                                        rect,
+                                        6.0,
+                                        egui::Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { AMBER } else if resp.hovered() { LINE2 } else { LINE }),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    if resp.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    if resp.clicked() {
+                                        gl.source = Some(info.source.clone());
+                                    }
+                                    let cap = match &info.source {
+                                        capture::Source::Monitor(n) if info.title.is_empty() => format!("Tela {}", n + 1),
+                                        _ => info.title.clone(),
+                                    };
+                                    ui.add_sized([156.0, 14.0], egui::Label::new(RichText::new(cap).size(12.0).color(if sel { TEXT } else { MUTED })).truncate());
+                                });
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    if !place.is_empty() {
+                        ui.label(caps("CANAL DE TRANSMISSÃO"));
+                        ui.label(RichText::new(&place).size(13.0).color(TEXT2));
+                        ui.add_space(6.0);
+                    }
+                    ui.label(caps("QUALIDADE DA TRANSMISSÃO"));
+                    let src_h = gl.selected().map(|i| i.height).unwrap_or(0);
+                    // a escolha anterior era maior que esta tela: usa a resolução da própria fonte
+                    if matches!(gl.res, Some(v) if src_h > 0 && v > src_h) {
+                        gl.res = None;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if ui.selectable_label(gl.preset == 1, "Fluidez").clicked() {
+                            gl.preset = 1;
+                            gl.res = Some(if src_h > 0 { src_h.min(1080) } else { 1080 });
+                            *fps = 60;
+                            gl.kbps = None;
+                        }
+                        if ui.selectable_label(gl.preset == 2, "Nitidez").clicked() {
+                            gl.preset = 2;
+                            gl.res = None;
+                            *fps = 15;
+                            gl.kbps = None;
+                        }
+                        if gl.preset == 0 {
+                            ui.label(RichText::new("Personalizado").size(12.5).color(AMBER));
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Resolução").size(12.5).color(TEXT2));
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        for (h, label) in [(Some(480u32), "480p"), (Some(720), "720p"), (Some(1080), "1080p"), (Some(1440), "1440p"), (None, "Fonte")] {
+                            // não faz sentido ampliar além da tela
+                            let too_big = matches!(h, Some(v) if src_h > 0 && v > src_h);
+                            let r = ui.add_enabled(!too_big, egui::Button::selectable(gl.res == h, label));
+                            if r.clicked() {
+                                gl.res = h;
+                                gl.preset = 0;
+                                gl.kbps = None;
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Taxa de quadros").size(12.5).color(TEXT2));
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let rates: &[u32] = if gl.advanced { &[15, 30, 60, 90, 120, 144] } else { &[15, 30, 60] };
+                        for f in rates {
+                            if ui.add(egui::Button::selectable(*fps == *f, format!("{f} FPS"))).clicked() {
+                                *fps = *f;
+                                gl.preset = 0;
+                                gl.kbps = None;
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    match gl.selected() {
+                        Some(info) => {
+                            let q = gl.quality(info, *fps);
+                            ui.label(RichText::new(publisher::describe(info.width, info.height, &q)).monospace().size(11.5).color(MUTED));
+                        }
+                        None => {
+                            ui.label(RichText::new("Escolha uma tela ou janela.").size(11.5).color(MUTED));
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.add_enabled(false, egui::Checkbox::new(&mut false, "Compartilhar áudio")).on_disabled_hover_text("Em breve");
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new("Avançado").default_open(gl.advanced).show(ui, |ui| {
+                        gl.advanced = true;
+                        let auto = gl.selected().map(|i| publisher::suggested_kbps(publisher::output_size(i.width, i.height, gl.res).1, *fps)).unwrap_or(8000);
+                        let mut mbps = gl.kbps.unwrap_or(auto) as f32 / 1000.0;
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Slider::new(&mut mbps, 1.0..=40.0).suffix(" Mbps")).changed() {
+                                gl.kbps = Some((mbps * 1000.0) as u32);
+                                gl.preset = 0;
+                            }
+                            if gl.kbps.is_some() && small_button(ui, "Automático", FIELD) {
+                                gl.kbps = None;
+                            }
+                        });
+                    });
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
                         if small_button(ui, "Cancelar", FIELD) {
                             close = true;
                         }
+                        if live && small_button(ui, "Parar de transmitir", RED) {
+                            go_stop = true;
+                            close = true;
+                        }
+                        let ready = cur.is_some() && gl.source.is_some();
+                        ui.add_enabled_ui(ready, |ui| {
+                            if small_button(ui, if live { "Aplicar" } else { "Transmitir" }, BLURPLE) {
+                                go_publish = true;
+                                close = true;
+                            }
+                        });
                     });
+                });
+                if go_stop {
+                    acts.push(Act::StopPublish);
+                }
+                if go_publish {
+                    if let Some(ch) = cur {
+                        acts.push(Act::Publish(ch));
+                    }
+                }
             }
         }
         if close || dismissed {
