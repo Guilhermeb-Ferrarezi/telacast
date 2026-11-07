@@ -16,15 +16,15 @@ Atualizado em 2026-11-07 (marcas: `[x]` pronto, `[~]` parcial, `[ ]` pendente).
 
 | Área | Já existe |
 |---|---|
-| Contas | cadastro **só com convite**, login (argon2 fora da thread principal, hash falso para usuário inexistente), token só com hash e validade deslizante de 30 dias, `Logout`, limite de tentativas, sessão salva no app |
+| Contas | cadastro **só com convite**, login (argon2 fora da thread principal, hash falso para usuário inexistente), token só com hash e validade deslizante de 30 dias, `Logout`, **trocar senha** e **lista/encerramento de sessões**, limite de tentativas, sessão salva no app |
 | Servidores | criar, convite por código (128 bits), entrar; **categorias recolhíveis** e canais de texto (só o dono cria), membros online/offline |
 | Chat | tempo real; **responder** (clicar na resposta salta até a original), **editar** ("(editado)"), **apagar** (autor ou dono), **não lido guardado no servidor** (`Ack`), **"digitando…"**, agrupamento, divisor de dia, hora ao passar o mouse, texto selecionável, menu do botão direito. Histórico: 50 por página, carrega mais ao rolar para cima |
 | Social | amigos (pedir/aceitar/remover), DMs 1:1, presença com **status manual** (online, ausente, não perturbe, invisível) e **ausente automático** |
 | Vídeo | transmissão de tela por canal: captura X11, NVENC, relay por WebSocket, fallback openh264 |
 | Interface | tema **Grafite** (camadas de cinza, âmbar, serifa), barra de servidores com pílula 8/20/40 e sigla, cabeçalho do servidor com menu, canais com categorias, painel de membros, login, modais, barra de ações no hover |
-| Infra | Postgres 18, ids snowflake `i64`, migrações embutidas, **heartbeat e reconexão automática**, testes unitários e **3 e2e** (fluxo completo, limite de login, responder/editar/apagar/ler) |
+| Infra | Postgres 18, ids snowflake `i64`, migrações embutidas, **heartbeat e reconexão automática**, testes unitários e **14 e2e**, TLS (wss, guia em `docs/DEPLOY.md`, ainda não testado numa VPS de verdade) |
 
-Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação, sem anexos, sem tópicos/threads, sem notificações.**
+Lacunas grandes: **sem áudio, sem cargos/permissões, sem moderação, sem tópicos/threads, sem notificações.** (Anexos, busca, reações, fixadas e bloqueio já existem.)
 
 ## Decisões já tomadas
 
@@ -37,7 +37,7 @@ Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação,
 | Cache | **em memória** (`moka`), atrás de uma interface própria; Redis só se houver mais de um servidor | A confirmar |
 | IDs | snowflake em `i64` | Tabelas já usam `BIGINT` |
 | Cadastro | **fechado, só com convite** da instância (`telacast-server invite`) | O código aparece uma vez; no banco fica o hash |
-| Tokens | opacos, só o hash no banco, com validade (30 dias deslizantes) e `Logout` | |
+| Tokens | opacos, só o hash no banco, com validade (30 dias deslizantes), `Logout`, troca de senha (encerra as outras sessões) e lista/encerramento de sessões (menu do usuário → "Minha conta") | ticket de uso único no vídeo |
 | Hospedagem | **VPS Oracle, Ampere A1 (ARM), 2 núcleos e 12 GB**; compilar na própria VPS | Local por enquanto (Marco A ainda não chegou) |
 | Plataformas | Desktop agora; **Android só depois de terminar o desktop** (Fases 0 a 4; ver "Plano Android") | O protocolo JSON/WebSocket precisa ficar estável e documentado |
 | Git | repositório criado; commits sem linha de coautoria | |
@@ -70,7 +70,7 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 ### 0.2 Segurança (auditoria do servidor, 19 riscos em [R07])
 - [x] **TLS (`wss://`)**: cliente com rustls (raízes públicas + `TELACAST_CA_FILE` para CA própria), recusa `ws://` fora da máquina e da rede local (login, retomada de sessão e vídeo), erro de certificado aparece na tela; guia com Caddy, systemd e backup em `docs/DEPLOY.md`. Testado contra proxy TLS local; **falta testar na VPS da Oracle**. P0 **M**
 - [x] **Rate limit** por IP e por conta (login/cadastro, `Send`, `JoinServer`, pedidos de amizade) e **Argon2 em `spawn_blocking`** com semáforo + hash falso para usuário inexistente. P0 **M**
-- [~] **Tokens** (feito: só o hash, expiração, `Logout`; **falta** revogar ao trocar senha, lista de sessões e o ticket de uso único no vídeo): guardar só o hash, expiração, `Logout`, revogar ao trocar senha, lista de sessões; **tirar o token da URL do vídeo** (ticket de uso único). P0 **M** ([R07]+[R01])
+- [~] **Tokens** (feito: só o hash, expiração, `Logout`, trocar senha revogando as outras sessões, lista de sessões com origem (IP) e encerrar uma ou todas, aviso `SessionExpired` às conexões abertas da sessão encerrada; **falta** o ticket de uso único no vídeo e derrubar de fato a conexão revogada): guardar só o hash, expiração, `Logout`, revogar ao trocar senha, lista de sessões; **tirar o token da URL do vídeo** (ticket de uso único). P0 **M** ([R07]+[R01])
 - [x] **Cadastro fechado — decidido: só entra quem tem convite** (por enquanto). O `Register` passa a exigir um **código de convite da instância** (128 bits, com expiração e limite de usos, revogável), gerado pelo operador do servidor por linha de comando (`telacast-server invite`), o que também resolve a criação da primeira conta. Os convites de *servidor* (guild) também passam a 128 bits. P1 **S**
 - [x] **Limites**: fila limitada, tamanho máximo de mensagem, **30 conexões por IP** (`TELACAST_MAX_CONNS_PER_IP`; a excedente recebe 429), heartbeat/idle de 60 s, **20 servidores por usuário e 200 canais por servidor**. conexões por IP, ping/idle timeout, canal limitado no lugar de `unbounded_channel`, tamanho máximo de quadro de vídeo, limites de servidores/canais por usuário. P1 **M**
 - [ ] Nomes de usuário: restringir Unicode (homóglifos). P2 **S**
@@ -144,7 +144,7 @@ Prioridade máxima do [R02]; moderação do [R07].
 - [ ] P3: chamadas em DM (depende da Fase 2), atividade/rich presence, sugestões de amigos
 
 **Perfil ([R01])**
-- [ ] P0: **upload de avatar** (usa o armazenamento da Fase 1), lista de sessões (já na 0.2). **M**
+- [ ] P0: **upload de avatar** (usa o armazenamento da Fase 1), lista de sessões (feita na 0.2, "Minha conta"). **M**
 - [ ] P1: bio, pronomes, banner, cor de destaque e **cartão de perfil**; troca de senha; recuperação de senha por e-mail (exige SMTP). **S–M**
 - [ ] P2: **2FA TOTP**, apelido por servidor, **exportar dados e excluir conta** (LGPD), nota privada. **S–M**
 

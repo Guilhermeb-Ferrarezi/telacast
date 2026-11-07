@@ -890,3 +890,82 @@ fn anexos() {
     });
     assert_eq!(m, "fim");
 }
+
+#[test]
+fn trocar_senha_e_encerrar_sessoes() {
+    use telacast_proto::ErrorCode;
+    let env = Env::start();
+    let code = env.invite(2);
+    let mut a1 = env.client();
+    let (_, ana_id) = a1.register("ana", &code);
+    let mut beto = env.client();
+    beto.register("beto", &code);
+
+    let login = |c: &mut Client, pw: &str| {
+        c.send(C2S::Login { username: "ana".into(), password: pw.into(), proto: telacast_proto::PROTO_VERSION });
+    };
+    // segunda sessão da ana (outro aparelho)
+    let mut a2 = env.client();
+    login(&mut a2, "segredo-forte-1");
+    let tok2 = a2.wait("Auth da 2ª sessão", |m| if let S2C::Auth { token, .. } = m { Some(token.clone()) } else { None });
+
+    // a lista mostra as duas, e só uma é a atual
+    a1.send(C2S::ListSessions);
+    let list = a1.wait("lista de sessões", |m| if let S2C::Sessions { list } = m { Some(list.clone()) } else { None });
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.iter().filter(|s| s.current).count(), 1);
+    assert!(list.iter().all(|s| s.device == "127.0.0.1" && s.created > 0 && s.last_used >= s.created));
+
+    // senha atual errada e senha nova curta são recusadas
+    a1.send(C2S::ChangePassword { old: "errada-errada".into(), new: "outra-senha-2".into() });
+    assert_eq!(a1.error_code().0, ErrorCode::WrongPassword);
+    a1.send(C2S::ChangePassword { old: "segredo-forte-1".into(), new: "curta".into() });
+    assert_eq!(a1.error_code().0, ErrorCode::InvalidInput);
+
+    // a troca vale: a sessão atual fica, a outra é avisada e some
+    a1.send(C2S::ChangePassword { old: "segredo-forte-1".into(), new: "outra-senha-2".into() });
+    a1.wait("PasswordChanged", |m| matches!(m, S2C::PasswordChanged).then_some(()));
+    let list = a1.wait("lista após a troca", |m| if let S2C::Sessions { list } = m { Some(list.clone()) } else { None });
+    assert_eq!(list.len(), 1);
+    assert!(list[0].current);
+    assert_eq!(a2.error_code().0, ErrorCode::SessionExpired);
+    let mut a3 = env.client();
+    a3.send(C2S::Resume { token: tok2, proto: telacast_proto::PROTO_VERSION });
+    assert_eq!(a3.error_code().0, ErrorCode::SessionExpired);
+
+    // senha antiga não entra mais; a nova entra
+    let mut a4 = env.client();
+    login(&mut a4, "segredo-forte-1");
+    assert_eq!(a4.error_code().0, ErrorCode::InvalidCredentials);
+    login(&mut a4, "outra-senha-2");
+    a4.wait("Auth com a senha nova", |m| matches!(m, S2C::Auth { .. }).then_some(()));
+
+    // encerrar uma sessão específica; não dá para encerrar a de outra pessoa
+    a1.send(C2S::ListSessions);
+    let list = a1.wait("lista com 2", |m| match m {
+        S2C::Sessions { list } if list.len() == 2 => Some(list.clone()),
+        _ => None,
+    });
+    let outra = list.iter().find(|s| !s.current).unwrap().id;
+    beto.send(C2S::RevokeSession { id: outra });
+    assert_eq!(beto.error_code().0, ErrorCode::NotFound);
+    a1.send(C2S::RevokeSession { id: outra });
+    let list = a1.wait("lista sem a outra", |m| match m {
+        S2C::Sessions { list } if list.len() == 1 => Some(list.clone()),
+        _ => None,
+    });
+    assert!(list[0].current);
+    assert_eq!(a4.error_code().0, ErrorCode::SessionExpired);
+
+    // encerrar todas as outras
+    let mut a5 = env.client();
+    login(&mut a5, "outra-senha-2");
+    a5.wait("Auth", |m| matches!(m, S2C::Auth { .. }).then_some(()));
+    a1.send(C2S::RevokeOtherSessions);
+    a1.wait("só a atual", |m| match m {
+        S2C::Sessions { list } if list.len() == 1 => Some(()),
+        _ => None,
+    });
+    assert_eq!(a5.error_code().0, ErrorCode::SessionExpired);
+    let _ = ana_id;
+}

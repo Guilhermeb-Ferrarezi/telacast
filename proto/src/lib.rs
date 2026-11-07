@@ -10,6 +10,8 @@ pub const PROTO_VERSION: u32 = 1;
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ErrorCode {
     InvalidCredentials,
+    /// Senha atual errada ao trocar a senha.
+    WrongPassword,
     InvalidInvite,
     UsernameTaken,
     SessionExpired,
@@ -180,6 +182,18 @@ pub struct SearchHit {
     pub channel_name: String,
 }
 
+/// Uma sessão (login) da conta. `device` é de onde ela foi aberta (endereço IP).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SessionInfo {
+    pub id: i64,
+    pub device: String,
+    /// Milissegundos desde 1970.
+    pub created: i64,
+    pub last_used: i64,
+    /// É a sessão desta conexão.
+    pub current: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum C2S {
     /// `invite`: código de convite da instância (cadastro fechado).
@@ -188,6 +202,14 @@ pub enum C2S {
     Resume { token: String, #[serde(default)] proto: u32 },
     /// Encerra a sessão (revoga o token) e fecha a conexão.
     Logout,
+    /// Troca a senha. Encerra todas as outras sessões (a atual continua).
+    ChangePassword { old: String, new: String },
+    /// Pede a lista de sessões da conta (resposta: `Sessions`).
+    ListSessions,
+    /// Encerra uma sessão pelo id (resposta: `Sessions` atualizada).
+    RevokeSession { id: i64 },
+    /// Encerra todas as sessões, menos a atual.
+    RevokeOtherSessions,
     CreateServer { name: String },
     JoinServer { code: String },
     /// `kind`: 0 texto ou 4 categoria. `parent_id`: categoria do novo canal (ignorado em categorias).
@@ -247,6 +269,9 @@ pub enum C2S {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum S2C {
     Auth { token: String, me: User },
+    Sessions { list: Vec<SessionInfo> },
+    /// A senha foi trocada (as outras sessões foram encerradas).
+    PasswordChanged,
     Error {
         #[serde(default)]
         code: ErrorCode,

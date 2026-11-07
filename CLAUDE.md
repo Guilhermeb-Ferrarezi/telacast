@@ -60,7 +60,9 @@ Cadastro é **fechado por convite**. Senha de 8 a 128 caracteres. Não ponha sen
 
 `channels.kind`: 0 texto, 1 voz, 2 anúncio, 3 palco, 4 categoria, 10 DM. Servidor novo nasce com a categoria "canais de texto" e o canal "geral" dentro. `read_state` guarda o último lido por usuário; o `Snapshot` traz `last_message_id` e `last_read_id` por canal e por DM.
 
-## Trabalho em ciclos de 15 minutos (PC suspende e acorda sozinho)
+## Trabalho em ciclos de 15 minutos (PC suspende e acorda sozinho) — **DESATIVADO**
+
+Em 2026-11-07 o usuário pediu para **não suspender mais o PC**: não rode `cycle.sh`; trabalhe direto. O texto abaixo fica só como referência.
 
 Para trabalhar de madrugada sem deixar o PC ligado o tempo todo: `tools/wake/`. Instalação, **uma vez** (pede a senha): `sudo bash tools/wake/install.sh`. Depois, ao terminar uma tarefa, rode **em segundo plano** (`run_in_background`): `tools/wake/cycle.sh 15 2`.
 

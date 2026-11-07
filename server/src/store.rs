@@ -133,15 +133,16 @@ impl Store {
 
     // --------------------------------------------------------------- sessões
 
-    pub async fn create_session(&self, id: i64, user_id: i64, token_hash: &[u8]) -> R<()> {
+    pub async fn create_session(&self, id: i64, user_id: i64, token_hash: &[u8], device: &str) -> R<()> {
         sqlx::query(
-            "INSERT INTO sessions(id, user_id, token_hash, expires_at)
-             VALUES ($1, $2, $3, now() + $4::interval)",
+            "INSERT INTO sessions(id, user_id, token_hash, device, expires_at)
+             VALUES ($1, $2, $3, $5, now() + $4::interval)",
         )
         .bind(id)
         .bind(user_id)
         .bind(token_hash)
         .bind(SESSION_DAYS)
+        .bind(device)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -162,6 +163,57 @@ impl Store {
 
     pub async fn revoke_session(&self, token_hash: &[u8]) -> R<()> {
         sqlx::query("DELETE FROM sessions WHERE token_hash = $1").bind(token_hash).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Sessões válidas da conta: (id, origem, criada, último uso em ms, é a atual).
+    pub async fn list_sessions(&self, uid: i64, current: &[u8]) -> R<Vec<(i64, String, i64, i64, bool)>> {
+        sqlx::query_as(
+            "SELECT id, COALESCE(device, ''),
+                    (extract(epoch FROM created_at) * 1000)::bigint,
+                    (extract(epoch FROM last_used_at) * 1000)::bigint,
+                    token_hash = $2
+             FROM sessions WHERE user_id = $1 AND expires_at > now()
+             ORDER BY last_used_at DESC",
+        )
+        .bind(uid)
+        .bind(current)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Apaga a sessão `id` da conta e devolve o hash do token (para avisar quem a usa).
+    pub async fn revoke_session_by_id(&self, uid: i64, id: i64) -> R<Option<Vec<u8>>> {
+        let r: Option<(Vec<u8>,)> =
+            sqlx::query_as("DELETE FROM sessions WHERE id = $1 AND user_id = $2 RETURNING token_hash")
+                .bind(id)
+                .bind(uid)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(r.map(|x| x.0))
+    }
+
+    /// Apaga todas as sessões da conta, menos a do token informado; devolve os hashes apagados.
+    pub async fn revoke_other_sessions(&self, uid: i64, keep: &[u8]) -> R<Vec<Vec<u8>>> {
+        let r: Vec<(Vec<u8>,)> =
+            sqlx::query_as("DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2 RETURNING token_hash")
+                .bind(uid)
+                .bind(keep)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(r.into_iter().map(|x| x.0).collect())
+    }
+
+    pub async fn password_hash(&self, uid: i64) -> R<Option<String>> {
+        let r: Option<(String,)> = sqlx::query_as("SELECT pass_hash FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(r.map(|x| x.0))
+    }
+
+    pub async fn set_password_hash(&self, uid: i64, hash: &str) -> R<()> {
+        sqlx::query("UPDATE users SET pass_hash = $2 WHERE id = $1").bind(uid).bind(hash).execute(&self.pool).await?;
         Ok(())
     }
 

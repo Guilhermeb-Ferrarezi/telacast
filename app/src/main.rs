@@ -41,6 +41,17 @@ fn main() -> eframe::Result {
     )
 }
 
+/// "agora", "há 5 min", "há 3 h", "há 2 dias" a partir de milissegundos.
+fn ago(now_ms: i64, then_ms: i64) -> String {
+    let m = (now_ms - then_ms).max(0) / 60_000;
+    match m {
+        0 => "agora".into(),
+        1..=59 => format!("há {m} min"),
+        60..=1439 => format!("há {} h", m / 60),
+        _ => format!("há {} dias", m / 1440),
+    }
+}
+
 // ------------------------------------------------------------------ estado
 
 #[derive(Clone)]
@@ -67,6 +78,7 @@ enum Modal {
     GoLive,
     DeleteMsg { id: i64, preview: String },
     ConfirmBlock { user_id: i64, name: String },
+    Account { old: String, new: String, again: String },
 }
 
 enum Act {
@@ -100,6 +112,7 @@ enum Act {
     SaveEdit(i64, String),
     AskDelete(i64, String),
     Logout,
+    OpenAccount,
     Watch(i64),
     StopWatch,
     Publish(i64),
@@ -132,6 +145,7 @@ struct Session {
     input: String,
     add_friend: String,
     modal: Modal,
+    sessions: Vec<p::SessionInfo>,
     toast: Option<(String, Instant)>,
     last_channel: HashMap<i64, i64>,
     view_since: Instant,
@@ -261,6 +275,7 @@ impl Session {
             input: String::new(),
             add_friend: String::new(),
             modal: Modal::None,
+            sessions: Vec::new(),
             toast: None,
             last_channel: HashMap::new(),
             view_since: Instant::now(),
@@ -732,6 +747,13 @@ impl Session {
                     S2C::DmOpened { channel_id } => self.open(View::Dm(channel_id)),
                     S2C::ServerJoined { server_id } => self.open_server(server_id),
                     S2C::Error { msg, .. } => self.toast = Some((msg, Instant::now())),
+                    S2C::Sessions { list } => self.sessions = list,
+                    S2C::PasswordChanged => {
+                        if matches!(self.modal, Modal::Account { .. }) {
+                            self.modal = Modal::Account { old: String::new(), new: String::new(), again: String::new() };
+                        }
+                        self.toast = Some(("Senha alterada. As outras sessões foram encerradas.".into(), Instant::now()));
+                    }
                     S2C::Auth { .. } => {}
                 },
             }
@@ -1505,6 +1527,10 @@ impl App {
                     }
                 }
                 Act::Logout => keep = false,
+                Act::OpenAccount => {
+                    s.modal = Modal::Account { old: String::new(), new: String::new(), again: String::new() };
+                    s.gw.send(C2S::ListSessions);
+                }
                 Act::Watch(ch) => {
                     self.stop_watch();
                     let url = net::url(&self.login.server, "watch", ch, &s.token);
@@ -1666,6 +1692,10 @@ impl App {
                                     }
                                 }
                                 ui.separator();
+                                if ui.button("Minha conta").clicked() {
+                                    acts.push(Act::OpenAccount);
+                                    ui.close();
+                                }
                                 if ui.button(RichText::new("Sair").color(RED)).clicked() {
                                     acts.push(Act::Logout);
                                     ui.close();
@@ -3014,6 +3044,54 @@ impl App {
                             close = true;
                         }
                     });
+            }
+            Modal::Account { old, new, again } => {
+                let sessions = s.sessions.clone();
+                modal(ctx, "Minha conta", 440.0, &mut dismissed, |ui| {
+                    ui.set_width(400.0);
+                    ui.label(caps("TROCAR SENHA"));
+                    ui.add(egui::TextEdit::singleline(old).password(true).hint_text("Senha atual").desired_width(f32::INFINITY));
+                    ui.add(egui::TextEdit::singleline(new).password(true).hint_text("Nova senha (8 a 128 caracteres)").desired_width(f32::INFINITY));
+                    ui.add(egui::TextEdit::singleline(again).password(true).hint_text("Repita a nova senha").desired_width(f32::INFINITY));
+                    let mismatch = !again.is_empty() && new != again;
+                    if mismatch {
+                        ui.label(RichText::new("As senhas não conferem.").size(12.5).color(RED));
+                    }
+                    let ready = !old.is_empty() && (8..=128).contains(&new.chars().count()) && new == again;
+                    ui.add_enabled_ui(ready, |ui| {
+                        if big_button(ui, "Trocar senha", BLURPLE) {
+                            acts.push(Act::Send(C2S::ChangePassword { old: old.clone(), new: new.clone() }));
+                        }
+                    });
+                    ui.add_space(10.0);
+                    ui.label(caps("SESSÕES ABERTAS"));
+                    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+                    for ss in &sessions {
+                        egui::Frame::new().fill(L2).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    let title = if ss.current { format!("{} · esta sessão", ss.device) } else { ss.device.clone() };
+                                    ui.label(RichText::new(if ss.device.is_empty() { "Origem desconhecida".to_string() } else { title }).color(TEXT));
+                                    ui.label(RichText::new(format!("Último uso {} · aberta {}", ago(now_ms, ss.last_used), ago(now_ms, ss.created))).size(12.5).color(MUTED));
+                                });
+                                if !ss.current {
+                                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                        if small_button(ui, "Encerrar", FIELD) {
+                                            acts.push(Act::Send(C2S::RevokeSession { id: ss.id }));
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                    }
+                    if sessions.iter().any(|x| !x.current) && small_button(ui, "Encerrar todas as outras", FIELD) {
+                        acts.push(Act::Send(C2S::RevokeOtherSessions));
+                    }
+                    if small_button(ui, "Fechar", FIELD) {
+                        close = true;
+                    }
+                });
             }
             Modal::ConfirmBlock { user_id, name } => {
                 modal(ctx, "Bloquear usuário", 360.0, &mut dismissed, |ui| {

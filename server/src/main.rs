@@ -87,6 +87,8 @@ struct App {
     max_conns_per_ip: usize,
     /// Conexões marcadas como "paradas" pelo app (ausente automático).
     idle: Mutex<HashSet<u64>>,
+    /// Token (hash) da sessão de cada conexão, para avisar quando a sessão for encerrada.
+    conn_tokens: Mutex<HashMap<u64, Vec<u8>>>,
     nonces: Mutex<(std::collections::HashSet<(i64, u64)>, std::collections::VecDeque<(i64, u64)>)>,
     /// Hash de uma senha qualquer, usado para gastar o mesmo tempo quando o usuário não existe.
     dummy_hash: String,
@@ -256,7 +258,23 @@ impl App {
         }
     }
 
+    /// Avisa as conexões que usam estas sessões (já apagadas) que elas expiraram.
+    fn expire_connections(&self, uid: i64, hashes: &[Vec<u8>]) {
+        let cids: Vec<u64> = {
+            let t = self.conn_tokens.lock().unwrap_or_else(|e| e.into_inner());
+            t.iter().filter(|(_, h)| hashes.contains(h)).map(|(c, _)| *c).collect()
+        };
+        if let Some(v) = self.conns.lock().unwrap_or_else(|e| e.into_inner()).get(&uid) {
+            for (cid, tx) in v {
+                if cids.contains(cid) {
+                    let _ = tx.send(S2C::Error { code: ErrorCode::SessionExpired, msg: "Essa sessão foi encerrada".into() });
+                }
+            }
+        }
+    }
+
     fn disconnect(self: &Arc<Self>, uid: i64, cid: u64) {
+        self.conn_tokens.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
         self.idle.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
         let last = {
             let mut c = self.conns.lock().unwrap_or_else(|e| e.into_inner());
@@ -361,6 +379,7 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         conns: Default::default(),
         rooms: Default::default(),
         next: AtomicU64::new(1),
+        conn_tokens: Mutex::new(HashMap::new()),
         hash_sem: Semaphore::new(permits),
         auth_limit: Limiter::default(),
         limits: Limiter::default(),
@@ -483,6 +502,7 @@ async fn finish_login(
     tx: &UnboundedSender<S2C>,
     session: &mut Option<Session>,
     cid: u64,
+    ip: &str,
     uid: i64,
     existing_token: Option<String>,
 ) {
@@ -490,7 +510,7 @@ async fn finish_login(
         Some(t) => t,
         None => {
             let t = auth::new_token();
-            if let Err(e) = app.store.create_session(app.sf.next(), uid, &auth::hash_token(&t)).await {
+            if let Err(e) = app.store.create_session(app.sf.next(), uid, &auth::hash_token(&t), ip).await {
                 error!("create_session: {e}");
                 let _ = tx.send(S2C::Error { code: ErrorCode::Internal, msg: ERR_INTERNAL.into() });
                 return;
@@ -502,7 +522,9 @@ async fn finish_login(
         let _ = tx.send(S2C::Error { code: ErrorCode::Internal, msg: ERR_INTERNAL.into() });
         return;
     };
-    *session = Some(Session { uid, token_hash: auth::hash_token(&token) });
+    let token_hash = auth::hash_token(&token);
+    app.conn_tokens.lock().unwrap_or_else(|e| e.into_inner()).insert(cid, token_hash.clone());
+    *session = Some(Session { uid, token_hash });
     let _ = tx.send(S2C::Auth { token, me: p::User { id: uid, name, online: true, status: Status::Online } });
     app.connect(uid, cid, tx.clone());
     app.push_snapshot(uid).await;
@@ -554,7 +576,7 @@ async fn handle(
                 return true;
             };
             match app.store.register(app.sf.next(), name, &hash, &auth::hash_token(&code)).await {
-                Ok(id) => finish_login(app, tx, session, cid, id, None).await,
+                Ok(id) => finish_login(app, tx, session, cid, ip, id, None).await,
                 Err(RegisterError::InvalidInvite) => err(ErrorCode::InvalidInvite, "Código de convite inválido, expirado ou já usado"),
                 Err(RegisterError::Taken) => err(ErrorCode::UsernameTaken, "Esse nome de usuário já está em uso"),
                 Err(RegisterError::Db(e)) => {
@@ -594,7 +616,7 @@ async fn handle(
             };
             let ok = app.verify_password(password, hash).await;
             match id {
-                Some(id) if ok => finish_login(app, tx, session, cid, id, None).await,
+                Some(id) if ok => finish_login(app, tx, session, cid, ip, id, None).await,
                 _ => err(ErrorCode::InvalidCredentials, "Usuário ou senha incorretos"),
             }
             true
@@ -608,7 +630,7 @@ async fn handle(
                 return true;
             }
             match app.store.session_user(&auth::hash_token(&token)).await {
-                Ok(Some(id)) => finish_login(app, tx, session, cid, id, Some(token)).await,
+                Ok(Some(id)) => finish_login(app, tx, session, cid, ip, id, Some(token)).await,
                 Ok(None) => err(ErrorCode::SessionExpired, "Sessão expirada"),
                 Err(e) => {
                     error!("resume: {e}");
@@ -642,6 +664,22 @@ async fn handle(
     }
 }
 
+async fn send_sessions(app: &Arc<App>, tx: &UnboundedSender<S2C>, me: i64, token_hash: &[u8]) {
+    match app.store.list_sessions(me, token_hash).await {
+        Ok(rows) => {
+            let list = rows
+                .into_iter()
+                .map(|(id, device, created, last_used, current)| p::SessionInfo { id, device, created, last_used, current })
+                .collect();
+            let _ = tx.send(S2C::Sessions { list });
+        }
+        Err(e) => {
+            error!("list_sessions: {e}");
+            let _ = tx.send(S2C::Error { code: ErrorCode::Internal, msg: ERR_INTERNAL.into() });
+        }
+    }
+}
+
 async fn handle_authed(
     app: &Arc<App>,
     tx: &UnboundedSender<S2C>,
@@ -661,6 +699,62 @@ async fn handle_authed(
         C2S::Logout => {
             let _ = app.store.revoke_session(token_hash).await;
             return false;
+        }
+        C2S::ListSessions => send_sessions(app, tx, me, token_hash).await,
+        C2S::RevokeSession { id } => {
+            match app.store.revoke_session_by_id(me, id).await {
+                Ok(Some(h)) => {
+                    app.expire_connections(me, &[h]);
+                    send_sessions(app, tx, me, token_hash).await;
+                }
+                Ok(None) => err(ErrorCode::NotFound, "Sessão não encontrada"),
+                Err(e) => db_err("revoke_session", e),
+            }
+        }
+        C2S::RevokeOtherSessions => {
+            match app.store.revoke_other_sessions(me, token_hash).await {
+                Ok(h) => {
+                    app.expire_connections(me, &h);
+                    send_sessions(app, tx, me, token_hash).await;
+                }
+                Err(e) => db_err("revoke_other_sessions", e),
+            }
+        }
+        C2S::ChangePassword { old, new } => {
+            if !app.auth_limit.allow(&format!("pw:{me}"), 5, Duration::from_secs(300)) {
+                err(ErrorCode::RateLimited, "Muitas tentativas. Tente de novo em alguns minutos.");
+                return true;
+            }
+            if !(8..=128).contains(&new.chars().count()) {
+                err(ErrorCode::InvalidInput, "A senha precisa ter de 8 a 128 caracteres");
+                return true;
+            }
+            let current = match app.store.password_hash(me).await {
+                Ok(Some(h)) => h,
+                Ok(None) => return false,
+                Err(e) => {
+                    db_err("password_hash", e);
+                    return true;
+                }
+            };
+            if !app.verify_password(old, current).await {
+                err(ErrorCode::WrongPassword, "A senha atual está incorreta");
+                return true;
+            }
+            let Ok(hash) = app.hash_password(new).await else {
+                err(ErrorCode::Internal, ERR_INTERNAL);
+                return true;
+            };
+            if let Err(e) = app.store.set_password_hash(me, &hash).await {
+                db_err("set_password_hash", e);
+                return true;
+            }
+            match app.store.revoke_other_sessions(me, token_hash).await {
+                Ok(h) => app.expire_connections(me, &h),
+                Err(e) => error!("revoke_other_sessions: {e}"),
+            }
+            let _ = tx.send(S2C::PasswordChanged);
+            send_sessions(app, tx, me, token_hash).await;
         }
         C2S::CreateServer { name } => {
             let name = name.trim();
