@@ -113,6 +113,9 @@ pub struct Snapshot {
     pub friends: Vec<Friend>,
     pub dms: Vec<Dm>,
     pub live: Vec<Live>,
+    /// Quem você bloqueou.
+    #[serde(default)]
+    pub blocked: Vec<User>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -196,6 +199,10 @@ pub enum C2S {
         text: String,
         before: Option<i64>,
     },
+    /// Bloqueia: some a amizade, nenhum dos dois abre DM nem manda mensagem privada ao outro, e o outro
+    /// não consegue mais te pedir amizade. As mensagens dele em servidores continuam existindo (o app as esconde).
+    Block { user_id: i64 },
+    Unblock { user_id: i64 },
     /// Fixa ou desafixa uma mensagem (dono do servidor, ou qualquer participante de uma DM). Máx. 50 por canal.
     Pin { message_id: i64, pin: bool },
     /// Pede as mensagens fixadas do canal (resposta: `S2C::Pins`).

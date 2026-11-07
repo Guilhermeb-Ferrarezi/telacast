@@ -81,6 +81,9 @@ struct App {
     auth_limit: Limiter,
     limits: Limiter,
     /// Últimos `nonce` aceitos por usuário (evita duplicar mensagem reenviada após reconexão).
+    /// Conexões abertas por IP (limite contra um cliente só abrir milhares).
+    ip_conns: Mutex<HashMap<String, usize>>,
+    max_conns_per_ip: usize,
     /// Conexões marcadas como "paradas" pelo app (ausente automático).
     idle: Mutex<HashSet<u64>>,
     nonces: Mutex<(std::collections::HashSet<(i64, u64)>, std::collections::VecDeque<(i64, u64)>)>,
@@ -215,7 +218,8 @@ impl App {
             .collect();
 
         let me_name = self.store.display_name(me).await?.unwrap_or_default();
-        Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live })
+        let blocked = self.store.blocked_by(me).await?.into_iter().map(|(id, name)| user(id, name)).collect();
+        Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live, blocked })
     }
 
     async fn push_snapshot(&self, uid: i64) {
@@ -359,6 +363,8 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         hash_sem: Semaphore::new(permits),
         auth_limit: Limiter::default(),
         limits: Limiter::default(),
+        ip_conns: Mutex::new(HashMap::new()),
+        max_conns_per_ip: std::env::var("TELACAST_MAX_CONNS_PER_IP").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
         idle: Mutex::new(HashSet::new()),
         nonces: Mutex::new(Default::default()),
         dummy_hash,
@@ -396,9 +402,26 @@ async fn gateway(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     State(app): State<Arc<App>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let ip = client_ip(&headers, peer);
-    ws.max_message_size(64 << 10).on_upgrade(move |s| run_conn(s, app, ip))
+    {
+        let mut m = app.ip_conns.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.entry(ip.clone()).or_insert(0);
+        if *n >= app.max_conns_per_ip {
+            return axum::http::StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+        *n += 1;
+    }
+    ws.max_message_size(64 << 10).on_upgrade(move |s| async move {
+        run_conn(s, app.clone(), ip.clone()).await;
+        let mut m = app.ip_conns.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&ip);
+            }
+        }
+    })
 }
 
 struct Session {
@@ -642,6 +665,8 @@ async fn handle_authed(
                 err(ErrorCode::InvalidInput, "Nome do servidor: 1 a 50 caracteres");
             } else if busy("mkserver", 5, 3600) {
                 err(ErrorCode::RateLimited, ERR_BUSY);
+            } else if app.store.owned_servers(me).await.unwrap_or(0) >= 20 {
+                err(ErrorCode::InvalidInput, "Você já tem 20 servidores");
             } else {
                 let sid = app.sf.next();
                 match app.store.create_server(sid, app.sf.next(), app.sf.next(), me, name, &auth::new_code()).await {
@@ -692,6 +717,8 @@ async fn handle_authed(
                 err(ErrorCode::RateLimited, ERR_BUSY);
             } else if app.store.server_owner(server_id).await.ok().flatten() != Some(me) {
                 err(ErrorCode::Forbidden, "Só o dono do servidor cria canais");
+            } else if app.store.channel_count(server_id).await.unwrap_or(0) >= 200 {
+                err(ErrorCode::InvalidInput, "Este servidor já tem 200 canais");
             } else {
                 let parent = if kind == 4 { None } else { parent_id };
                 match app.store.create_channel(app.sf.next(), server_id, &name, kind as i16, parent).await {
@@ -720,6 +747,10 @@ async fn handle_authed(
                     db_err("can_access", e);
                     return true;
                 }
+            }
+            if app.store.dm_blocked(channel_id, me).await.unwrap_or(false) {
+                err(ErrorCode::Forbidden, "Você não pode enviar mensagens para esta pessoa");
+                return true;
             }
             // reenvio com o mesmo nonce (cliente reconectou sem saber se a primeira chegou): ignora
             if nonce != 0 {
@@ -950,6 +981,24 @@ async fn handle_authed(
             Ok(false) => {}
             Err(e) => db_err("can_access", e),
         },
+        C2S::Block { user_id } => {
+            if user_id == me {
+                err(ErrorCode::InvalidInput, "Você não pode bloquear a si mesmo");
+            } else if app.store.display_name(user_id).await.ok().flatten().is_none() {
+                err(ErrorCode::NotFound, "Usuário não encontrado");
+            } else if busy("block", 20, 60) {
+                err(ErrorCode::RateLimited, ERR_BUSY);
+            } else {
+                match app.store.block(me, user_id).await {
+                    Ok(()) => app.push_many(&[me, user_id]).await,
+                    Err(e) => db_err("block", e),
+                }
+            }
+        }
+        C2S::Unblock { user_id } => match app.store.unblock(me, user_id).await {
+            Ok(()) => app.push_many(&[me, user_id]).await,
+            Err(e) => db_err("unblock", e),
+        },
         C2S::FriendRequest { username } => {
             if busy("friend", 20, 3600) {
                 err(ErrorCode::RateLimited, ERR_BUSY);
@@ -961,6 +1010,11 @@ async fn handle_authed(
             };
             if other == me {
                 err(ErrorCode::InvalidInput, "Você não pode adicionar a si mesmo");
+            } else if app.store.is_blocking(me, other).await.unwrap_or(false) {
+                err(ErrorCode::InvalidInput, "Você bloqueou esta pessoa. Desbloqueie para adicionar.");
+            } else if app.store.is_blocking(other, me).await.unwrap_or(false) {
+                // quem foi bloqueado não descobre isso: parece que a pessoa não existe
+                err(ErrorCode::NotFound, "Usuário não encontrado");
             } else if app.store.are_friends(me, other).await.unwrap_or(false) {
                 err(ErrorCode::InvalidInput, "Vocês já são amigos");
             } else if let Err(e) = app.store.friend_request(me, other).await {
@@ -987,6 +1041,8 @@ async fn handle_authed(
             let allowed = app.store.related_users(me).await.unwrap_or_default().contains(&user_id);
             if !allowed {
                 err(ErrorCode::Forbidden, "Você só pode conversar com amigos ou membros dos seus servidores");
+            } else if app.store.is_blocking(me, user_id).await.unwrap_or(false) || app.store.is_blocking(user_id, me).await.unwrap_or(false) {
+                err(ErrorCode::Forbidden, "Você não pode conversar com esta pessoa");
             } else {
                 match app.store.open_dm(app.sf.next(), me, user_id).await {
                     Ok(channel_id) => {

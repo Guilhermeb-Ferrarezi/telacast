@@ -20,6 +20,10 @@ struct Env {
 
 impl Env {
     fn start() -> Env {
+        Env::start_with(&[])
+    }
+
+    fn start_with(extra: &[(&str, &str)]) -> Env {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let db = format!("telacast_test_{nanos}");
@@ -36,6 +40,7 @@ impl Env {
             .env("DATABASE_URL", &db_url)
             .env("TELACAST_ADDR", format!("127.0.0.1:{port}"))
             .env("RUST_LOG", "warn")
+            .envs(extra.iter().copied())
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
@@ -709,4 +714,79 @@ fn fixadas_e_avisos_de_sistema() {
     beto.send(C2S::Pins { channel_id: geral });
     let pins = beto.wait("as fixadas", |m| if let S2C::Pins { messages, .. } = m { Some(messages.clone()) } else { None });
     assert!(pins.is_empty(), "mensagem de sistema não fixa");
+}
+
+#[test]
+fn bloquear_usuario() {
+    let env = Env::start();
+    let code = env.invite(2);
+    let mut ana = env.client();
+    let (_, ana_id) = ana.register("ana", &code);
+    let mut beto = env.client();
+    let (_, beto_id) = beto.register("beto", &code);
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    beto.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
+    beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+    // viram amigos e abrem uma DM
+    ana.send(C2S::FriendRequest { username: "beto".into() });
+    beto.wait("o pedido", |m| match m {
+        S2C::Snapshot(s) if !s.friends.is_empty() => Some(()),
+        _ => None,
+    });
+    beto.send(C2S::FriendAccept { user_id: ana_id });
+    ana.send(C2S::OpenDm { user_id: beto_id });
+    let dm = ana.wait("DmOpened", |m| if let S2C::DmOpened { channel_id } = m { Some(*channel_id) } else { None });
+    ana.send(C2S::Send { channel_id: dm, content: "oi".into(), reply_to: None, nonce: 0 });
+    beto.wait("a DM", |m| matches!(m, S2C::Message(m) if m.content == "oi").then_some(()));
+
+    // a ana bloqueia o beto: a amizade some e ele aparece na lista de bloqueados dela
+    ana.send(C2S::Block { user_id: beto_id });
+    let s = ana.wait("snapshot com o bloqueio", |m| match m {
+        S2C::Snapshot(s) if !s.blocked.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    assert_eq!(s.blocked[0].id, beto_id);
+    assert!(s.friends.is_empty(), "a amizade é desfeita");
+    // o beto não manda mais mensagem na DM existente, não abre DM nova e não pede amizade
+    beto.send(C2S::Send { channel_id: dm, content: "ainda aí?".into(), reply_to: None, nonce: 0 });
+    assert_eq!(beto.error_code().0, telacast_proto::ErrorCode::Forbidden);
+    beto.send(C2S::OpenDm { user_id: ana_id });
+    assert_eq!(beto.error_code().0, telacast_proto::ErrorCode::Forbidden);
+    beto.send(C2S::FriendRequest { username: "ana".into() });
+    assert_eq!(beto.error_code().0, telacast_proto::ErrorCode::NotFound, "quem foi bloqueado não descobre o bloqueio");
+    // a ana também não manda nem pede amizade enquanto bloqueia
+    ana.send(C2S::Send { channel_id: dm, content: "e agora?".into(), reply_to: None, nonce: 0 });
+    assert_eq!(ana.error_code().0, telacast_proto::ErrorCode::Forbidden);
+    ana.send(C2S::FriendRequest { username: "beto".into() });
+    assert_eq!(ana.error_code().0, telacast_proto::ErrorCode::InvalidInput);
+    ana.send(C2S::Block { user_id: ana_id });
+    assert_eq!(ana.error_code().0, telacast_proto::ErrorCode::InvalidInput, "não bloqueia a si mesmo");
+    // desbloquear libera a conversa
+    ana.send(C2S::Unblock { user_id: beto_id });
+    ana.wait("snapshot sem bloqueios", |m| match m {
+        S2C::Snapshot(s) if s.blocked.is_empty() => Some(()),
+        _ => None,
+    });
+    beto.send(C2S::Send { channel_id: dm, content: "voltei".into(), reply_to: None, nonce: 0 });
+    ana.wait("a DM do beto", |m| matches!(m, S2C::Message(m) if m.content == "voltei").then_some(()));
+}
+
+#[test]
+fn limite_de_conexoes_por_ip() {
+    let env = Env::start_with(&[("TELACAST_MAX_CONNS_PER_IP", "3")]);
+    let url = format!("ws://127.0.0.1:{}/ws", env.port);
+    let a = tungstenite::connect(&url).expect("1ª conexão");
+    let b = tungstenite::connect(&url).expect("2ª conexão");
+    let c = tungstenite::connect(&url).expect("3ª conexão");
+    assert!(tungstenite::connect(&url).is_err(), "a 4ª conexão do mesmo IP é recusada");
+    // fechar uma libera a vaga
+    drop(a);
+    std::thread::sleep(Duration::from_millis(500));
+    let d = tungstenite::connect(&url);
+    assert!(d.is_ok(), "com uma vaga livre a conexão passa de novo");
+    drop((b, c, d));
 }

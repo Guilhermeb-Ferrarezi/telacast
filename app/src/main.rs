@@ -54,6 +54,7 @@ enum HomeTab {
     Online,
     All,
     Pending,
+    Blocked,
     Add,
 }
 
@@ -64,6 +65,7 @@ enum Modal {
     Invite(String),
     GoLive,
     DeleteMsg { id: i64, preview: String },
+    ConfirmBlock { user_id: i64, name: String },
 }
 
 enum Act {
@@ -229,7 +231,7 @@ impl Session {
             link: Link::Up,
             gw,
             token,
-            snap: p::Snapshot { me: me.clone(), servers: vec![], friends: vec![], dms: vec![], live: vec![] },
+            snap: p::Snapshot { me: me.clone(), servers: vec![], friends: vec![], dms: vec![], live: vec![], blocked: vec![] },
             me,
             view: View::Home,
             tab: HomeTab::Online,
@@ -1931,6 +1933,26 @@ impl App {
                             if r.clicked() && m.id != s.me.id {
                                 acts.push(Act::Send(C2S::OpenDm { user_id: m.id }));
                             }
+                            if m.id != s.me.id {
+                                let is_blocked = s.snap.blocked.iter().any(|b| b.id == m.id);
+                                egui::Popup::context_menu(&r).width(190.0).show(|ui| {
+                                    ui.set_min_width(180.0);
+                                    if ui.button("Enviar mensagem").clicked() {
+                                        acts.push(Act::Send(C2S::OpenDm { user_id: m.id }));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if is_blocked {
+                                        if ui.button("Desbloquear").clicked() {
+                                            acts.push(Act::Send(C2S::Unblock { user_id: m.id }));
+                                            ui.close();
+                                        }
+                                    } else if ui.button(RichText::new("Bloquear").color(RED)).clicked() {
+                                        acts.push(Act::Modal(Modal::ConfirmBlock { user_id: m.id, name: m.name.clone() }));
+                                        ui.close();
+                                    }
+                                });
+                            }
                         }
                         ui.add_space(8.0);
                     }
@@ -2058,6 +2080,7 @@ impl App {
         let me_id = s.me.id;
         let is_owner = s.snap.servers.iter().any(|sv| sv.owner == me_id && sv.channels.iter().any(|c| c.id == ch));
         let can_pin = is_owner || matches!(s.view, View::Dm(_));
+        let blocked_ids: HashSet<i64> = s.snap.blocked.iter().map(|u| u.id).collect();
         let replying_here = matches!(&s.replying, Some((c, _)) if *c == ch);
         let input_h = 82.0 + 22.0 + if replying_here { 38.0 } else { 0.0 };
         let h = (ui.available_height() - input_h).max(60.0);
@@ -2096,6 +2119,21 @@ impl App {
                                 ui.scroll_to_rect(r, Some(Align::TOP));
                             }
                         }
+                    }
+                    // mensagem de alguém que você bloqueou: some, com um aviso e a opção de mostrar
+                    if blocked_ids.contains(&m.author_id) && m.kind == 0 && !s.revealed.contains(&(m.id, u32::MAX)) {
+                        ui.horizontal(|ui| {
+                            ui.add_space(54.0);
+                            ui.label(RichText::new("Mensagem de usuário bloqueado.").size(13.0).color(MUTED));
+                            let r = ui.add(egui::Label::new(RichText::new("Mostrar mensagem").size(13.0).color(AMBER).underline()).sense(egui::Sense::click()));
+                            if r.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if r.clicked() {
+                                acts.push(Act::ToggleSpoiler(m.id, u32::MAX));
+                            }
+                        });
+                        continue;
                     }
                     // avisos de sistema (entrou, fixou): linha própria, sem barra de ações, quebra o agrupamento
                     if m.kind == 2 || m.kind == 3 {
@@ -2483,10 +2521,34 @@ impl App {
             ui.selectable_value(&mut s.tab, HomeTab::Online, "Disponível");
             ui.selectable_value(&mut s.tab, HomeTab::All, "Todos");
             ui.selectable_value(&mut s.tab, HomeTab::Pending, format!("Pendente ({pending})"));
+            ui.selectable_value(&mut s.tab, HomeTab::Blocked, "Bloqueados");
             ui.selectable_value(&mut s.tab, HomeTab::Add, "Adicionar amigo");
         });
         rule_bleed(ui, 28.0);
 
+        if s.tab == HomeTab::Blocked {
+            ui.add_space(8.0);
+            if s.snap.blocked.is_empty() {
+                ui.add_space(30.0);
+                ui.vertical_centered(|ui| ui.label(RichText::new("Você não bloqueou ninguém.").color(MUTED)));
+                return;
+            }
+            ui.label(caps(&format!("Bloqueados — {}", s.snap.blocked.len())));
+            ui.add_space(4.0);
+            for u in &s.snap.blocked {
+                ui.horizontal(|ui| {
+                    avatar(ui, &u.name, u.id, 36.0, None, BG);
+                    ui.label(RichText::new(&u.name).strong().color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if small_button(ui, "Desbloquear", FIELD) {
+                            acts.push(Act::Send(C2S::Unblock { user_id: u.id }));
+                        }
+                    });
+                });
+                ui.separator();
+            }
+            return;
+        }
         if s.tab == HomeTab::Add {
             ui.add_space(8.0);
             ui.label(RichText::new("ADICIONAR AMIGO").strong());
@@ -2516,7 +2578,7 @@ impl App {
                 HomeTab::Online => f.status == p::FriendStatus::Friend && f.user.online,
                 HomeTab::All => f.status == p::FriendStatus::Friend,
                 HomeTab::Pending => f.status != p::FriendStatus::Friend,
-                HomeTab::Add => false,
+                HomeTab::Add | HomeTab::Blocked => false,
             })
             .collect();
         ui.add_space(4.0);
@@ -2541,7 +2603,14 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            avatar(ui, &f.user.name, f.user.id, 36.0, Some(f.user.status), BG);
+                            let av = avatar(ui, &f.user.name, f.user.id, 36.0, Some(f.user.status), BG);
+                            egui::Popup::context_menu(&av).width(180.0).show(|ui| {
+                                ui.set_min_width(170.0);
+                                if ui.button(RichText::new("Bloquear").color(RED)).clicked() {
+                                    acts.push(Act::Modal(Modal::ConfirmBlock { user_id: f.user.id, name: f.user.name.clone() }));
+                                    ui.close();
+                                }
+                            });
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
                                 ui.label(RichText::new(&f.user.name).strong());
@@ -2728,6 +2797,21 @@ impl App {
                             close = true;
                         }
                     });
+            }
+            Modal::ConfirmBlock { user_id, name } => {
+                modal(ctx, "Bloquear usuário", 360.0, &mut dismissed, |ui| {
+                    ui.label(RichText::new(format!("Bloquear {name}?")).strong().color(TEXT));
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Vocês deixam de ser amigos, ninguém abre conversa privada com o outro e as mensagens dela(e) nos servidores ficam escondidas para você.").color(TEXT2));
+                    ui.add_space(10.0);
+                    if big_button(ui, "Bloquear", RED) {
+                        acts.push(Act::Send(C2S::Block { user_id: *user_id }));
+                        close = true;
+                    }
+                    if small_button(ui, "Cancelar", FIELD) {
+                        close = true;
+                    }
+                });
             }
             Modal::DeleteMsg { id, preview } => {
                 modal(ctx, "Apagar mensagem", 360.0, &mut dismissed, |ui| {

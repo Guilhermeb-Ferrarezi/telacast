@@ -24,7 +24,7 @@ Atualizado em 2026-11-07 (marcas: `[x]` pronto, `[~]` parcial, `[ ]` pendente).
 | Interface | tema **Grafite** (camadas de cinza, âmbar, serifa), barra de servidores com pílula 8/20/40 e sigla, cabeçalho do servidor com menu, canais com categorias, painel de membros, login, modais, barra de ações no hover |
 | Infra | Postgres 18, ids snowflake `i64`, migrações embutidas, **heartbeat e reconexão automática**, testes unitários e **3 e2e** (fluxo completo, limite de login, responder/editar/apagar/ler) |
 
-Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação, sem Markdown, sem anexos, sem busca.**
+Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação, sem anexos, sem tópicos/threads, sem notificações.**
 
 ## Decisões já tomadas
 
@@ -72,7 +72,7 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 - [x] **Rate limit** por IP e por conta (login/cadastro, `Send`, `JoinServer`, pedidos de amizade) e **Argon2 em `spawn_blocking`** com semáforo + hash falso para usuário inexistente. P0 **M**
 - [~] **Tokens** (feito: só o hash, expiração, `Logout`; **falta** revogar ao trocar senha, lista de sessões e o ticket de uso único no vídeo): guardar só o hash, expiração, `Logout`, revogar ao trocar senha, lista de sessões; **tirar o token da URL do vídeo** (ticket de uso único). P0 **M** ([R07]+[R01])
 - [x] **Cadastro fechado — decidido: só entra quem tem convite** (por enquanto). O `Register` passa a exigir um **código de convite da instância** (128 bits, com expiração e limite de usos, revogável), gerado pelo operador do servidor por linha de comando (`telacast-server invite`), o que também resolve a criação da primeira conta. Os convites de *servidor* (guild) também passam a 128 bits. P1 **S**
-- [~] **Limites** (feito: fila limitada e tamanho máximo de mensagem; **falta** conexões por IP, ping/idle e limites por usuário): conexões por IP, ping/idle timeout, canal limitado no lugar de `unbounded_channel`, tamanho máximo de quadro de vídeo, limites de servidores/canais por usuário. P1 **M**
+- [x] **Limites**: fila limitada, tamanho máximo de mensagem, **30 conexões por IP** (`TELACAST_MAX_CONNS_PER_IP`; a excedente recebe 429), heartbeat/idle de 60 s, **20 servidores por usuário e 200 canais por servidor**. conexões por IP, ping/idle timeout, canal limitado no lugar de `unbounded_channel`, tamanho máximo de quadro de vídeo, limites de servidores/canais por usuário. P1 **M**
 - [ ] Nomes de usuário: restringir Unicode (homóglifos). P2 **S**
 
 ### 0.3 Protocolo ([R06])
@@ -138,7 +138,7 @@ Prioridade máxima do [R02]; moderação do [R07].
 ## Fase 4 — Social, perfil, interface e sistema
 
 **Social ([R05])**
-- [~] P0: **status manual** (online/ausente/não perturbe/invisível: feito, salvo na conta, menu no cartão do usuário, bolinha com forma própria) e **ausente automático** (10 min sem entrada, conta suspensão do PC; feito); **falta bloquear usuário** e o não perturbe silenciar notificações (ainda não há notificações). **S / M**
+- [~] P0: **status manual** (online/ausente/não perturbe/invisível: feito, salvo na conta, menu no cartão do usuário, bolinha com forma própria) e **ausente automático** (10 min sem entrada, conta suspensão do PC; feito); **bloquear usuário feito** (some a amizade; ninguém abre DM nem manda mensagem privada ao outro; o bloqueado não descobre; mensagens dele em servidores ficam escondidas com "Mostrar mensagem"; aba "Bloqueados" no Início; menu do botão direito em membros e amigos). **Falta** o não perturbe silenciar notificações (ainda não há notificações). **S / M**
 - [ ] P1: silenciar servidor/canal/DM, **notificação desktop + som** respeitando DND, abas Bloqueados/busca em amigos. **S–M**
 - [ ] P2: **DM em grupo**, status personalizado, níveis de notificação, privacidade (quem me adiciona/manda DM), ignorar. **S–L**
 - [ ] P3: chamadas em DM (depende da Fase 2), atividade/rich presence, sugestões de amigos

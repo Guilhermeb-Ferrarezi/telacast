@@ -563,6 +563,74 @@ impl Store {
         Ok(v)
     }
 
+    /// `a` bloqueou `b`?
+    pub async fn is_blocking(&self, a: i64, b: i64) -> R<bool> {
+        let r: (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM blocks WHERE user_id = $1 AND blocked_id = $2)")
+            .bind(a)
+            .bind(b)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(r.0)
+    }
+
+    /// Bloqueia `other` e desfaz a amizade e os pedidos entre os dois, na mesma transação.
+    pub async fn block(&self, me: i64, other: i64) -> R<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO blocks(user_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(me)
+            .bind(other)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM friendships WHERE (requester_id = $1 AND target_id = $2) OR (requester_id = $2 AND target_id = $1)")
+            .bind(me)
+            .bind(other)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await
+    }
+
+    pub async fn unblock(&self, me: i64, other: i64) -> R<()> {
+        sqlx::query("DELETE FROM blocks WHERE user_id = $1 AND blocked_id = $2").bind(me).bind(other).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Quem `me` bloqueou: (id, nome).
+    pub async fn blocked_by(&self, me: i64) -> R<Vec<(i64, String)>> {
+        sqlx::query_as(
+            "SELECT u.id, u.display_name FROM blocks b JOIN users u ON u.id = b.blocked_id
+             WHERE b.user_id = $1 ORDER BY lower(u.display_name)",
+        )
+        .bind(me)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// O canal é uma DM em que um dos dois bloqueou o outro?
+    pub async fn dm_blocked(&self, channel: i64, me: i64) -> R<bool> {
+        let r: (bool,) = sqlx::query_as(
+            "SELECT EXISTS (
+                 SELECT 1 FROM channels c JOIN channel_members cm ON cm.channel_id = c.id
+                 WHERE c.id = $1 AND c.kind = 10 AND cm.user_id <> $2 AND EXISTS (
+                     SELECT 1 FROM blocks b WHERE (b.user_id = $2 AND b.blocked_id = cm.user_id)
+                                               OR (b.user_id = cm.user_id AND b.blocked_id = $2)))",
+        )
+        .bind(channel)
+        .bind(me)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(r.0)
+    }
+
+    pub async fn owned_servers(&self, owner: i64) -> R<i64> {
+        let r: (i64,) = sqlx::query_as("SELECT count(*) FROM servers WHERE owner_id = $1").bind(owner).fetch_one(&self.pool).await?;
+        Ok(r.0)
+    }
+
+    pub async fn channel_count(&self, server: i64) -> R<i64> {
+        let r: (i64,) = sqlx::query_as("SELECT count(*) FROM channels WHERE server_id = $1").bind(server).fetch_one(&self.pool).await?;
+        Ok(r.0)
+    }
+
     pub async fn is_member(&self, server: i64, user: i64) -> R<bool> {
         let r: (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM members WHERE server_id = $1 AND user_id = $2)")
             .bind(server)
