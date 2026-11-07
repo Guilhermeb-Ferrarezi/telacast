@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SÓ DEBUG (fica em src/debug; o release usa o padrão do Android 9+: texto claro bloqueado, só wss://).
+  O desenvolvimento usa ws:// em localhost (adb reverse), 10.0.2.2 (emulador) e IPs da rede local. A configuração de
+  rede do Android não entende faixas de IP (192.168.0.0/16) nem curinga em IP, então no debug o texto claro vale para
+  qualquer endereço. Em produção o app só fala wss://.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

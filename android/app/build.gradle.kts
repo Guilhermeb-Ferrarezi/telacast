@@ -2,6 +2,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("org.jetbrains.kotlin.plugin.serialization")
     id("app.cash.paparazzi")
 }
 
@@ -39,10 +40,30 @@ dependencies {
     implementation("androidx.compose.animation:animation")
     implementation("androidx.compose.material3:material3")
 
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }
 
-// Testes de snapshot (Paparazzi) na JVM: heap enxuto por causa da RAM apertada.
+// Testes na JVM: heap enxuto por causa da RAM apertada.
+// Os fixtures do protocolo ficam fora do projeto Gradle: ../proto/fixtures (relativo a android/).
+// Testes de integração (nome termina em IntegracaoTest) só rodam com -PintegrationTests (ver scripts/it.sh);
+// no `verifyPaparazziDebug`/`testDebugUnitTest` normais ficam de fora.
 tasks.withType<Test>().configureEach {
     maxHeapSize = "768m"
+    systemProperty("telacast.fixtures", rootProject.projectDir.resolve("../proto/fixtures").canonicalPath)
+    if (project.hasProperty("integrationTests")) {
+        filter.includeTestsMatching("*IntegracaoTest")
+        outputs.upToDateWhen { false }
+        // repassa o servidor de teste (subido por scripts/it.sh)
+        listOf("TELACAST_IT_URL", "TELACAST_IT_INVITE").forEach { k -> System.getenv(k)?.let { environment(k, it) } }
+        testLogging { events("passed", "failed", "skipped"); showStandardStreams = true }
+    } else {
+        filter.excludeTestsMatching("*IntegracaoTest")
+        testLogging { events("failed") }
+    }
 }
