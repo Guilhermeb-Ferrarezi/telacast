@@ -87,6 +87,18 @@ enum HomeTab {
     Add,
 }
 
+/// Anexos por mensagem e envios simultâneos.
+const MAX_ATTACH: usize = 10;
+const MAX_PARALLEL: usize = 3;
+
+/// Mensagem já "enviada" pelo usuário que sai quando os anexos dela terminarem de subir.
+struct Armed {
+    ch: i64,
+    content: String,
+    reply: Option<p::Reply>,
+    keys: Vec<u64>,
+}
+
 enum Modal {
     None,
     AddServer { create: bool, name: String, code: String },
@@ -97,6 +109,8 @@ enum Modal {
     ConfirmBlock { user_id: i64, name: String },
     Account { old: String, new: String, again: String },
     Preview(p::Attachment),
+    /// Prévia de um anexo ainda não enviado (arquivo local).
+    PreviewLocal { key: u64, name: String, path: std::path::PathBuf },
 }
 
 enum Act {
@@ -106,10 +120,13 @@ enum Act {
     Modal(Modal),
     ToggleCategory(i64),
     Copy(String),
+    Toast(String),
     Reply(i64, p::Reply),
     CancelReply,
     JumpTo(i64),
     SendMsg { ch: i64, content: String, reply: Option<p::Reply>, attachments: Vec<p::Attachment> },
+    /// Envia a mensagem assim que os anexos (chaves) terminarem de subir.
+    QueueSend { ch: i64, content: String, reply: Option<p::Reply>, keys: Vec<u64> },
     PickFile,
     AddFile(std::path::PathBuf),
     RemoveUpload(u64),
@@ -196,6 +213,10 @@ struct Session {
     /// Arquivos sendo enviados para o campo de mensagem (por canal) e o canal por onde chegam os resultados.
     uploads: Vec<files::Upload>,
     upload_key: u64,
+    armed: Vec<Armed>,
+    /// Rolagem horizontal da bandeja de anexos e onde ela ficou na tela (para a roda do mouse).
+    tray_x: f32,
+    tray_rect: egui::Rect,
     upload_tx: std::sync::mpsc::Sender<(u64, Result<p::Attachment, String>)>,
     upload_rx: std::sync::mpsc::Receiver<(u64, Result<p::Attachment, String>)>,
     /// Caminhos escolhidos no seletor de arquivos (a janela roda em outra thread).
@@ -317,6 +338,9 @@ impl Session {
             images: files::Images::new(),
             uploads: Vec::new(),
             upload_key: 0,
+            armed: Vec::new(),
+            tray_x: 0.0,
+            tray_rect: egui::Rect::NOTHING,
             upload_tx,
             upload_rx,
             picked_tx,
@@ -454,18 +478,78 @@ impl Session {
         }
     }
 
-    /// Começa a enviar um arquivo para o canal aberto; o resultado volta por `upload_rx`.
+    /// Põe um arquivo na fila de envio do canal aberto (no máximo 10 por mensagem).
     fn start_upload(&mut self, path: std::path::PathBuf) {
         let Some(channel) = self.current_channel() else { return };
+        if self.uploads.iter().filter(|u| u.channel == channel && !u.armed).count() >= MAX_ATTACH {
+            self.toast = Some((format!("Você só pode anexar {MAX_ATTACH} arquivos por mensagem."), Instant::now()));
+            return;
+        }
         self.upload_key += 1;
         let key = self.upload_key;
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "arquivo".into());
-        self.uploads.push(files::Upload { key, channel, name, path: path.clone(), state: files::UpState::Sending });
+        self.uploads.push(files::Upload { key, channel, name, path, state: files::UpState::Queued, armed: false, not_before: None });
+        self.pump_uploads();
+    }
+
+    /// Dispara os envios da fila, até `MAX_PARALLEL` ao mesmo tempo (cada um numa thread).
+    fn pump_uploads(&mut self) {
+        let running = self.uploads.iter().filter(|u| matches!(u.state, files::UpState::Sending)).count();
+        let mut slots = MAX_PARALLEL.saturating_sub(running);
         let (base, token, tx, ctx) = (self.http_base.clone(), self.token.clone(), self.upload_tx.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
-            let _ = tx.send((key, files::upload(&base, &token, channel, &path)));
-            ctx.request_repaint();
-        });
+        let now = Instant::now();
+        for u in self.uploads.iter_mut().filter(|u| matches!(u.state, files::UpState::Queued)) {
+            if slots == 0 {
+                break;
+            }
+            if let Some(t) = u.not_before {
+                if t > now {
+                    self.ctx.request_repaint_after(t - now);
+                    continue;
+                }
+            }
+            slots -= 1;
+            u.state = files::UpState::Sending;
+            let (base, token, tx, ctx, key, channel, path) = (base.clone(), token.clone(), tx.clone(), ctx.clone(), u.key, u.channel, u.path.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send((key, files::upload(&base, &token, channel, &path)));
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// Manda as mensagens que esperavam os anexos, na ordem em que foram pedidas (por canal).
+    fn flush_armed(&mut self) {
+        let mut blocked: HashSet<i64> = HashSet::new();
+        let mut i = 0;
+        while i < self.armed.len() {
+            let ch = self.armed[i].ch;
+            let busy = self.armed[i]
+                .keys
+                .iter()
+                .any(|k| self.uploads.iter().any(|u| u.key == *k && matches!(u.state, files::UpState::Queued | files::UpState::Sending)));
+            if busy || blocked.contains(&ch) {
+                blocked.insert(ch);
+                i += 1;
+                continue;
+            }
+            let a = self.armed.remove(i);
+            let atts: Vec<p::Attachment> = a
+                .keys
+                .iter()
+                .filter_map(|k| self.uploads.iter().find(|u| u.key == *k))
+                .filter_map(|u| if let files::UpState::Done(at) = &u.state { Some(at.clone()) } else { None })
+                .collect();
+            self.uploads.retain(|u| !(a.keys.contains(&u.key) && matches!(u.state, files::UpState::Done(_))));
+            for u in self.uploads.iter_mut().filter(|u| a.keys.contains(&u.key)) {
+                u.armed = false; // o que falhou volta para o campo
+            }
+            if a.content.trim().is_empty() && atts.is_empty() {
+                self.toast = Some(("Os anexos não subiram; a mensagem não foi enviada.".into(), Instant::now()));
+                continue;
+            }
+            self.send_message(a.ch, a.content, a.reply, atts);
+        }
     }
 
     /// Rola até a mensagem `id` do canal aberto; se não estiver carregada, busca páginas antigas.
@@ -569,6 +653,11 @@ impl Session {
             if let Some(u) = self.uploads.iter_mut().find(|u| u.key == key) {
                 u.state = match res {
                     Ok(a) => files::UpState::Done(a),
+                    // o servidor pediu calma (limite por minuto): volta para a fila e tenta já já
+                    Err(e) if e.contains("muitos envios seguidos") => {
+                        u.not_before = Some(Instant::now() + Duration::from_secs(5));
+                        files::UpState::Queued
+                    }
                     Err(e) => files::UpState::Failed(e),
                 };
             }
@@ -576,6 +665,8 @@ impl Session {
         while let Ok(path) = self.picked_rx.try_recv() {
             self.start_upload(path);
         }
+        self.pump_uploads();
+        self.flush_armed();
         while let Ok(ev) = self.gw.rx.try_recv() {
             match ev {
                 Event::Closed(why) => {
@@ -1200,6 +1291,46 @@ fn attachment_view(ui: &mut egui::Ui, a: &p::Attachment, base: &str, token: &str
     let _ = (card, acts);
 }
 
+/// Prévia ampliada de uma imagem sobre o app. Devolve `true` quando deve fechar (Esc, clique fora ou "Fechar").
+/// Com `download`, mostra também o botão "Baixar".
+fn lightbox(ctx: &egui::Context, tex: Option<egui::TextureHandle>, caption: &str, download: Option<String>) -> bool {
+    let screen = ctx.content_rect();
+    let max = egui::vec2((screen.width() - 120.0).max(200.0), (screen.height() - 150.0).max(150.0));
+    let m = egui::Modal::new(egui::Id::new("img-preview"))
+        .backdrop_color(egui::Color32::from_black_alpha(220))
+        .frame(egui::Frame::NONE)
+        .show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                match &tex {
+                    Some(t) => {
+                        let sz = t.size_vec2();
+                        let k = (max.x / sz.x).min(max.y / sz.y);
+                        ui.add(egui::Image::new(t).fit_to_exact_size(sz * k).corner_radius(egui::CornerRadius::same(6)));
+                    }
+                    None => {
+                        ui.add_space(max.y / 2.0);
+                        ui.label(RichText::new("Carregando…").color(MUTED));
+                        ui.add_space(max.y / 2.0);
+                        ctx.request_repaint_after(Duration::from_millis(200));
+                    }
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(caption).size(13.0).color(TEXT2));
+                    if let Some(url) = &download {
+                        if small_button(ui, "Baixar", FIELD) {
+                            ctx.open_url(egui::OpenUrl::new_tab(url.clone()));
+                        }
+                    }
+                    if small_button(ui, "Fechar", FIELD) {
+                        ui.close();
+                    }
+                });
+            });
+        });
+    m.should_close()
+}
+
 /// Tile de anexo pendente (120x120): miniatura "cobrir" com raio 8, nome 12 px embaixo,
 /// lixeira no hover, barra âmbar enquanto envia.
 fn upload_tile(ui: &mut egui::Ui, u: &files::Upload, images: &mut files::Images, acts: &mut Vec<Act>) {
@@ -1209,10 +1340,10 @@ fn upload_tile(ui: &mut egui::Ui, u: &files::Upload, images: &mut files::Images,
     let ctx = ui.ctx().clone();
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 4.0;
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(120.0, 120.0), egui::Sense::hover());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(120.0, 120.0), if is_img { egui::Sense::click() } else { egui::Sense::hover() });
         let mut shown = false;
         if is_img {
-            match images.get_local(&ctx, u.key, &u.path) {
+            match images.get_local(&ctx, u.key, &u.path, false) {
                 files::Img::Ready(tex) => {
                     let sz = tex.size_vec2();
                     // "cobrir": corta o excesso do lado maior, centralizado
@@ -1233,6 +1364,10 @@ fn upload_tile(ui: &mut egui::Ui, u: &files::Upload, images: &mut files::Images,
             p.text(rect.center(), Align2::CENTER_CENTER, label, egui::FontId::proportional(20.0), TEXT2);
         }
         match &u.state {
+            files::UpState::Queued => {
+                p.rect_filled(rect, 8.0, egui::Color32::from_black_alpha(130));
+                p.text(rect.center(), Align2::CENTER_CENTER, "Na fila", egui::FontId::proportional(13.0), TEXT2);
+            }
             files::UpState::Sending => {
                 p.rect_filled(rect, 8.0, egui::Color32::from_black_alpha(90));
                 // sem progresso real do envio: uma barra de 3 px corre pelo pé do tile
@@ -1251,6 +1386,12 @@ fn upload_tile(ui: &mut egui::Ui, u: &files::Upload, images: &mut files::Images,
                 p.text(rect.center(), Align2::CENTER_CENTER, "Falhou", egui::FontId::proportional(13.0), RED);
             }
             files::UpState::Done(_) => {}
+        }
+        if is_img && resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if is_img && resp.clicked() {
+            acts.push(Act::Modal(Modal::PreviewLocal { key: u.key, name: u.name.clone(), path: u.path.clone() }));
         }
         // lixeira no hover (canto superior direito)
         let pill = egui::Rect::from_min_size(egui::pos2(rect.right() - 34.0, rect.top() + 6.0), egui::vec2(28.0, 28.0));
@@ -1364,7 +1505,10 @@ impl App {
             // gancho de teste: anexa esse arquivo uma vez, ao abrir um canal
             if let Ok(path) = std::env::var("TELACAST_ATTACH") {
                 if s.uploads.is_empty() && s.upload_key == 0 && s.current_channel().is_some() {
-                    acts.push(Act::AddFile(path.into()));
+                    // vários arquivos separados por vírgula
+                    for one in path.split(',').filter(|x| !x.is_empty()) {
+                        acts.push(Act::AddFile(one.into()));
+                    }
                 }
             }
         }
@@ -1540,14 +1684,21 @@ impl App {
                     s.uploads.retain(|u| !matches!(&u.state, files::UpState::Done(a) if used.contains(&a.id)));
                     s.send_message(ch, content, reply, attachments);
                 }
+                Act::QueueSend { ch, content, reply, keys } => {
+                    for u in s.uploads.iter_mut().filter(|u| keys.contains(&u.key)) {
+                        u.armed = true;
+                    }
+                    s.armed.push(Armed { ch, content, reply, keys });
+                    s.flush_armed();
+                }
                 Act::PickFile => {
                     let tx = s.picked_tx.clone();
                     let ctx2 = ctx.clone();
                     std::thread::spawn(move || {
-                        if let Some(path) = files::pick_file() {
+                        for path in files::pick_files() {
                             let _ = tx.send(path);
-                            ctx2.request_repaint();
                         }
+                        ctx2.request_repaint();
                     });
                 }
                 Act::AddFile(path) => s.start_upload(path),
@@ -1642,6 +1793,7 @@ impl App {
                     }
                 }
                 Act::AskDelete(id, preview) => s.modal = Modal::DeleteMsg { id, preview },
+                Act::Toast(msg) => s.toast = Some((msg, Instant::now())),
                 Act::Copy(text) => {
                     ctx.copy_text(text);
                     s.toast = Some(("Texto copiado".into(), Instant::now()));
@@ -2390,7 +2542,7 @@ impl App {
         let blocked_ids: HashSet<i64> = s.snap.blocked.iter().map(|u| u.id).collect();
         let replying_here = matches!(&s.replying, Some((c, _)) if *c == ch);
         let uploads_here = s.uploads.iter().any(|u| u.channel == ch);
-        let input_h = 82.0 + 22.0 + if replying_here { 38.0 } else { 0.0 } + if uploads_here { 172.0 } else { 0.0 };
+        let input_h = 82.0 + 22.0 + if replying_here { 38.0 } else { 0.0 } + if uploads_here { 180.0 + if s.armed.iter().any(|a| a.ch == ch) { 20.0 } else { 0.0 } } else { 0.0 };
         let h = (ui.available_height() - input_h).max(60.0);
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         // Esc dispensa o divisor "novas mensagens" (o canal já foi marcado como lido ao abrir)
@@ -2789,14 +2941,43 @@ impl App {
                 // bandeja de anexos pendentes: no topo da caixa, miniaturas 120x120
                 if s.uploads.iter().any(|u| u.channel == ch) {
                     ui.add_space(4.0);
-                    egui::ScrollArea::horizontal().id_salt(("tray", ch)).auto_shrink([false, true]).show(ui, |ui| {
-                        ui.horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
-                            for u in s.uploads.iter().filter(|u| u.channel == ch) {
-                                upload_tile(ui, u, &mut s.images, acts);
-                            }
+                    // barra fina que ocupa o próprio espaço (não cobre o nome dos arquivos)
+                    let mut st = egui::style::ScrollStyle::solid();
+                    st.bar_width = 6.0;
+                    st.bar_inner_margin = 4.0;
+                    st.foreground_color = true;
+                    st.dormant_handle_opacity = 0.6;
+                    st.active_handle_opacity = 0.8;
+                    ui.spacing_mut().scroll = st;
+                    ui.visuals_mut().widgets.inactive.fg_stroke.color = Color32::from_rgb(0x4a, 0x4a, 0x50);
+                    ui.visuals_mut().widgets.hovered.fg_stroke.color = Color32::from_rgb(0x7a, 0x7a, 0x82);
+                    ui.visuals_mut().widgets.active.fg_stroke.color = AMBER;
+                    // a roda do mouse sobre a bandeja rola na horizontal
+                    if ctx.pointer_hover_pos().is_some_and(|p| s.tray_rect.contains(p)) {
+                        let dy = ctx.input(|i| i.smooth_scroll_delta.y);
+                        if dy != 0.0 {
+                            s.tray_x = (s.tray_x - dy).max(0.0);
+                            ctx.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+                        }
+                    }
+                    let out = egui::ScrollArea::horizontal()
+                        .id_salt(("tray", ch))
+                        .auto_shrink([false, true])
+                        .horizontal_scroll_offset(s.tray_x)
+                        .show(ui, |ui| {
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                                for u in s.uploads.iter().filter(|u| u.channel == ch) {
+                                    upload_tile(ui, u, &mut s.images, acts);
+                                }
+                            });
                         });
-                    });
+                    s.tray_x = out.state.offset().x;
+                    s.tray_rect = out.inner_rect;
+                    if s.armed.iter().any(|a| a.ch == ch) {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("A mensagem sai assim que os anexos terminarem de subir.").size(12.0).color(AMBER));
+                    }
                     ui.add_space(8.0);
                     let y = ui.cursor().top();
                     let x = ui.max_rect().x_range();
@@ -2837,17 +3018,22 @@ impl App {
                     }
                     let enter = r.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
                     let clicked = small_button(ui, "Enviar", BLURPLE);
-                    let atts: Vec<p::Attachment> = s
-                        .uploads
-                        .iter()
-                        .filter(|u| u.channel == ch)
-                        .filter_map(|u| if let files::UpState::Done(a) = &u.state { Some(a.clone()) } else { None })
-                        .collect();
-                    let uploading = s.uploads.iter().any(|u| u.channel == ch && matches!(u.state, files::UpState::Sending));
-                    if (enter || clicked) && (!s.input.trim().is_empty() || !atts.is_empty()) && !uploading {
+                    // anexos desta mensagem: os que ainda não pertencem a outra mensagem na fila
+                    let mine: Vec<&files::Upload> = s.uploads.iter().filter(|u| u.channel == ch && !u.armed).collect();
+                    let atts: Vec<p::Attachment> =
+                        mine.iter().filter_map(|u| if let files::UpState::Done(a) = &u.state { Some(a.clone()) } else { None }).collect();
+                    let keys: Vec<u64> = mine.iter().filter(|u| !matches!(u.state, files::UpState::Failed(_))).map(|u| u.key).collect();
+                    let uploading = mine.iter().any(|u| matches!(u.state, files::UpState::Queued | files::UpState::Sending));
+                    if (enter || clicked) && (!s.input.trim().is_empty() || !keys.is_empty()) {
                         let reply = s.replying.as_ref().filter(|(c, _)| *c == ch).map(|(_, r)| r.clone());
                         let had_reply = reply.is_some();
-                        acts.push(Act::SendMsg { ch, content: std::mem::take(&mut s.input), reply, attachments: atts });
+                        let content = std::mem::take(&mut s.input);
+                        if uploading {
+                            // sem bloquear: a mensagem sai sozinha quando o último anexo terminar de subir
+                            acts.push(Act::QueueSend { ch, content, reply, keys });
+                        } else {
+                            acts.push(Act::SendMsg { ch, content, reply, attachments: atts });
+                        }
                         if had_reply {
                             acts.push(Act::CancelReply);
                         }
@@ -3154,39 +3340,21 @@ impl App {
                     files::Img::Ready(t) => Some(t.clone()),
                     _ => thumb,
                 };
-                let screen = ctx.content_rect();
-                let max = egui::vec2((screen.width() - 120.0).max(200.0), (screen.height() - 150.0).max(150.0));
-                let m = egui::Modal::new(egui::Id::new("img-preview"))
-                    .backdrop_color(egui::Color32::from_black_alpha(220))
-                    .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
-                        ui.vertical_centered(|ui| {
-                            match &tex {
-                                Some(t) => {
-                                    let sz = t.size_vec2();
-                                    let k = (max.x / sz.x).min(max.y / sz.y);
-                                    ui.add(egui::Image::new(t).fit_to_exact_size(sz * k).corner_radius(egui::CornerRadius::same(6)));
-                                }
-                                None => {
-                                    ui.add_space(max.y / 2.0);
-                                    ui.label(RichText::new("Carregando…").color(MUTED));
-                                    ui.add_space(max.y / 2.0);
-                                    ctx.request_repaint_after(Duration::from_millis(200));
-                                }
-                            }
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(format!("{} · {}", a.name, files::human_size(a.size))).size(13.0).color(TEXT2));
-                                if small_button(ui, "Baixar", FIELD) {
-                                    ctx.open_url(egui::OpenUrl::new_tab(files::url(&base, a, &token)));
-                                }
-                                if small_button(ui, "Fechar", FIELD) {
-                                    ui.close();
-                                }
-                            });
-                        });
-                    });
-                if m.should_close() {
+                let caption = format!("{} · {}", a.name, files::human_size(a.size));
+                if lightbox(ctx, tex, &caption, Some(files::url(&base, a, &token))) {
+                    dismissed = true;
+                }
+            }
+            Modal::PreviewLocal { key, name, path } => {
+                let thumb = match s.images.get_local(ctx, *key, path, false) {
+                    files::Img::Ready(t) => Some(t.clone()),
+                    _ => None,
+                };
+                let tex = match s.images.get_local(ctx, *key, path, true) {
+                    files::Img::Ready(t) => Some(t.clone()),
+                    _ => thumb,
+                };
+                if lightbox(ctx, tex, name, None) {
                     dismissed = true;
                 }
             }
@@ -3283,8 +3451,15 @@ impl App {
                         ui.label("Mande este código para quem você quer convidar:");
                         ui.label(RichText::new(code.as_str()).size(22.0).strong().monospace());
                         ui.horizontal(|ui| {
-                            if small_button(ui, "Copiar", BLURPLE) {
+                            let id = egui::Id::new("invite-copied");
+                            let copied = ctx.data(|d| d.get_temp::<Instant>(id)).is_some_and(|t| t.elapsed() < Duration::from_millis(2200));
+                            if copied {
+                                ctx.request_repaint_after(Duration::from_millis(2300));
+                            }
+                            if small_button(ui, if copied { "Copiado" } else { "Copiar" }, if copied { L4 } else { BLURPLE }) {
                                 ctx.copy_text(code.clone());
+                                ctx.data_mut(|d| d.insert_temp(id, Instant::now()));
+                                acts.push(Act::Toast("Código de convite copiado".into()));
                             }
                             if small_button(ui, "Fechar", FIELD) {
                                 close = true;
@@ -3344,6 +3519,7 @@ impl App {
             }
             ctx.request_repaint_after(Duration::from_millis(500));
             egui::Area::new(egui::Id::new("toast"))
+                .order(egui::Order::Tooltip)
                 .anchor(Align2::CENTER_BOTTOM, [0.0, -24.0])
                 .show(ctx, |ui| {
                     egui::Frame::new()
@@ -3351,7 +3527,13 @@ impl App {
                         .stroke(egui::Stroke::new(1.0, LINE2))
                         .corner_radius(egui::CornerRadius::same(10))
                         .inner_margin(egui::Margin::same(12))
-                        .show(ui, |ui| ui.label(msg));
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 14.0), egui::Sense::hover());
+                                ui.painter().circle_filled(r.center(), 3.5, AMBER);
+                                ui.label(msg);
+                            });
+                        });
                 });
         }
     }

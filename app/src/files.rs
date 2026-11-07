@@ -82,19 +82,21 @@ pub fn upload(base: &str, token: &str, channel: i64, path: &Path) -> Result<p::A
 }
 
 /// Abre o seletor de arquivos do sistema (kdialog ou zenity); `None` se cancelou ou não há nenhum instalado.
-pub fn pick_file() -> Option<PathBuf> {
+pub fn pick_files() -> Vec<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let tries: [(&str, Vec<String>); 2] = [
-        ("kdialog", vec!["--getopenfilename".into(), home.clone()]),
-        ("zenity", vec!["--file-selection".into(), format!("--filename={home}/")]),
+        ("kdialog", vec!["--getopenfilename".into(), home.clone(), "--multiple".into(), "--separate-output".into()]),
+        ("zenity", vec!["--file-selection".into(), "--multiple".into(), "--separator=\n".into(), format!("--filename={home}/")]),
     ];
     for (cmd, args) in tries {
         if let Ok(out) = std::process::Command::new(cmd).args(&args).output() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            return if out.status.success() && !s.is_empty() { Some(PathBuf::from(s)) } else { None };
+            if !out.status.success() {
+                return Vec::new();
+            }
+            return String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|l| !l.is_empty()).map(PathBuf::from).collect();
         }
     }
-    None
+    Vec::new()
 }
 
 /// Arquivo que está sendo enviado (ou já foi) para o campo de mensagem de um canal.
@@ -104,9 +106,15 @@ pub struct Upload {
     pub name: String,
     pub path: std::path::PathBuf,
     pub state: UpState,
+    /// Já pertence a uma mensagem que espera os envios terminarem.
+    pub armed: bool,
+    /// Só tenta de novo depois disso (servidor pediu calma com 429).
+    pub not_before: Option<std::time::Instant>,
 }
 
 pub enum UpState {
+    /// Esperando vaga (há no máximo 3 envios ao mesmo tempo).
+    Queued,
     Sending,
     Done(p::Attachment),
     Failed(String),
@@ -157,11 +165,12 @@ impl Images {
     }
 
     /// Miniatura de um arquivo local (bandeja de anexos pendentes). Chave própria por envio.
-    pub fn get_local(&mut self, ctx: &egui::Context, upload_key: u64, path: &std::path::Path) -> &Img {
+    pub fn get_local(&mut self, ctx: &egui::Context, upload_key: u64, path: &std::path::Path, full: bool) -> &Img {
         let path = path.to_path_buf();
-        self.load_with(-(1 << 60) - upload_key as i64, ctx, move || {
+        let (key, lim) = if full { (-(1 << 61) - upload_key as i64, (4096, 4096)) } else { (-(1 << 60) - upload_key as i64, (480, 480)) };
+        self.load_with(key, ctx, move || {
             let bytes = std::fs::read(&path).ok()?;
-            decode(&bytes, (480, 480))
+            decode(&bytes, lim)
         })
     }
 
