@@ -46,7 +46,12 @@ fn run(url: &str, out: Receiver<C2S>, ev: &Sender<Event>, ctx: &Context) -> anyh
     }
     let _ = ev.send(Event::Connected);
     ctx.request_repaint();
+    // Relógio de parede: depois de o PC suspender, o salto de tempo derruba a conexão velha na hora.
+    let mut last_rx = std::time::SystemTime::now();
     loop {
+        if last_rx.elapsed().map_or(true, |d| d > Duration::from_secs(50)) {
+            anyhow::bail!("o servidor parou de responder");
+        }
         loop {
             match out.try_recv() {
                 Ok(m) => ws.send(Message::Text(serde_json::to_string(&m)?.into()))?,
@@ -59,13 +64,15 @@ fn run(url: &str, out: Receiver<C2S>, ev: &Sender<Event>, ctx: &Context) -> anyh
         }
         match ws.read() {
             Ok(Message::Text(t)) => {
+                last_rx = std::time::SystemTime::now();
                 if let Ok(m) = serde_json::from_str::<S2C>(&t) {
                     let _ = ev.send(Event::Msg(m));
                     ctx.request_repaint();
                 }
             }
             Ok(Message::Close(_)) => return Ok(()),
-            Ok(_) => {}
+            // ping do servidor (o tungstenite já responde com pong) e pong também provam que a conexão vive
+            Ok(_) => last_rx = std::time::SystemTime::now(),
             Err(tungstenite::Error::Io(e))
                 if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
             Err(e) => return Err(e.into()),

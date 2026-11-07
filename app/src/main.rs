@@ -86,7 +86,19 @@ enum Act {
     Fullscreen,
 }
 
+/// Estado da ligação com o servidor depois do login.
+enum Link {
+    Up,
+    /// Caiu; tenta de novo em `retry_at`.
+    Down { attempt: u32, retry_at: Instant, why: String },
+    /// Conexão reaberta, esperando o servidor aceitar a sessão.
+    Resuming { attempt: u32 },
+}
+
 struct Session {
+    server: String,
+    ctx: egui::Context,
+    link: Link,
     gw: Gateway,
     token: String,
     me: p::User,
@@ -120,8 +132,11 @@ struct Jump {
 }
 
 impl Session {
-    fn new(gw: Gateway, token: String, me: p::User) -> Self {
+    fn new(gw: Gateway, server: String, ctx: egui::Context, token: String, me: p::User) -> Self {
         Self {
+            server,
+            ctx,
+            link: Link::Up,
             gw,
             token,
             snap: p::Snapshot { me: me.clone(), servers: vec![], friends: vec![], dms: vec![], live: vec![] },
@@ -246,10 +261,45 @@ impl Session {
 
     /// Processa eventos do servidor. Devolve o motivo se a conexão caiu.
     fn pump(&mut self) -> Option<String> {
+        // hora de tentar de novo?
+        if let Link::Down { attempt, retry_at, .. } = &self.link {
+            if Instant::now() >= *retry_at {
+                let attempt = *attempt;
+                self.gw = gateway::open(&self.server, self.ctx.clone());
+                self.gw.send(C2S::Resume { token: self.token.clone() });
+                self.link = Link::Resuming { attempt };
+            } else {
+                self.ctx.request_repaint_after(Duration::from_millis(500));
+            }
+        }
         while let Ok(ev) = self.gw.rx.try_recv() {
             match ev {
-                Event::Closed(why) => return Some(why),
+                Event::Closed(why) => {
+                    let attempt = match &self.link {
+                        Link::Up => 1,
+                        Link::Down { attempt, .. } | Link::Resuming { attempt } => attempt + 1,
+                    };
+                    // 1, 2, 4, 8 e no máximo 15 segundos entre tentativas
+                    let wait = (1u64 << (attempt - 1).min(4)).min(15);
+                    self.link = Link::Down { attempt, retry_at: Instant::now() + Duration::from_secs(wait), why };
+                    self.ctx.request_repaint_after(Duration::from_millis(500));
+                    break;
+                }
                 Event::Connected => {}
+                Event::Msg(S2C::Error { msg }) if matches!(self.link, Link::Resuming { .. }) => {
+                    // o servidor recusou a sessão (expirou ou foi revogada): volta para o login
+                    return Some(msg);
+                }
+                Event::Msg(S2C::Auth { .. }) if matches!(self.link, Link::Resuming { .. }) => {
+                    self.link = Link::Up;
+                    // recarrega o canal aberto: pode ter perdido mensagens enquanto estava fora
+                    let cur = self.current_channel();
+                    self.requested.clear();
+                    if let Some(ch) = cur {
+                        self.requested.insert(ch);
+                        self.gw.send(C2S::History { channel_id: ch, before: None });
+                    }
+                }
                 Event::Msg(m) => match m {
                     S2C::Snapshot(sn) => {
                         self.me = sn.me.clone();
@@ -388,7 +438,7 @@ impl App {
         });
     }
 
-    fn poll_login(&mut self) {
+    fn poll_login(&mut self, ctx: &egui::Context) {
         loop {
             let Some(ev) = self.login.gw.as_ref().and_then(|g| g.rx.try_recv().ok()) else { break };
             match ev {
@@ -403,7 +453,7 @@ impl App {
                     self.login.pass.clear();
                     self.login.error.clear();
                     self.login.resuming = false;
-                    self.session = Some(Session::new(gw, token, me));
+                    self.session = Some(Session::new(gw, self.login.server.clone(), ctx.clone(), token, me));
                     return;
                 }
                 Event::Msg(S2C::Error { msg }) => {
@@ -461,7 +511,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll_login();
+        self.poll_login(&ctx);
         match self.session.take() {
             Some(mut s) => {
                 if let Some(why) = s.pump() {
@@ -586,6 +636,33 @@ impl App {
     /// Desenha a sessão. Devolve false se o usuário saiu.
     fn session_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &mut Session) -> bool {
         let mut acts: Vec<Act> = Vec::new();
+
+        // faixa de conexão: aparece só enquanto a ligação com o servidor está fora
+        if !self.fullscreen && !matches!(s.link, Link::Up) {
+            egui::Panel::top("link")
+                .frame(egui::Frame::new().fill(L3).inner_margin(egui::Margin::symmetric(16, 7)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        dot(ui, AMBER);
+                        match &s.link {
+                            Link::Down { retry_at, .. } => {
+                                let left = retry_at.saturating_duration_since(Instant::now()).as_secs() + 1;
+                                ui.label(RichText::new(format!("Sem conexão com o servidor. Nova tentativa em {left} s.")).color(TEXT));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Tentar agora", FIELD) {
+                                        if let Link::Down { retry_at, .. } = &mut s.link {
+                                            *retry_at = Instant::now();
+                                        }
+                                    }
+                                });
+                            }
+                            _ => {
+                                ui.label(RichText::new("Reconectando…").color(TEXT));
+                            }
+                        }
+                    });
+                });
+        }
 
         if self.publishing.is_some() || self.watching.is_some() {
             ctx.request_repaint_after(Duration::from_millis(500));
@@ -1377,7 +1454,7 @@ impl App {
                     }
                     let enter = r.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
                     let clicked = small_button(ui, "Enviar", BLURPLE);
-                    if (enter || clicked) && !s.input.trim().is_empty() {
+                    if (enter || clicked) && !s.input.trim().is_empty() && matches!(s.link, Link::Up) {
                         let reply_to = s.replying.as_ref().filter(|(c, _)| *c == ch).map(|(_, r)| r.id);
                         acts.push(Act::Send(C2S::Send { channel_id: ch, content: std::mem::take(&mut s.input), reply_to }));
                         if reply_to.is_some() {

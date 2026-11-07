@@ -377,21 +377,34 @@ async fn run_conn(mut socket: WebSocket, app: Arc<App>, ip: String) {
     let (tx, mut rx) = unbounded_channel::<S2C>();
     let cid = app.next.fetch_add(1, Ordering::Relaxed);
     let mut session: Option<Session> = None;
+    // Heartbeat: ping a cada 20 s; qualquer quadro recebido (inclusive o pong) conta como vivo.
+    // Sem nada por 60 s a conexão é considerada morta (derruba o "online" falso).
+    let mut beat = tokio::time::interval(Duration::from_secs(20));
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_seen = tokio::time::Instant::now();
+    beat.tick().await; // o primeiro tick é imediato; o primeiro ping só sai aos 20 s
     loop {
         tokio::select! {
+            _ = beat.tick() => {
+                if last_seen.elapsed() > Duration::from_secs(60) { break }
+                if socket.send(Message::Ping(Default::default())).await.is_err() { break }
+            }
             out = rx.recv() => {
                 let Some(m) = out else { break };
                 let Ok(json) = serde_json::to_string(&m) else { continue };
                 if socket.send(Message::Text(json.into())).await.is_err() { break }
             }
-            inc = socket.recv() => match inc {
-                Some(Ok(Message::Text(t))) => {
-                    if let Ok(m) = serde_json::from_str::<C2S>(&t) {
-                        if !handle(&app, &tx, &mut session, cid, &ip, m).await { break }
+            inc = socket.recv() => {
+                last_seen = tokio::time::Instant::now();
+                match inc {
+                    Some(Ok(Message::Text(t))) => {
+                        if let Ok(m) = serde_json::from_str::<C2S>(&t) {
+                            if !handle(&app, &tx, &mut session, cid, &ip, m).await { break }
+                        }
                     }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
                 }
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                _ => {}
             }
         }
     }

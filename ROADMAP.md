@@ -22,9 +22,9 @@ Atualizado em 2026-11-07 (marcas: `[x]` pronto, `[~]` parcial, `[ ]` pendente).
 | Social | amigos (pedir/aceitar/remover), DMs 1:1, presença online/offline |
 | Vídeo | transmissão de tela por canal: captura X11, NVENC, relay por WebSocket, fallback openh264 |
 | Interface | tema **Grafite** (camadas de cinza, âmbar, serifa), barra de servidores com pílula 8/20/40 e sigla, cabeçalho do servidor com menu, canais com categorias, painel de membros, login, modais, barra de ações no hover |
-| Infra | Postgres 18, ids snowflake `i64`, migrações embutidas, testes unitários e **3 e2e** (fluxo completo, limite de login, responder/editar/apagar/ler) |
+| Infra | Postgres 18, ids snowflake `i64`, migrações embutidas, **heartbeat e reconexão automática**, testes unitários e **3 e2e** (fluxo completo, limite de login, responder/editar/apagar/ler) |
 
-Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação, sem reconexão automática, sem Markdown, sem paginação de histórico, sem anexos, sem busca.**
+Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação, sem Markdown, sem paginação de histórico, sem anexos, sem busca.**
 
 ## Decisões já tomadas
 
@@ -76,8 +76,8 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 - [ ] Nomes de usuário: restringir Unicode (homóglifos). P2 **S**
 
 ### 0.3 Protocolo ([R06])
-- [ ] **Heartbeat + ACK** e derrubar conexões zumbi (corrige "online" falso). P0 **S**
-- [ ] **Reconexão automática** com backoff e banner na UI. P0 **S**
+- [x] **Heartbeat** (ping do servidor a cada 20 s, derruba conexão muda há 60 s; o cliente também detecta conexão morta, inclusive após suspender o PC). Falta o ACK por mensagem. P0 **S**
+- [x] **Reconexão automática** com espera 1, 2, 4, 8 e 15 s, faixa "Sem conexão… Nova tentativa em N s" com botão "Tentar agora", retoma a sessão e recarrega o canal aberto; o campo de mensagem não envia enquanto está fora. P0 **S**
 - [ ] **`nonce`** no envio, deduplicação e mensagem otimista. P0 **S**
 - [ ] **`ErrorCode` estáveis** + variante `Unknown` nos enums (cliente antigo não quebra). P0 **S**
 - [ ] **`PROTO_VERSION`** no login. P1 **S**
