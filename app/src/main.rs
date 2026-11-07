@@ -61,6 +61,7 @@ enum Modal {
     NewChannel { server: i64, name: String, kind: u8, parent: Option<i64> },
     Invite(String),
     GoLive,
+    DeleteMsg { id: i64, preview: String },
 }
 
 enum Act {
@@ -69,6 +70,13 @@ enum Act {
     Send(C2S),
     Modal(Modal),
     ToggleCategory(i64),
+    Copy(String),
+    Reply(i64, p::Reply),
+    CancelReply,
+    StartEdit(i64, String),
+    CancelEdit,
+    SaveEdit(i64, String),
+    AskDelete(i64, String),
     Logout,
     Watch(i64),
     StopWatch,
@@ -95,6 +103,11 @@ struct Session {
     view_since: Instant,
     seen: HashMap<i64, Instant>,
     collapsed: HashSet<i64>,
+    replying: Option<(i64, p::Reply)>,
+    editing: Option<(i64, String)>,
+    typing: HashMap<(i64, i64), Instant>,
+    last_typing: Instant,
+    focus_composer: bool,
 }
 
 impl Session {
@@ -117,6 +130,11 @@ impl Session {
             view_since: Instant::now(),
             seen: HashMap::new(),
             collapsed: HashSet::new(),
+            replying: None,
+            editing: None,
+            typing: HashMap::new(),
+            last_typing: Instant::now() - Duration::from_secs(60),
+            focus_composer: false,
         }
     }
 
@@ -139,12 +157,37 @@ impl Session {
         };
         if let Some(ch) = ch {
             self.unread.remove(&ch);
+            self.ack(ch);
             if self.requested.insert(ch) {
                 self.gw.send(C2S::History { channel_id: ch, before: None });
             }
         }
+        self.editing = None;
         self.view = v;
         self.view_since = Instant::now();
+    }
+
+    /// Id da última mensagem conhecida do canal (a do snapshot ou a mais nova já carregada).
+    fn latest_id(&self, ch: i64) -> i64 {
+        let snap = self
+            .snap
+            .servers
+            .iter()
+            .flat_map(|s| s.channels.iter())
+            .find(|c| c.id == ch)
+            .map(|c| c.last_message_id)
+            .or_else(|| self.snap.dms.iter().find(|d| d.channel_id == ch).map(|d| d.last_message_id))
+            .unwrap_or(0);
+        let loaded = self.msgs.get(&ch).and_then(|v| v.last()).map(|m| m.id).unwrap_or(0);
+        snap.max(loaded)
+    }
+
+    /// Avisa o servidor que o canal foi lido até a última mensagem conhecida.
+    fn ack(&mut self, ch: i64) {
+        let id = self.latest_id(ch);
+        if id > 0 {
+            self.gw.send(C2S::Ack { channel_id: ch, message_id: id });
+        }
     }
 
     fn open_server(&mut self, id: i64) {
@@ -200,18 +243,50 @@ impl Session {
                 Event::Msg(m) => match m {
                     S2C::Snapshot(sn) => {
                         self.me = sn.me.clone();
+                        // não lido = há mensagem mais nova que a última lida (fora o canal aberto)
+                        let cur = self.current_channel();
+                        self.unread = sn
+                            .servers
+                            .iter()
+                            .flat_map(|s| s.channels.iter())
+                            .filter(|c| c.kind == 0)
+                            .map(|c| (c.id, c.last_message_id, c.last_read_id))
+                            .chain(sn.dms.iter().map(|d| (d.channel_id, d.last_message_id, d.last_read_id)))
+                            .filter(|(id, last, read)| last > read && Some(*id) != cur)
+                            .map(|(id, _, _)| id)
+                            .collect();
                         self.snap = sn;
                         self.fix_view();
                     }
                     S2C::Message(m) => {
                         let ch = m.channel_id;
                         let mine = m.author_id == self.me.id;
+                        let (id, author) = (m.id, m.author_id);
                         if self.requested.contains(&ch) {
                             self.msgs.entry(ch).or_default().push(m);
                         }
-                        if !mine && self.current_channel() != Some(ch) {
-                            self.unread.insert(ch);
+                        self.typing.remove(&(ch, author));
+                        if !mine {
+                            if self.current_channel() == Some(ch) {
+                                self.gw.send(C2S::Ack { channel_id: ch, message_id: id });
+                            } else {
+                                self.unread.insert(ch);
+                            }
                         }
+                    }
+                    S2C::MessageEdited { channel_id, message_id, content } => {
+                        if let Some(m) = self.msgs.get_mut(&channel_id).and_then(|v| v.iter_mut().find(|m| m.id == message_id)) {
+                            m.content = content;
+                            m.edited = true;
+                        }
+                    }
+                    S2C::MessageDeleted { channel_id, message_id } => {
+                        if let Some(v) = self.msgs.get_mut(&channel_id) {
+                            v.retain(|m| m.id != message_id);
+                        }
+                    }
+                    S2C::Typing { channel_id, user_id } => {
+                        self.typing.insert((channel_id, user_id), Instant::now());
                     }
                     S2C::History { channel_id, messages } => {
                         self.msgs.insert(channel_id, messages);
@@ -472,6 +547,22 @@ impl App {
 // ------------------------------------------------------------------ sessão
 
 /// Sigla do servidor: primeira letra de cada palavra, sem forçar maiúscula (regra do Discord).
+/// Consome um Enter sem Shift (Shift+Enter continua quebrando linha).
+fn take_plain_enter(ctx: &egui::Context) -> bool {
+    ctx.input_mut(|i| {
+        let pos = i.events.iter().position(|e| {
+            matches!(e, egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } if !modifiers.shift && !modifiers.alt)
+        });
+        match pos {
+            Some(p) => {
+                i.events.remove(p);
+                true
+            }
+            None => false,
+        }
+    })
+}
+
 fn initials(name: &str) -> String {
     let s: String = name
         .replace("'s ", " ")
@@ -523,6 +614,24 @@ impl App {
                 Act::OpenServer(id) => s.open_server(id),
                 Act::Send(m) => s.gw.send(m),
                 Act::Modal(m) => s.modal = m,
+                Act::Reply(ch, r) => {
+                    s.replying = Some((ch, r));
+                    s.focus_composer = true;
+                }
+                Act::CancelReply => s.replying = None,
+                Act::StartEdit(id, text) => s.editing = Some((id, text)),
+                Act::CancelEdit => s.editing = None,
+                Act::SaveEdit(id, text) => {
+                    s.editing = None;
+                    if !text.trim().is_empty() {
+                        s.gw.send(C2S::Edit { message_id: id, content: text });
+                    }
+                }
+                Act::AskDelete(id, preview) => s.modal = Modal::DeleteMsg { id, preview },
+                Act::Copy(text) => {
+                    ctx.copy_text(text);
+                    s.toast = Some(("Texto copiado".into(), Instant::now()));
+                }
                 Act::ToggleCategory(id) => {
                     if !s.collapsed.remove(&id) {
                         s.collapsed.insert(id);
@@ -951,7 +1060,10 @@ impl App {
         }
 
         // mensagens
-        let input_h = 82.0;
+        let me_id = s.me.id;
+        let is_owner = s.snap.servers.iter().any(|sv| sv.owner == me_id && sv.channels.iter().any(|c| c.id == ch));
+        let replying_here = matches!(&s.replying, Some((c, _)) if *c == ch);
+        let input_h = 82.0 + 22.0 + if replying_here { 38.0 } else { 0.0 };
         let h = (ui.available_height() - input_h).max(60.0);
         egui::ScrollArea::vertical()
             .id_salt(("chat", ch))
@@ -972,9 +1084,11 @@ impl App {
                     }
                     let grouped = !new_day
                         && msgs[i - 1].author_id == m.author_id
-                        && m.ts - msgs[i - 1].ts < 5 * 60 * 1000;
+                        && m.ts - msgs[i - 1].ts < 5 * 60 * 1000
+                        && m.reply.is_none();
                     let born = *s.seen.entry(m.id).or_insert_with(Instant::now);
                     let age = born.elapsed().as_secs_f32() / 0.22;
+                    let editing_this = matches!(&s.editing, Some((id, _)) if *id == m.id);
                     let bg = ui.painter().add(egui::Shape::Noop);
                     let row = ui.horizontal_top(|ui| {
                         if age < 1.0 {
@@ -989,21 +1103,89 @@ impl App {
                         }
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
+                            if let Some(r) = &m.reply {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.label(RichText::new("↳").size(13.0).color(MUTED));
+                                    ui.label(RichText::new(&r.author).size(13.0).strong().color(TEXT2));
+                                    let snip: String = r.content.chars().take(90).map(|c| if c == '\n' { ' ' } else { c }).collect();
+                                    ui.label(RichText::new(snip).size(13.0).color(MUTED));
+                                });
+                            }
                             if !grouped {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(&m.author).size(15.5).strong().color(TEXT));
                                     ui.label(RichText::new(fmt_clock(m.ts)).size(12.0).color(MUTED));
                                 });
                             }
-                            ui.add(egui::Label::new(RichText::new(&m.content).size(15.5).color(TEXT2)).wrap());
+                            if editing_this {
+                                if let Some((_, buf)) = &mut s.editing {
+                                    let id = egui::Id::new(("edit", m.id));
+                                    let save = ui.memory(|mem| mem.has_focus(id)) && take_plain_enter(ui.ctx());
+                                    let r = ui.add(
+                                        egui::TextEdit::multiline(buf)
+                                            .id(id)
+                                            .desired_width(ui.available_width().min(640.0))
+                                            .desired_rows(1),
+                                    );
+                                    let first: bool = ui.data_mut(|d| d.get_temp::<bool>(id.with("init")).is_none());
+                                    if first {
+                                        ui.data_mut(|d| d.insert_temp(id.with("init"), true));
+                                        r.request_focus();
+                                    }
+                                    ui.label(RichText::new("Esc cancela · Enter salva").size(12.0).color(MUTED));
+                                    if save {
+                                        ui.data_mut(|d| d.remove_temp::<bool>(id.with("init")));
+                                        acts.push(Act::SaveEdit(m.id, buf.clone()));
+                                    } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                        ui.data_mut(|d| d.remove_temp::<bool>(id.with("init")));
+                                        acts.push(Act::CancelEdit);
+                                    }
+                                }
+                            } else if m.edited {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.label(RichText::new(&m.content).size(15.5).color(TEXT2));
+                                    ui.label(RichText::new(" (editado)").size(11.5).color(MUTED));
+                                });
+                            } else {
+                                ui.add(egui::Label::new(RichText::new(&m.content).size(15.5).color(TEXT2)).wrap());
+                            }
                         });
                     });
                     let rc = row.response.rect;
-                    if ui.rect_contains_pointer(rc.expand2(egui::vec2(28.0, 3.0))) {
-                        let full = egui::Rect::from_min_max(
-                            egui::pos2(ui.max_rect().left() - 28.0, rc.top() - 3.0),
-                            egui::pos2(ui.max_rect().right() + 28.0, rc.bottom() + 3.0),
-                        );
+                    let full = egui::Rect::from_min_max(
+                        egui::pos2(ui.max_rect().left() - 28.0, rc.top()),
+                        egui::pos2(ui.max_rect().right() + 28.0, rc.bottom() + 0.5),
+                    );
+                    let mine = m.author_id == me_id;
+                    let can_delete = mine || is_owner;
+                    let reply_ref = p::Reply { id: m.id, author: m.author.clone(), content: m.content.chars().take(120).collect() };
+                    // a linha inteira é um alvo de clique: botão direito abre o menu da mensagem
+                    let hit = ui.interact(full, egui::Id::new(("msg", m.id)), egui::Sense::click());
+                    egui::Popup::context_menu(&hit).width(190.0).show(|ui| {
+                        ui.set_min_width(180.0);
+                        if ui.button("Responder").clicked() {
+                            acts.push(Act::Reply(ch, reply_ref.clone()));
+                            ui.close();
+                        }
+                        if mine && ui.button("Editar mensagem").clicked() {
+                            acts.push(Act::StartEdit(m.id, m.content.clone()));
+                            ui.close();
+                        }
+                        if ui.button("Copiar texto").clicked() {
+                            acts.push(Act::Copy(m.content.clone()));
+                            ui.close();
+                        }
+                        if can_delete {
+                            ui.separator();
+                            if ui.button(RichText::new("Apagar mensagem").color(RED)).clicked() {
+                                acts.push(Act::AskDelete(m.id, m.content.clone()));
+                                ui.close();
+                            }
+                        }
+                    });
+                    if !editing_this && ui.rect_contains_pointer(full) {
                         ui.painter().set(bg, egui::Shape::rect_filled(full, 0.0, Color32::from_white_alpha(6)));
                         if grouped {
                             ui.painter().text(
@@ -1014,13 +1196,106 @@ impl App {
                                 MUTED,
                             );
                         }
+                        // barra de ações, desenhada sem ocupar espaço no layout
+                        let mut items: Vec<(&str, u8)> = vec![("Responder", 0)];
+                        if mine {
+                            items.push(("Editar", 1));
+                        }
+                        if can_delete {
+                            items.push(("Apagar", 2));
+                        }
+                        items.push(("Copiar", 3));
+                        let widths: Vec<f32> = items
+                            .iter()
+                            .map(|(t, _)| ui.painter().layout_no_wrap(t.to_string(), egui::FontId::proportional(13.0), TEXT).size().x + 22.0)
+                            .collect();
+                        let total: f32 = widths.iter().sum();
+                        let bar = egui::Rect::from_min_size(
+                            egui::pos2(full.right() - 28.0 - total, full.top() - 1.0),
+                            egui::vec2(total, 26.0),
+                        );
+                        ui.painter().rect_filled(bar, 8.0, L3);
+                        ui.painter().rect_stroke(bar, 8.0, egui::Stroke::new(1.0, LINE2), egui::StrokeKind::Inside);
+                        let mut x = bar.left();
+                        for ((label, kind), w) in items.iter().zip(&widths) {
+                            let r = egui::Rect::from_min_size(egui::pos2(x, bar.top()), egui::vec2(*w, 26.0));
+                            x += w;
+                            let b = ui.interact(r, egui::Id::new(("msg-act", m.id, *kind)), egui::Sense::click());
+                            if b.hovered() {
+                                ui.painter().rect_filled(r.shrink(1.0), 7.0, L4);
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            let ink = match (*kind, b.hovered()) {
+                                (2, true) => RED,
+                                (_, true) => TEXT,
+                                _ => TEXT2,
+                            };
+                            ui.painter().text(r.center(), Align2::CENTER_CENTER, *label, egui::FontId::proportional(13.0), ink);
+                            if b.clicked() {
+                                acts.push(match kind {
+                                    0 => Act::Reply(ch, reply_ref.clone()),
+                                    1 => Act::StartEdit(m.id, m.content.clone()),
+                                    2 => Act::AskDelete(m.id, m.content.clone()),
+                                    _ => Act::Copy(m.content.clone()),
+                                });
+                            }
+                        }
                     }
                     ui.add_space(if grouped { 1.0 } else { 8.0 });
                 }
             });
 
+        // "fulano está digitando…" (a linha reserva a altura mesmo vazia)
+        let now = Instant::now();
+        let typers: Vec<String> = {
+            let mut ids: Vec<i64> = s
+                .typing
+                .iter()
+                .filter(|((c, u), t)| *c == ch && *u != me_id && now.duration_since(**t) < Duration::from_secs(8))
+                .map(|((_, u), _)| *u)
+                .collect();
+            ids.sort();
+            ids.into_iter().map(|u| s.name_of(u)).collect()
+        };
+        if !typers.is_empty() {
+            ui.ctx().request_repaint_after(Duration::from_millis(800));
+        }
+        ui.allocate_ui(egui::vec2(ui.available_width(), 22.0), |ui| {
+            ui.add_space(4.0);
+            let text = match typers.len() {
+                0 => String::new(),
+                1 => format!("{} está digitando…", typers[0]),
+                2 => format!("{} e {} estão digitando…", typers[0], typers[1]),
+                3 => format!("{}, {} e {} estão digitando…", typers[0], typers[1], typers[2]),
+                _ => "Várias pessoas estão digitando…".into(),
+            };
+            ui.label(RichText::new(text).size(12.5).color(TEXT2));
+        });
+
+        // "respondendo a…"
+        if let Some((rch, r)) = s.replying.clone() {
+            if rch == ch {
+                egui::Frame::new()
+                    .fill(L2)
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(14, 6))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Respondendo a").size(13.0).color(MUTED));
+                            ui.label(RichText::new(&r.author).size(13.0).strong().color(TEXT));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if small_button(ui, "Cancelar", FIELD) {
+                                    acts.push(Act::CancelReply);
+                                }
+                            });
+                        });
+                    });
+                ui.add_space(4.0);
+            }
+        }
+
         // entrada
-        ui.add_space(10.0);
         let input_id = egui::Id::new(("compose", ch));
         let focused = ctx.memory(|mem| mem.has_focus(input_id));
         egui::Frame::new()
@@ -1040,10 +1315,25 @@ impl App {
                             .vertical_align(Align::Center)
                             .margin(egui::Margin::symmetric(0, 6)),
                     );
+                    if s.focus_composer {
+                        s.focus_composer = false;
+                        r.request_focus();
+                    }
+                    if r.changed() && !s.input.trim().is_empty() && s.last_typing.elapsed() > Duration::from_secs(4) {
+                        s.last_typing = Instant::now();
+                        acts.push(Act::Send(C2S::Typing { channel_id: ch }));
+                    }
+                    if r.has_focus() && replying_here && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        acts.push(Act::CancelReply);
+                    }
                     let enter = r.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
                     let clicked = small_button(ui, "Enviar", BLURPLE);
                     if (enter || clicked) && !s.input.trim().is_empty() {
-                        acts.push(Act::Send(C2S::Send { channel_id: ch, content: std::mem::take(&mut s.input) }));
+                        let reply_to = s.replying.as_ref().filter(|(c, _)| *c == ch).map(|(_, r)| r.id);
+                        acts.push(Act::Send(C2S::Send { channel_id: ch, content: std::mem::take(&mut s.input), reply_to }));
+                        if reply_to.is_some() {
+                            acts.push(Act::CancelReply);
+                        }
                         r.request_focus();
                     }
                 });
@@ -1306,6 +1596,34 @@ impl App {
                                 kind: *kind,
                                 parent_id: if *kind == 0 { *parent } else { None },
                             }));
+                            close = true;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            close = true;
+                        }
+                    });
+            }
+            Modal::DeleteMsg { id, preview } => {
+                egui::Window::new("Apagar mensagem")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.set_width(340.0);
+                        ui.label("Tem certeza de que quer apagar esta mensagem?");
+                        ui.add_space(6.0);
+                        egui::Frame::new()
+                            .fill(L2)
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                let shown: String = preview.chars().take(200).collect();
+                                ui.label(RichText::new(shown).color(TEXT2));
+                            });
+                        ui.add_space(8.0);
+                        if big_button(ui, "Apagar", RED) {
+                            acts.push(Act::Send(C2S::Delete { message_id: *id }));
                             close = true;
                         }
                         if ui.button("Cancelar").clicked() {

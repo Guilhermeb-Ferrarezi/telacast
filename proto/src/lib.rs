@@ -17,6 +17,9 @@ pub struct Channel {
     /// Categoria a que o canal pertence; `None` fica solto no topo.
     pub parent: Option<i64>,
     pub position: i32,
+    /// Id da última mensagem do canal (0 se vazio) e da última que `me` leu (0 se nunca leu).
+    pub last_message_id: i64,
+    pub last_read_id: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -48,6 +51,8 @@ pub struct Friend {
 pub struct Dm {
     pub channel_id: i64,
     pub user: User,
+    pub last_message_id: i64,
+    pub last_read_id: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -66,6 +71,14 @@ pub struct Snapshot {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Reply {
+    pub id: i64,
+    pub author: String,
+    /// Começo do texto respondido (até 120 caracteres).
+    pub content: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Message {
     pub id: i64,
     pub channel_id: i64,
@@ -74,6 +87,8 @@ pub struct Message {
     pub content: String,
     /// Milissegundos desde a época Unix (UTC).
     pub ts: i64,
+    pub edited: bool,
+    pub reply: Option<Reply>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -88,7 +103,15 @@ pub enum C2S {
     JoinServer { code: String },
     /// `kind`: 0 texto ou 4 categoria. `parent_id`: categoria do novo canal (ignorado em categorias).
     CreateChannel { server_id: i64, name: String, kind: u8, parent_id: Option<i64> },
-    Send { channel_id: i64, content: String },
+    Send { channel_id: i64, content: String, reply_to: Option<i64> },
+    /// Só o autor edita.
+    Edit { message_id: i64, content: String },
+    /// O autor ou o dono do servidor apaga.
+    Delete { message_id: i64 },
+    /// Marca o canal como lido até `message_id`.
+    Ack { channel_id: i64, message_id: i64 },
+    /// "Está digitando…" (reenviar a cada poucos segundos).
+    Typing { channel_id: i64 },
     History { channel_id: i64, before: Option<i64> },
     FriendRequest { username: String },
     FriendAccept { user_id: i64 },
@@ -105,6 +128,9 @@ pub enum S2C {
     Message(Message),
     /// Mensagens em ordem cronológica.
     History { channel_id: i64, messages: Vec<Message> },
+    MessageEdited { channel_id: i64, message_id: i64, content: String },
+    MessageDeleted { channel_id: i64, message_id: i64 },
+    Typing { channel_id: i64, user_id: i64 },
     DmOpened { channel_id: i64 },
     ServerJoined { server_id: i64 },
 }

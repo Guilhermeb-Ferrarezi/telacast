@@ -220,10 +220,10 @@ fn fluxo_completo() {
     assert_eq!(voz.parent, Some(cat_id));
 
     // categoria não recebe mensagem
-    ana.send(C2S::Send { channel_id: cat_id, content: "isso não vai".into() });
+    ana.send(C2S::Send { channel_id: cat_id, content: "isso não vai".into(), reply_to: None });
 
     // --- mensagens em tempo real e histórico
-    ana.send(C2S::Send { channel_id: geral, content: "oi beto!".into() });
+    ana.send(C2S::Send { channel_id: geral, content: "oi beto!".into(), reply_to: None });
     let msg = beto.wait("a mensagem", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
     assert_eq!(msg.content, "oi beto!");
     assert_eq!(msg.author, "ana");
@@ -235,7 +235,7 @@ fn fluxo_completo() {
 
     // quem não é do servidor não lê nem escreve
     carla.send(C2S::History { channel_id: geral, before: None });
-    carla.send(C2S::Send { channel_id: geral, content: "invasão".into() });
+    carla.send(C2S::Send { channel_id: geral, content: "invasão".into(), reply_to: None });
     std::thread::sleep(Duration::from_millis(400));
     ana.send(C2S::History { channel_id: geral, before: None });
     let hist = ana.wait("o histórico da ana", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
@@ -251,7 +251,7 @@ fn fluxo_completo() {
     carla.send(C2S::FriendAccept { user_id: ana_id });
     carla.send(C2S::OpenDm { user_id: ana_id });
     let dm = carla.wait("DmOpened", |m| if let S2C::DmOpened { channel_id } = m { Some(*channel_id) } else { None });
-    carla.send(C2S::Send { channel_id: dm, content: "privado".into() });
+    carla.send(C2S::Send { channel_id: dm, content: "privado".into(), reply_to: None });
     let m = ana.wait("DM na ana", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
     assert_eq!(m.content, "privado");
     let _ = beto_id;
@@ -277,4 +277,86 @@ fn limite_de_tentativas_de_login() {
         last = c.error();
     }
     assert!(last.contains("Muitas tentativas"), "depois de várias tentativas deveria bloquear: {last}");
+}
+
+#[test]
+fn responder_editar_apagar_e_ler() {
+    let env = Env::start();
+    let code = env.invite(2);
+    let mut ana = env.client();
+    let (_, ana_id) = ana.register("ana", &code);
+    let mut beto = env.client();
+    let (_, _) = beto.register("beto", &code);
+
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    let geral = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
+    beto.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
+    beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+
+    // --- resposta
+    ana.send(C2S::Send { channel_id: geral, content: "primeira".into(), reply_to: None });
+    let m1 = beto.wait("a primeira", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
+    assert!(m1.reply.is_none() && !m1.edited);
+    beto.send(C2S::Send { channel_id: geral, content: "resposta".into(), reply_to: Some(m1.id) });
+    let m2 = ana.wait("a resposta", |m| match m {
+        S2C::Message(m) if m.content == "resposta" => Some(m.clone()),
+        _ => None,
+    });
+    let r = m2.reply.expect("a resposta carrega a mensagem respondida");
+    assert_eq!((r.id, r.author.as_str(), r.content.as_str()), (m1.id, "ana", "primeira"));
+    beto.send(C2S::Send { channel_id: geral, content: "órfã".into(), reply_to: Some(1) });
+    assert!(beto.error().contains("respondida"));
+
+    // --- edição: só o autor
+    beto.send(C2S::Edit { message_id: m1.id, content: "x".into() });
+    assert!(beto.error().contains("autor"));
+    ana.send(C2S::Edit { message_id: m1.id, content: "primeira, corrigida".into() });
+    let novo = beto.wait("a edição", |m| match m {
+        S2C::MessageEdited { message_id, content, .. } if *message_id == m1.id => Some(content.clone()),
+        _ => None,
+    });
+    assert_eq!(novo, "primeira, corrigida");
+    beto.send(C2S::History { channel_id: geral, before: None });
+    let hist = beto.wait("o histórico", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
+    assert!(hist.iter().find(|m| m.id == m1.id).unwrap().edited, "o histórico marca a mensagem como editada");
+    assert_eq!(hist.iter().find(|m| m.id == m2.id).unwrap().reply.as_ref().unwrap().id, m1.id);
+
+    // --- apagar: o autor ou o dono do servidor
+    ana.send(C2S::Send { channel_id: geral, content: "da ana".into(), reply_to: None });
+    let da_ana = beto.wait("a mensagem da ana", |m| match m {
+        S2C::Message(m) if m.content == "da ana" => Some(m.clone()),
+        _ => None,
+    });
+    beto.send(C2S::Delete { message_id: da_ana.id });
+    assert!(beto.error().contains("não pode"), "quem não é autor nem dono não apaga");
+    ana.send(C2S::Delete { message_id: m2.id }); // a ana é dona do servidor e apaga a do beto
+    let apagada = beto.wait("a exclusão", |m| match m {
+        S2C::MessageDeleted { message_id, .. } => Some(*message_id),
+        _ => None,
+    });
+    assert_eq!(apagada, m2.id);
+
+    // --- "digitando"
+    ana.send(C2S::Typing { channel_id: geral });
+    let quem = beto.wait("o aviso de digitação", |m| if let S2C::Typing { user_id, .. } = m { Some(*user_id) } else { None });
+    assert_eq!(quem, ana_id);
+
+    // --- não lidos: o beto só leu quando mandar Ack
+    let unread = |env: &Env| -> (i64, i64) {
+        let mut c = env.client();
+        c.send(C2S::Login { username: "beto".into(), password: "segredo-forte-1".into() });
+        let s = c.wait("snapshot do login", |m| if let S2C::Snapshot(s) = m { Some(s.clone()) } else { None });
+        let ch = s.servers[0].channels.iter().find(|c| c.id == geral).unwrap();
+        (ch.last_message_id, ch.last_read_id)
+    };
+    let (ultima, lida) = unread(&env);
+    assert!(ultima > lida, "o beto ainda não leu o canal");
+    beto.send(C2S::Ack { channel_id: geral, message_id: ultima });
+    std::thread::sleep(Duration::from_millis(300));
+    let (ultima2, lida2) = unread(&env);
+    assert_eq!(lida2, ultima2, "depois do Ack o canal está lido");
 }

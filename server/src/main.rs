@@ -119,7 +119,7 @@ impl App {
 
         let raw = self.store.servers_of(me).await?;
         let ids: Vec<i64> = raw.iter().map(|s| s.0).collect();
-        let chans = self.store.channels_in(&ids).await?;
+        let chans = self.store.channels_in(&ids, me).await?;
         let mems = self.store.members_in(&ids).await?;
         let servers = raw
             .into_iter()
@@ -131,7 +131,15 @@ impl App {
                 channels: chans
                     .iter()
                     .filter(|c| c.0 == id)
-                    .map(|c| p::Channel { id: c.1, name: c.2.clone(), kind: c.3 as u8, parent: c.4, position: c.5 })
+                    .map(|c| p::Channel {
+                        id: c.1,
+                        name: c.2.clone(),
+                        kind: c.3 as u8,
+                        parent: c.4,
+                        position: c.5,
+                        last_message_id: c.6,
+                        last_read_id: c.7,
+                    })
                     .collect(),
                 members: mems.iter().filter(|m| m.0 == id).map(|m| user(m.1, m.2.clone())).collect(),
             })
@@ -156,7 +164,12 @@ impl App {
             .dms_of(me)
             .await?
             .into_iter()
-            .map(|(channel_id, id, name)| p::Dm { channel_id, user: user(id, name) })
+            .map(|(channel_id, id, name, last_message_id, last_read_id)| p::Dm {
+                channel_id,
+                user: user(id, name),
+                last_message_id,
+                last_read_id,
+            })
             .collect();
 
         let live_ch: Vec<i64> = live_rooms.iter().map(|r| r.0).collect();
@@ -610,7 +623,7 @@ async fn handle_authed(
                 }
             }
         }
-        C2S::Send { channel_id, content } => {
+        C2S::Send { channel_id, content, reply_to } => {
             let content = content.trim();
             if content.is_empty() || content.chars().count() > 4000 {
                 return true;
@@ -627,15 +640,71 @@ async fn handle_authed(
                     return true;
                 }
             }
-            match app.store.insert_message(app.sf.next(), channel_id, me, content).await {
-                Ok(msg) => {
+            match app.store.insert_message(app.sf.next(), channel_id, me, content, reply_to).await {
+                Ok(Some(msg)) => {
+                    let id = msg.id;
                     let to = app.store.participants(channel_id).await.unwrap_or_default();
                     let out = S2C::Message(msg);
                     for u in to {
                         app.send_to(u, &out);
                     }
+                    // quem escreve já leu a própria mensagem
+                    let _ = app.store.ack(me, channel_id, id).await;
                 }
+                Ok(None) => err("A mensagem respondida não existe mais"),
                 Err(e) => db_err("insert_message", e),
+            }
+        }
+        C2S::Edit { message_id, content } => {
+            let content = content.trim();
+            if content.is_empty() || content.chars().count() > 4000 {
+                err("A mensagem precisa ter de 1 a 4000 caracteres");
+            } else if busy("edit", 20, 30) {
+                err(ERR_BUSY);
+            } else {
+                match app.store.edit_message(message_id, me, content).await {
+                    Ok(Some(channel_id)) => {
+                        let out = S2C::MessageEdited { channel_id, message_id, content: content.to_string() };
+                        for u in app.store.participants(channel_id).await.unwrap_or_default() {
+                            app.send_to(u, &out);
+                        }
+                    }
+                    Ok(None) => err("Só o autor edita a mensagem"),
+                    Err(e) => db_err("edit_message", e),
+                }
+            }
+        }
+        C2S::Delete { message_id } => {
+            if busy("delete", 30, 30) {
+                err(ERR_BUSY);
+            } else {
+                match app.store.delete_message(message_id, me).await {
+                    Ok(Some(channel_id)) => {
+                        let out = S2C::MessageDeleted { channel_id, message_id };
+                        for u in app.store.participants(channel_id).await.unwrap_or_default() {
+                            app.send_to(u, &out);
+                        }
+                    }
+                    Ok(None) => err("Você não pode apagar esta mensagem"),
+                    Err(e) => db_err("delete_message", e),
+                }
+            }
+        }
+        C2S::Ack { channel_id, message_id } => {
+            if !busy("ack", 120, 10) && app.store.can_access(channel_id, me).await.unwrap_or(false) {
+                if let Err(e) = app.store.ack(me, channel_id, message_id).await {
+                    db_err("ack", e);
+                }
+            }
+        }
+        C2S::Typing { channel_id } => {
+            if !busy("typing", 20, 10) && app.store.can_access(channel_id, me).await.unwrap_or(false) {
+                let out = S2C::Typing { channel_id, user_id: me };
+                for u in app.store.participants(channel_id).await.unwrap_or_default() {
+                    if u != me {
+                        app.send_to(u, &out);
+                    }
+                }
             }
         }
         C2S::History { channel_id, before } => match app.store.can_access(channel_id, me).await {

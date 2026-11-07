@@ -2,7 +2,7 @@
 use crate::ids::ts_ms;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
-use telacast_proto::Message;
+use telacast_proto::{Message, Reply};
 
 pub type R<T> = Result<T, sqlx::Error>;
 
@@ -286,25 +286,106 @@ impl Store {
 
     // ------------------------------------------------------------- mensagens
 
-    pub async fn insert_message(&self, id: i64, channel: i64, author: i64, content: &str) -> R<Message> {
+    /// `Ok(None)` se `reply_to` não é uma mensagem deste canal.
+    pub async fn insert_message(
+        &self,
+        id: i64,
+        channel: i64,
+        author: i64,
+        content: &str,
+        reply_to: Option<i64>,
+    ) -> R<Option<Message>> {
+        let reply = match reply_to {
+            None => None,
+            Some(r) => {
+                let row: Option<(i64, String, String)> = sqlx::query_as(
+                    "SELECT m.id, u.display_name, left(m.content, 120) FROM messages m
+                     JOIN users u ON u.id = m.author_id WHERE m.id = $1 AND m.channel_id = $2",
+                )
+                .bind(r)
+                .bind(channel)
+                .fetch_optional(&self.pool)
+                .await?;
+                match row {
+                    Some((id, author, content)) => Some(Reply { id, author, content }),
+                    None => return Ok(None),
+                }
+            }
+        };
         let (name,): (String,) = sqlx::query_as(
-            "WITH ins AS (INSERT INTO messages(id, channel_id, author_id, content) VALUES ($1, $2, $3, $4) RETURNING author_id)
+            "WITH ins AS (INSERT INTO messages(id, channel_id, author_id, content, reply_to)
+                          VALUES ($1, $2, $3, $4, $5) RETURNING author_id)
              SELECT u.display_name FROM users u JOIN ins ON ins.author_id = u.id",
         )
         .bind(id)
         .bind(channel)
         .bind(author)
         .bind(content)
+        .bind(reply_to)
         .fetch_one(&self.pool)
         .await?;
-        Ok(Message { id, channel_id: channel, author_id: author, author: name, content: content.to_string(), ts: ts_ms(id) })
+        Ok(Some(Message {
+            id,
+            channel_id: channel,
+            author_id: author,
+            author: name,
+            content: content.to_string(),
+            ts: ts_ms(id),
+            edited: false,
+            reply,
+        }))
+    }
+
+    /// Devolve o canal da mensagem editada, ou `None` se não existe ou não é do autor.
+    pub async fn edit_message(&self, id: i64, author: i64, content: &str) -> R<Option<i64>> {
+        let r: Option<(i64,)> = sqlx::query_as(
+            "UPDATE messages SET content = $3, edited_at = now() WHERE id = $1 AND author_id = $2 RETURNING channel_id",
+        )
+        .bind(id)
+        .bind(author)
+        .bind(content)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(r.map(|x| x.0))
+    }
+
+    /// Apaga se `user` é o autor ou o dono do servidor. Devolve o canal.
+    pub async fn delete_message(&self, id: i64, user: i64) -> R<Option<i64>> {
+        let r: Option<(i64,)> = sqlx::query_as(
+            "DELETE FROM messages m WHERE m.id = $1 AND (m.author_id = $2 OR EXISTS (
+                 SELECT 1 FROM channels c JOIN servers s ON s.id = c.server_id
+                 WHERE c.id = m.channel_id AND s.owner_id = $2)) RETURNING m.channel_id",
+        )
+        .bind(id)
+        .bind(user)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(r.map(|x| x.0))
+    }
+
+    pub async fn ack(&self, user: i64, channel: i64, message: i64) -> R<()> {
+        sqlx::query(
+            "INSERT INTO read_state(user_id, channel_id, last_read_id) VALUES ($1, $2, $3)
+             ON CONFLICT (user_id, channel_id) DO UPDATE
+             SET last_read_id = GREATEST(read_state.last_read_id, EXCLUDED.last_read_id)",
+        )
+        .bind(user)
+        .bind(channel)
+        .bind(message)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Até 50 mensagens anteriores a `before`, em ordem cronológica.
     pub async fn history(&self, channel: i64, before: Option<i64>) -> R<Vec<Message>> {
-        let rows: Vec<(i64, i64, String, String)> = sqlx::query_as(
-            "SELECT m.id, m.author_id, u.display_name, m.content
+        type Row = (i64, i64, String, String, bool, Option<i64>, Option<String>, Option<String>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT m.id, m.author_id, u.display_name, m.content, m.edited_at IS NOT NULL,
+                    r.id, ru.display_name, left(r.content, 120)
              FROM messages m JOIN users u ON u.id = m.author_id
+             LEFT JOIN messages r ON r.id = m.reply_to
+             LEFT JOIN users ru ON ru.id = r.author_id
              WHERE m.channel_id = $1 AND m.id < $2
              ORDER BY m.id DESC LIMIT 50",
         )
@@ -314,13 +395,18 @@ impl Store {
         .await?;
         let mut v: Vec<Message> = rows
             .into_iter()
-            .map(|(id, author_id, author, content)| Message {
+            .map(|(id, author_id, author, content, edited, rid, rauthor, rcontent)| Message {
                 id,
                 channel_id: channel,
                 author_id,
                 author,
                 content,
                 ts: ts_ms(id),
+                edited,
+                reply: match (rid, rauthor, rcontent) {
+                    (Some(id), Some(author), Some(content)) => Some(Reply { id, author, content }),
+                    _ => None,
+                },
             })
             .collect();
         v.reverse();
@@ -431,9 +517,12 @@ impl Store {
     }
 
     /// (canal, outro usuário, nome)
-    pub async fn dms_of(&self, me: i64) -> R<Vec<(i64, i64, String)>> {
+    pub async fn dms_of(&self, me: i64) -> R<Vec<(i64, i64, String, i64, i64)>> {
         sqlx::query_as(
-            "SELECT c1.channel_id, u.id, u.display_name FROM channel_members c1
+            "SELECT c1.channel_id, u.id, u.display_name,
+                    COALESCE((SELECT max(m.id) FROM messages m WHERE m.channel_id = c1.channel_id), 0),
+                    COALESCE((SELECT rs.last_read_id FROM read_state rs WHERE rs.user_id = $1 AND rs.channel_id = c1.channel_id), 0)
+             FROM channel_members c1
              JOIN channels ch ON ch.id = c1.channel_id AND ch.kind = 10
              JOIN channel_members c2 ON c2.channel_id = c1.channel_id AND c2.user_id <> $1
              JOIN users u ON u.id = c2.user_id
@@ -479,12 +568,16 @@ impl Store {
     }
 
     /// (servidor, canal, nome, tipo, categoria, posição) dos canais de texto e categorias.
-    pub async fn channels_in(&self, servers: &[i64]) -> R<Vec<(i64, i64, String, i16, Option<i64>, i32)>> {
+    pub async fn channels_in(&self, servers: &[i64], me: i64) -> R<Vec<(i64, i64, String, i16, Option<i64>, i32, i64, i64)>> {
         sqlx::query_as(
-            "SELECT server_id, id, name, kind, parent_id, position FROM channels
-             WHERE server_id = ANY($1) AND kind IN (0, 4) ORDER BY server_id, position, id",
+            "SELECT c.server_id, c.id, c.name, c.kind, c.parent_id, c.position,
+                    COALESCE((SELECT max(m.id) FROM messages m WHERE m.channel_id = c.id), 0),
+                    COALESCE((SELECT rs.last_read_id FROM read_state rs WHERE rs.user_id = $2 AND rs.channel_id = c.id), 0)
+             FROM channels c
+             WHERE c.server_id = ANY($1) AND c.kind IN (0, 4) ORDER BY c.server_id, c.position, c.id",
         )
         .bind(servers)
+        .bind(me)
         .fetch_all(&self.pool)
         .await
     }

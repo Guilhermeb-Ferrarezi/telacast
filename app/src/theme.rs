@@ -127,6 +127,7 @@ pub fn apply_theme(ctx: &egui::Context) {
         s.spacing.item_spacing = vec2(8.0, 6.0);
         s.spacing.button_padding = vec2(12.0, 6.0);
         s.interaction.tooltip_delay = 0.1;
+        s.interaction.selectable_labels = false; // texto de interface não seleciona nem mostra cursor de texto
         s.text_styles.insert(TextStyle::Body, FontId::new(14.5, FontFamily::Proportional));
         s.text_styles.insert(TextStyle::Button, FontId::new(13.5, FontFamily::Proportional));
         s.text_styles.insert(TextStyle::Small, FontId::new(12.0, FontFamily::Proportional));
