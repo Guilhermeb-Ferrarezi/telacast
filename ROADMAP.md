@@ -150,7 +150,7 @@ Prioridade máxima do [R02]; moderação do [R07].
 
 **Interface ([R10])**
 - [ ] P0: **tela de Configurações** (Minha conta, Aparência, Notificações, Voz, Sair). **M**
-- [ ] P1: **Ctrl+K (Quick Switcher)**, popout de perfil, **temas claro e AMOLED**, zoom e tamanho de fonte, atalhos básicos. **S–M**
+- [~] P1: **Ctrl+K (Quick Switcher)** feito (crate `telacast-qs`, 6 testes: prefixos `@ # *`, nota 10/7/5/3/1 × reforço de uso, setas/Enter/Esc, menções e não lidos, canais anteriores); faltam popout de perfil, **temas claro e AMOLED**, zoom e tamanho de fonte, atalhos básicos. **S–M**
 - [ ] P2: busca com filtros na UI, modo compacto, pastas de servidores e arrastar para reordenar, onboarding e estados vazios, acessibilidade (AccessKit, alto contraste). **S–L**
 - [ ] P3: i18n, atalhos remapeáveis, "modo desenvolvedor".
 

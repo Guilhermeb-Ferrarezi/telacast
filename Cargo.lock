@@ -4340,6 +4340,7 @@ dependencies = [
  "serde_json",
  "telacast-md",
  "telacast-proto",
+ "telacast-qs",
  "tungstenite 0.30.0",
  "x11rb 0.14.0",
 ]
@@ -4355,6 +4356,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "telacast-qs"
+version = "0.1.0"
 
 [[package]]
 name = "telacast-server"

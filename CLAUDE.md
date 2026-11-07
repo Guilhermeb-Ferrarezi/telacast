@@ -12,6 +12,7 @@ Planos: `ROADMAP.md` (fases 0 a 5, decisões, ordem), `docs/MOBILE-PLAN.md` (And
 | `server/` | axum 0.8 + sqlx 0.9. `main.rs` (gateway, limites, CLI), `store.rs` (todas as consultas), `auth.rs` (argon2, tokens), `ids.rs` (snowflake). Migrações em `server/migrations/` (embutidas) |
 | `app/` | cliente egui/eframe 0.37. `main.rs` (telas), `theme.rs` (tema Grafite e widgets), `gateway.rs`, `publisher.rs` (captura + NVENC), `viewer.rs` (decodifica transmissão) |
 | `md/` | `telacast-md`: parser de Markdown do chat, sem dependências, com testes (`cargo test -p telacast-md`). O desenho fica em `app/src/md_view.rs` |
+| `qs/` | `telacast-qs`: lógica do Ctrl+K (prefixos, pontuação, ordenação), sem dependências, com testes. A janela fica em `app/src/quick.rs` |
 | `vendor/` | cópia ajustada do `nvidia-video-codec-sdk` |
 | `server/tests/e2e.rs` | sobe o servidor de verdade num banco novo e testa o fluxo completo |
 

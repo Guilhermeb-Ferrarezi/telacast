@@ -3,6 +3,7 @@ mod gpu;
 mod md_view;
 mod net;
 mod publisher;
+mod quick;
 mod theme;
 mod viewer;
 
@@ -136,6 +137,10 @@ struct Session {
     idle_sent: bool,
     /// Menções ainda não lidas por canal (do snapshot, mais as que chegam com o canal fechado).
     mentions: HashMap<i64, u32>,
+    /// Destinos visitados: (0 servidor, 1 canal, 2 usuário, id) -> vezes. Reforça a nota no Ctrl+K.
+    visits: HashMap<(u8, i64), u32>,
+    /// Canais e DMs visitados, o mais recente primeiro.
+    recent: Vec<i64>,
     /// Divisor "novas mensagens": (canal, último id lido ao abrir, já rolei até ele).
     marker: Option<(i64, i64, bool)>,
     /// Canais com uma página de mensagens antigas a caminho.
@@ -216,6 +221,8 @@ impl Session {
             revealed: HashSet::new(),
             idle_sent: false,
             mentions: HashMap::new(),
+            visits: HashMap::new(),
+            recent: Vec::new(),
             marker: None,
             older: HashSet::new(),
             has_more: HashMap::new(),
@@ -253,6 +260,22 @@ impl Session {
                 .or_else(|| self.snap.dms.iter().find(|d| d.channel_id == ch).map(|d| (d.last_message_id, d.last_read_id)))
                 .unwrap_or((0, 0));
             self.marker = (last > read).then_some((ch, read, false));
+            // histórico e frequência para o Ctrl+K
+            self.recent.retain(|c| *c != ch);
+            self.recent.insert(0, ch);
+            self.recent.truncate(20);
+            match &v {
+                View::Chan { server, channel } => {
+                    *self.visits.entry((1, *channel)).or_insert(0) += 1;
+                    *self.visits.entry((0, *server)).or_insert(0) += 1;
+                }
+                View::Dm(c) => {
+                    if let Some(d) = self.snap.dms.iter().find(|d| d.channel_id == *c) {
+                        *self.visits.entry((2, d.user.id)).or_insert(0) += 1;
+                    }
+                }
+                View::Home => {}
+            }
             self.unread.remove(&ch);
             self.mentions.remove(&ch);
             self.ack(ch);
@@ -569,6 +592,7 @@ struct App {
     texture: Option<egui::TextureHandle>,
     fullscreen: bool,
     /// Última atividade do usuário (relógio de parede: suspender o PC conta como tempo parado).
+    qs: Option<quick::Qs>,
     last_input: std::time::SystemTime,
     /// Tempo parado até virar "ausente" (10 min; `TELACAST_IDLE_SECS` encurta para testar).
     idle_after: Duration,
@@ -609,6 +633,7 @@ impl App {
             watching: None,
             texture: None,
             fullscreen: false,
+            qs: None,
             last_input: std::time::SystemTime::now(),
             idle_after: Duration::from_secs(
                 std::env::var("TELACAST_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(600),
@@ -871,6 +896,11 @@ impl App {
     fn session_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &mut Session) -> bool {
         let mut acts: Vec<Act> = Vec::new();
 
+        // Ctrl+K abre e fecha o seletor rápido (consumido antes de qualquer campo de texto)
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+            self.qs = if self.qs.is_some() { None } else { Some(quick::Qs::new()) };
+        }
+
         // ausente automático: sem nenhuma entrada por `idle_after`, avisa o servidor; ao voltar, avisa de novo
         if ctx.input(|i| !i.events.is_empty()) {
             self.last_input = std::time::SystemTime::now();
@@ -939,6 +969,20 @@ impl App {
                     self.center(ui, ctx, s, &mut acts);
                 }
             });
+        if let Some(q) = &mut self.qs {
+            match quick::show(ctx, q, s) {
+                quick::Out::Stay => {}
+                quick::Out::Close => self.qs = None,
+                quick::Out::Go(t) => {
+                    self.qs = None;
+                    acts.push(match t {
+                        quick::Target::Server(id) => Act::OpenServer(id),
+                        quick::Target::Channel { server, channel } => Act::Open(View::Chan { server, channel }),
+                        quick::Target::User(user_id) => Act::Send(C2S::OpenDm { user_id }),
+                    });
+                }
+            }
+        }
         self.modals(ctx, s, &mut acts);
         self.toast(ctx, s);
 
