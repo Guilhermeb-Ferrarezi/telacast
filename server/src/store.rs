@@ -345,13 +345,15 @@ impl Store {
             reply,
             nonce: 0,
             reactions: Vec::new(),
+            kind: 0,
+            pinned: false,
         }))
     }
 
     /// Devolve o canal da mensagem editada, ou `None` se não existe ou não é do autor.
     pub async fn edit_message(&self, id: i64, author: i64, content: &str) -> R<Option<i64>> {
         let r: Option<(i64,)> = sqlx::query_as(
-            "UPDATE messages SET content = $3, edited_at = now() WHERE id = $1 AND author_id = $2 RETURNING channel_id",
+            "UPDATE messages SET content = $3, edited_at = now() WHERE id = $1 AND author_id = $2 AND kind = 0 RETURNING channel_id",
         )
         .bind(id)
         .bind(author)
@@ -455,6 +457,112 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Mensagem de sistema (kind 2 entrada, 3 fixou). `content` precisa de pelo menos 1 caractere.
+    pub async fn insert_system(&self, id: i64, channel: i64, user: i64, kind: i16, content: &str) -> R<Message> {
+        let (name,): (String,) = sqlx::query_as(
+            "WITH ins AS (INSERT INTO messages(id, channel_id, author_id, content, kind) VALUES ($1, $2, $3, $4, $5) RETURNING author_id)
+             SELECT u.display_name FROM users u JOIN ins ON ins.author_id = u.id",
+        )
+        .bind(id)
+        .bind(channel)
+        .bind(user)
+        .bind(content)
+        .bind(kind)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Message {
+            id,
+            channel_id: channel,
+            author_id: user,
+            author: name,
+            content: content.to_string(),
+            ts: ts_ms(id),
+            edited: false,
+            reply: None,
+            nonce: 0,
+            reactions: Vec::new(),
+            kind: kind as u8,
+            pinned: false,
+        })
+    }
+
+    /// Canal onde avisos de sistema aparecem: o primeiro canal de texto do servidor.
+    pub async fn system_channel(&self, server: i64) -> R<Option<i64>> {
+        let r: Option<(i64,)> = sqlx::query_as("SELECT id FROM channels WHERE server_id = $1 AND kind = 0 ORDER BY position, id LIMIT 1")
+            .bind(server)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(r.map(|x| x.0))
+    }
+
+    /// Quem pode fixar: o dono do servidor, ou qualquer participante de uma DM.
+    pub async fn can_pin(&self, channel: i64, user: i64) -> R<bool> {
+        let r: (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM channels c JOIN servers s ON s.id = c.server_id WHERE c.id = $1 AND s.owner_id = $2)
+                 OR EXISTS (SELECT 1 FROM channel_members WHERE channel_id = $1 AND user_id = $2)",
+        )
+        .bind(channel)
+        .bind(user)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(r.0)
+    }
+
+    /// Fixa/desafixa. `Ok(Some(true))` mudou, `Ok(Some(false))` já estava assim, `Ok(None)` limite de 50.
+    pub async fn set_pinned(&self, message: i64, channel: i64, pin: bool) -> R<Option<bool>> {
+        if pin {
+            let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM messages WHERE channel_id = $1 AND pinned_at IS NOT NULL")
+                .bind(channel)
+                .fetch_one(&self.pool)
+                .await?;
+            if n >= 50 {
+                return Ok(None);
+            }
+        }
+        let n = sqlx::query(
+            "UPDATE messages SET pinned_at = CASE WHEN $2 THEN now() ELSE NULL END
+             WHERE id = $1 AND kind = 0 AND (pinned_at IS NULL) = $2",
+        )
+        .bind(message)
+        .bind(pin)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(Some(n > 0))
+    }
+
+    /// Fixadas do canal, a mais recente primeiro.
+    pub async fn pins(&self, channel: i64, me: i64) -> R<Vec<Message>> {
+        type Row = (i64, i64, String, String, bool);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT m.id, m.author_id, u.display_name, m.content, m.edited_at IS NOT NULL
+             FROM messages m JOIN users u ON u.id = m.author_id
+             WHERE m.channel_id = $1 AND m.pinned_at IS NOT NULL ORDER BY m.pinned_at DESC LIMIT 50",
+        )
+        .bind(channel)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut v: Vec<Message> = rows
+            .into_iter()
+            .map(|(id, author_id, author, content, edited)| Message {
+                id,
+                channel_id: channel,
+                author_id,
+                author,
+                content,
+                ts: ts_ms(id),
+                edited,
+                reply: None,
+                nonce: 0,
+                reactions: Vec::new(),
+                kind: 0,
+                pinned: true,
+            })
+            .collect();
+        self.attach_reactions(&mut v, me).await?;
+        Ok(v)
+    }
+
     pub async fn is_member(&self, server: i64, user: i64) -> R<bool> {
         let r: (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM members WHERE server_id = $1 AND user_id = $2)")
             .bind(server)
@@ -475,13 +583,14 @@ impl Store {
         before: Option<i64>,
         me: i64,
     ) -> R<Vec<(Message, String)>> {
-        type Row = (i64, i64, String, i64, String, String, bool);
+        type Row = (i64, i64, String, i64, String, String, bool, i16, bool);
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT m.id, m.channel_id, c.name, m.author_id, u.display_name, m.content, m.edited_at IS NOT NULL
+            "SELECT m.id, m.channel_id, c.name, m.author_id, u.display_name, m.content, m.edited_at IS NOT NULL, m.kind, m.pinned_at IS NOT NULL
              FROM messages m
              JOIN channels c ON c.id = m.channel_id
              JOIN users u ON u.id = m.author_id
              WHERE (($1::bigint IS NOT NULL AND m.channel_id = $1) OR ($2::bigint IS NOT NULL AND c.server_id = $2 AND c.kind = 0))
+               AND m.kind = 0
                AND ($3::bigint IS NULL OR m.author_id = $3)
                AND ($4 = '' OR to_tsvector('portuguese', m.content) @@ websearch_to_tsquery('portuguese', $4))
                AND ($5::bigint IS NULL OR m.id < $5)
@@ -496,9 +605,9 @@ impl Store {
         .await?;
         let mut out: Vec<(Message, String)> = rows
             .into_iter()
-            .map(|(id, channel_id, channel_name, author_id, author, content, edited)| {
+            .map(|(id, channel_id, channel_name, author_id, author, content, edited, kind, pinned)| {
                 (
-                    Message { id, channel_id, author_id, author, content, ts: ts_ms(id), edited, reply: None, nonce: 0, reactions: Vec::new() },
+                    Message { id, channel_id, author_id, author, content, ts: ts_ms(id), edited, reply: None, nonce: 0, reactions: Vec::new(), kind: kind as u8, pinned },
                     channel_name,
                 )
             })
@@ -527,10 +636,10 @@ impl Store {
 
     /// Até 50 mensagens anteriores a `before`, em ordem cronológica.
     pub async fn history(&self, channel: i64, before: Option<i64>, me: i64) -> R<Vec<Message>> {
-        type Row = (i64, i64, String, String, bool, Option<i64>, Option<String>, Option<String>);
+        type Row = (i64, i64, String, String, bool, Option<i64>, Option<String>, Option<String>, i16, bool);
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT m.id, m.author_id, u.display_name, m.content, m.edited_at IS NOT NULL,
-                    r.id, ru.display_name, left(r.content, 120)
+                    r.id, ru.display_name, left(r.content, 120), m.kind, m.pinned_at IS NOT NULL
              FROM messages m JOIN users u ON u.id = m.author_id
              LEFT JOIN messages r ON r.id = m.reply_to
              LEFT JOIN users ru ON ru.id = r.author_id
@@ -543,7 +652,7 @@ impl Store {
         .await?;
         let mut v: Vec<Message> = rows
             .into_iter()
-            .map(|(id, author_id, author, content, edited, rid, rauthor, rcontent)| Message {
+            .map(|(id, author_id, author, content, edited, rid, rauthor, rcontent, kind, pinned)| Message {
                 id,
                 channel_id: channel,
                 author_id,
@@ -557,6 +666,8 @@ impl Store {
                 },
                 nonce: 0,
                 reactions: Vec::new(),
+                kind: kind as u8,
+                pinned,
             })
             .collect();
         v.reverse();

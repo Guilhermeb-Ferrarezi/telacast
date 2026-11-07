@@ -661,6 +661,15 @@ async fn handle_authed(
                     Ok(Some(sid)) => {
                         let ids = app.store.server_member_ids(sid).await.unwrap_or_default();
                         app.push_many(&ids).await;
+                        // aviso "fulano entrou" no primeiro canal de texto
+                        if let Ok(Some(ch)) = app.store.system_channel(sid).await {
+                            if let Ok(msg) = app.store.insert_system(app.sf.next(), ch, me, 2, "entrou").await {
+                                let out = S2C::Message(msg);
+                                for u in &ids {
+                                    app.send_to(*u, &out);
+                                }
+                            }
+                        }
                         let _ = tx.send(S2C::ServerJoined { server_id: sid });
                     }
                     Ok(None) => err(ErrorCode::InvalidInvite, "Convite inválido, expirado ou esgotado"),
@@ -815,6 +824,53 @@ async fn handle_authed(
                 Err(e) => db_err("search", e),
             }
         }
+        C2S::Pin { message_id, pin } => {
+            if busy("pin", 20, 30) {
+                err(ErrorCode::RateLimited, ERR_BUSY);
+            } else {
+                match app.store.message_channel(message_id).await {
+                    Ok(Some(channel_id)) if app.store.can_access(channel_id, me).await.unwrap_or(false) => {
+                        if !app.store.can_pin(channel_id, me).await.unwrap_or(false) {
+                            err(ErrorCode::Forbidden, "Só o dono do servidor fixa mensagens");
+                        } else {
+                            match app.store.set_pinned(message_id, channel_id, pin).await {
+                                Ok(Some(true)) => {
+                                    let to = app.store.participants(channel_id).await.unwrap_or_default();
+                                    let ev = S2C::Pinned { channel_id, message_id, pinned: pin };
+                                    for u in &to {
+                                        app.send_to(*u, &ev);
+                                    }
+                                    if pin {
+                                        // aviso "fulano fixou uma mensagem" (o conteúdo é o id da fixada)
+                                        if let Ok(msg) = app.store.insert_system(app.sf.next(), channel_id, me, 3, &message_id.to_string()).await {
+                                            let out = S2C::Message(msg);
+                                            for u in &to {
+                                                app.send_to(*u, &out);
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(Some(false)) => {}
+                                Ok(None) => err(ErrorCode::InvalidInput, "Este canal já tem 50 mensagens fixadas"),
+                                Err(e) => db_err("set_pinned", e),
+                            }
+                        }
+                    }
+                    Ok(_) => err(ErrorCode::NotFound, "Mensagem não encontrada"),
+                    Err(e) => db_err("message_channel", e),
+                }
+            }
+        }
+        C2S::Pins { channel_id } => match app.store.can_access(channel_id, me).await {
+            Ok(true) => match app.store.pins(channel_id, me).await {
+                Ok(messages) => {
+                    let _ = tx.send(S2C::Pins { channel_id, messages });
+                }
+                Err(e) => db_err("pins", e),
+            },
+            Ok(false) => {}
+            Err(e) => db_err("can_access", e),
+        },
         C2S::React { message_id, emoji, add } => {
             // emoji de verdade: sem letras/números/espaços ASCII, curto (sequências com ZWJ cabem)
             let valid = !emoji.is_empty()

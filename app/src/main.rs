@@ -84,6 +84,9 @@ enum Act {
     Search(bool),
     React { message: i64, emoji: String, add: bool },
     OpenPicker(i64, egui::Pos2),
+    Pin { message: i64, pin: bool },
+    OpenPins,
+    ClosePins,
     Goto { channel: i64, id: i64 },
     CloseSearch,
     StartEdit(i64, String),
@@ -149,6 +152,9 @@ struct Session {
     search: Option<SearchState>,
     /// Seletor de emoji aberto para uma mensagem: (id, posição na tela).
     picker: Option<(i64, egui::Pos2)>,
+    /// Painel de fixadas aberto e a lista do canal atual.
+    pins_open: bool,
+    pins: Vec<p::Message>,
     /// Ir até uma mensagem assim que o histórico do canal carregar: (canal, id).
     pending_goto: Option<(i64, i64)>,
     /// Divisor "novas mensagens": (canal, último id lido ao abrir, já rolei até ele).
@@ -202,6 +208,8 @@ impl Pending {
             reply: self.reply.clone(),
             nonce: self.nonce,
             reactions: Vec::new(),
+            kind: 0,
+            pinned: false,
         }
     }
 }
@@ -251,6 +259,8 @@ impl Session {
             recent: Vec::new(),
             search: None,
             picker: None,
+            pins_open: false,
+            pins: Vec::new(),
             pending_goto: None,
             marker: None,
             older: HashSet::new(),
@@ -307,6 +317,10 @@ impl Session {
             }
             self.unread.remove(&ch);
             self.mentions.remove(&ch);
+            if self.pins_open {
+                self.pins.clear();
+                self.gw.send(C2S::Pins { channel_id: ch });
+            }
             self.ack(ch);
             if self.requested.insert(ch) {
                 self.gw.send(C2S::History { channel_id: ch, before: None });
@@ -562,6 +576,19 @@ impl Session {
                             }
                         }
                     }
+                    S2C::Pinned { channel_id, message_id, pinned } => {
+                        if let Some(msg) = self.msgs.get_mut(&channel_id).and_then(|v| v.iter_mut().find(|m| m.id == message_id)) {
+                            msg.pinned = pinned;
+                        }
+                        if self.pins_open && self.current_channel() == Some(channel_id) {
+                            self.gw.send(C2S::Pins { channel_id });
+                        }
+                    }
+                    S2C::Pins { channel_id, messages } => {
+                        if self.current_channel() == Some(channel_id) {
+                            self.pins = messages;
+                        }
+                    }
                     S2C::Reaction { channel_id, message_id, emoji, user_id, add } => {
                         let mine = user_id == self.me.id;
                         if let Some(msg) = self.msgs.get_mut(&channel_id).and_then(|v| v.iter_mut().find(|m| m.id == message_id)) {
@@ -593,6 +620,7 @@ impl Session {
                         }
                     }
                     S2C::MessageDeleted { channel_id, message_id } => {
+                        self.pins.retain(|m| m.id != message_id);
                         if let Some(v) = self.msgs.get_mut(&channel_id) {
                             v.retain(|m| m.id != message_id);
                         }
@@ -951,6 +979,46 @@ fn parse_search(query: &str, snap: &p::Snapshot, view: &View, me: i64) -> (Strin
     (text.join(" "), from, chan)
 }
 
+/// Aviso de sistema numa linha só: "fulano entrou…" ou "fulano fixou uma mensagem…".
+fn system_row(ui: &mut egui::Ui, m: &p::Message, acts: &mut Vec<Act>) {
+    const JOIN: [&str; 6] =
+        ["entrou no servidor.", "chegou.", "acabou de aparecer!", "pulou para o servidor.", "acabou de aterrissar.", "chegou por aqui. Diga oi!"];
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(egui::vec2(46.0, 20.0), egui::Sense::hover());
+        let c = r.center() + egui::vec2(-3.0, 0.0);
+        let p = ui.painter();
+        if m.kind == 2 {
+            // seta para dentro
+            let st = egui::Stroke::new(1.6, OK);
+            p.line_segment([c + egui::vec2(-6.0, 0.0), c + egui::vec2(5.0, 0.0)], st);
+            p.line_segment([c + egui::vec2(1.0, -4.0), c + egui::vec2(5.0, 0.0)], st);
+            p.line_segment([c + egui::vec2(1.0, 4.0), c + egui::vec2(5.0, 0.0)], st);
+        } else {
+            // alfinete
+            let st = egui::Stroke::new(1.6, AMBER);
+            p.circle_filled(c + egui::vec2(0.0, -3.0), 4.0, AMBER);
+            p.line_segment([c + egui::vec2(0.0, 0.0), c + egui::vec2(0.0, 7.0)], st);
+        }
+        ui.spacing_mut().item_spacing.x = 5.0;
+        ui.label(RichText::new(&m.author).strong().color(TEXT));
+        if m.kind == 2 {
+            ui.label(RichText::new(JOIN[(m.id as usize) % JOIN.len()]).color(TEXT2));
+        } else {
+            ui.label(RichText::new("fixou uma mensagem neste canal.").color(TEXT2));
+            let r = ui.add(egui::Label::new(RichText::new("Ver todas as mensagens fixadas").color(AMBER).underline()).sense(egui::Sense::click()));
+            if r.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if r.clicked() {
+                acts.push(Act::OpenPins);
+            }
+        }
+        ui.label(RichText::new(fmt_clock(m.ts)).size(11.5).color(MUTED));
+    });
+    ui.add_space(6.0);
+}
+
 fn is_pending_or_own_echo(m: &p::Message, me: i64) -> bool {
     m.id < 0 || (m.author_id == me && m.nonce != 0)
 }
@@ -1021,6 +1089,7 @@ impl App {
 
         // Ctrl+F abre e fecha o painel de busca (só dentro de um canal ou conversa)
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) && !matches!(s.view, View::Home) {
+            s.pins_open = false;
             s.search = match s.search {
                 Some(_) => None,
                 None => Some(SearchState {
@@ -1095,6 +1164,8 @@ impl App {
             self.channel_panel(ui, s, &mut acts);
             if s.search.is_some() {
                 self.search_panel(ui, s, &mut acts);
+            } else if s.pins_open && !matches!(s.view, View::Home) {
+                self.pins_panel(ui, s, &mut acts);
             } else if let View::Chan { server, .. } = s.view {
                 self.members_panel(ui, s, server, &mut acts);
             }
@@ -1192,6 +1263,16 @@ impl App {
                 Act::CloseSearch => s.search = None,
                 Act::React { message, emoji, add } => s.gw.send(C2S::React { message_id: message, emoji, add }),
                 Act::OpenPicker(id, pos) => s.picker = Some((id, pos)),
+                Act::Pin { message, pin } => s.gw.send(C2S::Pin { message_id: message, pin }),
+                Act::OpenPins => {
+                    s.pins_open = true;
+                    s.search = None;
+                    if let Some(ch) = s.current_channel() {
+                        s.pins.clear();
+                        s.gw.send(C2S::Pins { channel_id: ch });
+                    }
+                }
+                Act::ClosePins => s.pins_open = false,
                 Act::Goto { channel, id } => {
                     let server = s.snap.servers.iter().find(|sv| sv.channels.iter().any(|c| c.id == channel)).map(|sv| sv.id);
                     let already = s.current_channel() == Some(channel);
@@ -1746,6 +1827,83 @@ impl App {
         edge(ui, pr.response.rect, false);
     }
 
+    // ---- mensagens fixadas
+    fn pins_panel(&mut self, ui: &mut egui::Ui, s: &mut Session, acts: &mut Vec<Act>) {
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let pr = egui::Panel::right("pins")
+            .frame(egui::Frame::new().fill(SIDE))
+            .resizable(false)
+            .exact_size(380.0)
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 52.0), Layout::left_to_right(Align::Center), |ui| {
+                    ui.add_space(16.0);
+                    ui.label(serif("Mensagens fixadas", 19.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(10.0);
+                        let (r, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(r, 8.0, L4);
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        let c = r.center();
+                        let st = egui::Stroke::new(1.5, if resp.hovered() { TEXT } else { MUTED });
+                        ui.painter().line_segment([c + egui::vec2(-5.0, -5.0), c + egui::vec2(5.0, 5.0)], st);
+                        ui.painter().line_segment([c + egui::vec2(-5.0, 5.0), c + egui::vec2(5.0, -5.0)], st);
+                        if resp.clicked() {
+                            acts.push(Act::ClosePins);
+                        }
+                    });
+                });
+                rule_bleed(ui, 0.0);
+                if s.pins.is_empty() {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("Este canal não tem mensagens fixadas...").color(TEXT2));
+                        ui.label(RichText::new("por enquanto.").color(MUTED));
+                    });
+                }
+                let mut go: Option<(i64, i64)> = None;
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    for m in &s.pins {
+                        let bg = ui.painter().add(egui::Shape::Noop);
+                        let card = egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 10)).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal_top(|ui| {
+                                avatar(ui, &m.author, m.author_id, 32.0, None, SIDE);
+                                ui.add_space(4.0);
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(&m.author).strong().color(TEXT));
+                                        ui.label(RichText::new(format!("{} {}", fmt_day(m.ts), fmt_clock(m.ts))).size(11.5).color(MUTED));
+                                    });
+                                    let blocks = telacast_md::parse(&m.content);
+                                    let empty = HashSet::new();
+                                    let env = md_view::Env { snap: &s.snap, revealed: &empty, msg: m.id, now: now_secs };
+                                    let mut clicks = Vec::new();
+                                    md_view::show(ui, &blocks, &env, &md_view::Base { size: 14.5, color: TEXT2 }, m.edited, &mut clicks);
+                                });
+                            });
+                        });
+                        let r = ui.interact(card.response.rect, egui::Id::new(("pin", m.id)), egui::Sense::click());
+                        if r.hovered() {
+                            ui.painter().set(bg, egui::Shape::rect_filled(card.response.rect, 0.0, L2));
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if r.clicked() {
+                            go = Some((m.channel_id, m.id));
+                        }
+                        let (line, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+                        ui.painter().rect_filled(line, 0.0, LINE);
+                    }
+                });
+                if let Some((channel, id)) = go {
+                    acts.push(Act::Goto { channel, id });
+                }
+            });
+        edge(ui, pr.response.rect, false);
+    }
+
     // ---- membros
     fn members_panel(&mut self, ui: &mut egui::Ui, s: &Session, server: i64, acts: &mut Vec<Act>) {
         let Some(sv) = s.snap.servers.iter().find(|x| x.id == server) else { return };
@@ -1853,6 +2011,9 @@ impl App {
                         }
                     }
                 }
+                if small_button(ui, "Fixadas", FIELD) {
+                    acts.push(if s.pins_open { Act::ClosePins } else { Act::OpenPins });
+                }
             });
         });
         rule_bleed(ui, 28.0);
@@ -1896,6 +2057,7 @@ impl App {
         // mensagens
         let me_id = s.me.id;
         let is_owner = s.snap.servers.iter().any(|sv| sv.owner == me_id && sv.channels.iter().any(|c| c.id == ch));
+        let can_pin = is_owner || matches!(s.view, View::Dm(_));
         let replying_here = matches!(&s.replying, Some((c, _)) if *c == ch);
         let input_h = 82.0 + 22.0 + if replying_here { 38.0 } else { 0.0 };
         let h = (ui.available_height() - input_h).max(60.0);
@@ -1935,7 +2097,12 @@ impl App {
                             }
                         }
                     }
-                    let grouped = !new_day && !first_new
+                    // avisos de sistema (entrou, fixou): linha própria, sem barra de ações, quebra o agrupamento
+                    if m.kind == 2 || m.kind == 3 {
+                        system_row(ui, m, acts);
+                        continue;
+                    }
+                    let grouped = !new_day && !first_new && (i == 0 || msgs[i - 1].kind == 0)
                         && msgs[i - 1].author_id == m.author_id
                         && m.ts - msgs[i - 1].ts < 5 * 60 * 1000
                         && m.reply.is_none();
@@ -1959,6 +2126,10 @@ impl App {
                             ui.set_min_width(180.0);
                             if ui.button("Responder").clicked() {
                                 acts.push(Act::Reply(ch, reply_ref.clone()));
+                                ui.close();
+                            }
+                            if can_pin && ui.button(if m.pinned { "Desafixar mensagem" } else { "Fixar mensagem" }).clicked() {
+                                acts.push(Act::Pin { message: m.id, pin: !m.pinned });
                                 ui.close();
                             }
                             if ui.button("Reagir").clicked() {
@@ -2022,6 +2193,9 @@ impl App {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(&m.author).size(15.5).strong().color(TEXT));
                                     ui.label(RichText::new(fmt_clock(m.ts)).size(12.0).color(MUTED));
+                                    if m.pinned {
+                                        ui.label(RichText::new("Fixada").size(11.5).color(AMBER));
+                                    }
                                 });
                             }
                             if editing_this {
@@ -2148,6 +2322,9 @@ impl App {
                         if can_delete {
                             items.push(("Apagar", 2));
                         }
+                        if can_pin {
+                            items.push((if m.pinned { "Desafixar" } else { "Fixar" }, 5));
+                        }
                         items.push(("Copiar", 3));
                         let widths: Vec<f32> = items
                             .iter()
@@ -2181,6 +2358,7 @@ impl App {
                                     1 => Act::StartEdit(m.id, m.content.clone()),
                                     2 => Act::AskDelete(m.id, m.content.clone()),
                                     4 => Act::OpenPicker(m.id, egui::pos2(r.left(), bar.bottom() + 4.0)),
+                                    5 => Act::Pin { message: m.id, pin: !m.pinned },
                                     _ => Act::Copy(m.content.clone()),
                                 });
                             }

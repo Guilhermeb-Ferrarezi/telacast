@@ -149,6 +149,11 @@ pub struct Message {
     /// Só vem preenchido no histórico e na busca; reações novas chegam por `S2C::Reaction`.
     #[serde(default)]
     pub reactions: Vec<Reaction>,
+    /// 0 normal, 2 alguém entrou no servidor, 3 alguém fixou uma mensagem (`content` = id da fixada).
+    #[serde(default)]
+    pub kind: u8,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Um resultado de busca: a mensagem e onde ela está.
@@ -191,6 +196,10 @@ pub enum C2S {
         text: String,
         before: Option<i64>,
     },
+    /// Fixa ou desafixa uma mensagem (dono do servidor, ou qualquer participante de uma DM). Máx. 50 por canal.
+    Pin { message_id: i64, pin: bool },
+    /// Pede as mensagens fixadas do canal (resposta: `S2C::Pins`).
+    Pins { channel_id: i64 },
     /// Reage (ou tira a reação) com um emoji. Repetir não muda nada.
     React { message_id: i64, emoji: String, add: bool },
     /// Marca o canal como lido até `message_id`.
@@ -219,6 +228,10 @@ pub enum S2C {
     History { channel_id: i64, messages: Vec<Message> },
     /// Resultado de `Search` (mais novos primeiro); `more` indica que há outra página.
     SearchResults { nonce: u64, hits: Vec<SearchHit>, more: bool },
+    /// A mensagem foi fixada ou desafixada.
+    Pinned { channel_id: i64, message_id: i64, pinned: bool },
+    /// Fixadas do canal, a mais recente primeiro.
+    Pins { channel_id: i64, messages: Vec<Message> },
     /// Alguém reagiu (`add`) ou tirou a reação.
     Reaction { channel_id: i64, message_id: i64, emoji: String, user_id: i64, add: bool },
     MessageEdited { channel_id: i64, message_id: i64, content: String },

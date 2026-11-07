@@ -234,8 +234,8 @@ fn fluxo_completo() {
     assert!(msg.id > 0 && msg.ts > 1_767_225_600_000, "id e hora vêm do snowflake");
     beto.send(C2S::History { channel_id: geral, before: None });
     let hist = beto.wait("o histórico", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
-    assert_eq!(hist.len(), 1);
-    assert_eq!(hist[0].id, msg.id);
+    assert_eq!(hist.iter().filter(|m| m.kind == 0).count(), 1);
+    assert_eq!(hist.iter().find(|m| m.kind == 0).unwrap().id, msg.id);
 
     // quem não é do servidor não lê nem escreve
     carla.send(C2S::History { channel_id: geral, before: None });
@@ -243,7 +243,7 @@ fn fluxo_completo() {
     std::thread::sleep(Duration::from_millis(400));
     ana.send(C2S::History { channel_id: geral, before: None });
     let hist = ana.wait("o histórico da ana", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
-    assert_eq!(hist.len(), 1, "a mensagem da carla não deveria existir");
+    assert_eq!(hist.iter().filter(|m| m.kind == 0).count(), 1, "a mensagem da carla não deveria existir");
 
     // --- amizade e DM
     ana.send(C2S::FriendRequest { username: "carla".into() });
@@ -418,7 +418,7 @@ fn nonce_nao_duplica_mensagem() {
     assert_eq!((segunda.content.as_str(), segunda.nonce), ("tchau", 778), "a repetição foi descartada");
     beto.send(C2S::History { channel_id: geral, before: None });
     let hist = beto.wait("o histórico", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
-    assert_eq!(hist.len(), 2);
+    assert_eq!(hist.iter().filter(|m| m.kind == 0).count(), 2);
 }
 
 #[test]
@@ -614,14 +614,15 @@ fn reacoes_com_emoji() {
     // o histórico agrega: 👍 x2 (e a ana está entre eles), 🎉 x1
     ana.send(C2S::History { channel_id: geral, before: None });
     let hist = ana.wait("o histórico", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
-    let r = &hist[0].reactions;
+    let r = &hist.iter().find(|m| m.kind == 0).unwrap().reactions;
     assert_eq!(r.len(), 2, "dois emojis diferentes: {r:?}");
     assert_eq!((r[0].emoji.as_str(), r[0].count, r[0].me), ("👍", 2, true));
     assert_eq!((r[1].emoji.as_str(), r[1].count, r[1].me), ("🎉", 1, true));
     // para o beto, só o 👍 é dele
     beto.send(C2S::History { channel_id: geral, before: None });
     let h2 = beto.wait("o histórico do beto", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
-    assert_eq!((h2[0].reactions[0].me, h2[0].reactions[1].me), (true, false));
+    let r2 = &h2.iter().find(|m| m.kind == 0).unwrap().reactions;
+    assert_eq!((r2[0].me, r2[1].me), (true, false));
     // tirar a reação
     ana.send(C2S::React { message_id: msg.id, emoji: "🎉".into(), add: false });
     let ev = beto.wait("a remoção", |m| match m {
@@ -637,4 +638,75 @@ fn reacoes_com_emoji() {
     fora.register("carla", &code2);
     fora.send(C2S::React { message_id: msg.id, emoji: "👍".into(), add: true });
     assert_eq!(fora.error_code().0, telacast_proto::ErrorCode::NotFound);
+}
+
+#[test]
+fn fixadas_e_avisos_de_sistema() {
+    let env = Env::start();
+    let code = env.invite(2);
+    let mut ana = env.client();
+    let (_, ana_id) = ana.register("ana", &code);
+    let mut beto = env.client();
+    let (_, beto_id) = beto.register("beto", &code);
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    let geral = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
+    // quem entra gera um aviso de sistema (kind 2) no primeiro canal
+    beto.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
+    let aviso = ana.wait("o aviso de entrada", |m| match m {
+        S2C::Message(m) if m.kind == 2 => Some(m.clone()),
+        _ => None,
+    });
+    assert_eq!((aviso.author_id, aviso.channel_id), (beto_id, geral));
+
+    ana.send(C2S::Send { channel_id: geral, content: "regras do canal".into(), reply_to: None, nonce: 0 });
+    let msg = beto.wait("a mensagem", |m| match m {
+        S2C::Message(m) if m.kind == 0 => Some(m.clone()),
+        _ => None,
+    });
+    // o beto não é dono: não fixa
+    beto.send(C2S::Pin { message_id: msg.id, pin: true });
+    assert_eq!(beto.error_code().0, telacast_proto::ErrorCode::Forbidden);
+    // a ana é dona: fixa; todos recebem o evento e o aviso "fixou" (kind 3, content = id da fixada)
+    ana.send(C2S::Pin { message_id: msg.id, pin: true });
+    let ev = beto.wait("o evento de fixar", |m| match m {
+        S2C::Pinned { message_id, pinned, .. } => Some((*message_id, *pinned)),
+        _ => None,
+    });
+    assert_eq!(ev, (msg.id, true));
+    let fixou = beto.wait("o aviso de fixar", |m| match m {
+        S2C::Message(m) if m.kind == 3 => Some(m.clone()),
+        _ => None,
+    });
+    assert_eq!((fixou.author_id, fixou.content.as_str()), (ana_id, msg.id.to_string().as_str()));
+    // fixar de novo não repete
+    ana.send(C2S::Pin { message_id: msg.id, pin: true });
+    // lista de fixadas e marca no histórico
+    beto.send(C2S::Pins { channel_id: geral });
+    let pins = beto.wait("as fixadas", |m| if let S2C::Pins { messages, .. } = m { Some(messages.clone()) } else { None });
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].id, msg.id);
+    beto.send(C2S::History { channel_id: geral, before: None });
+    let hist = beto.wait("o histórico", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
+    assert!(hist.iter().find(|m| m.id == msg.id).unwrap().pinned);
+    assert!(hist.iter().any(|m| m.kind == 2) && hist.iter().filter(|m| m.kind == 3).count() == 1, "um aviso de entrada e um só de fixar");
+    // desafixar
+    ana.send(C2S::Pin { message_id: msg.id, pin: false });
+    let ev = beto.wait("o evento de desafixar", |m| match m {
+        S2C::Pinned { pinned: false, message_id, .. } => Some(*message_id),
+        _ => None,
+    });
+    assert_eq!(ev, msg.id);
+    beto.send(C2S::Pins { channel_id: geral });
+    let pins = beto.wait("as fixadas", |m| if let S2C::Pins { messages, .. } = m { Some(messages.clone()) } else { None });
+    assert!(pins.is_empty());
+    // aviso de sistema não se fixa nem se reage
+    ana.send(C2S::Pin { message_id: aviso.id, pin: true });
+    std::thread::sleep(Duration::from_millis(300));
+    beto.send(C2S::Pins { channel_id: geral });
+    let pins = beto.wait("as fixadas", |m| if let S2C::Pins { messages, .. } = m { Some(messages.clone()) } else { None });
+    assert!(pins.is_empty(), "mensagem de sistema não fixa");
 }
