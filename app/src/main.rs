@@ -49,6 +49,7 @@ fn main() -> eframe::Result {
         "Telacast",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
+                .with_decorations(false) // a barra de título é nossa (como a do Discord)
                 .with_inner_size([1280.0, 760.0])
                 .with_min_inner_size([900.0, 520.0]),
             ..Default::default()
@@ -349,6 +350,10 @@ struct Session {
     voice_muted: bool,
     voice_deaf: bool,
     voice_view: bool,
+    /// Histórico de navegação (setas ← → da barra de título).
+    nav: Vec<View>,
+    nav_i: usize,
+    nav_moving: bool,
     voice_since: Option<Instant>,
     /// Volume de cada pessoa que ouço (0.0 a 2.0; ausente = 1.0).
     voice_volumes: HashMap<i64, f32>,
@@ -499,6 +504,9 @@ impl Session {
             voice_muted: false,
             voice_deaf: false,
             voice_view: false,
+            nav: vec![View::Home],
+            nav_i: 0,
+            nav_moving: false,
             voice_since: None,
             voice_volumes: HashMap::new(),
             update: std::sync::Arc::new(std::sync::Mutex::new(update::State::Idle)),
@@ -585,8 +593,46 @@ impl Session {
             }
         }
         self.editing = None;
+        if !self.nav_moving {
+            // anda para a frente no histórico (descarta o "avançar" antigo)
+            self.nav.truncate(self.nav_i + 1);
+            self.nav.push(v.clone());
+            self.nav_i = self.nav.len() - 1;
+            if self.nav.len() > 60 {
+                self.nav.remove(0);
+                self.nav_i -= 1;
+            }
+        }
         self.view = v;
         self.view_since = Instant::now();
+    }
+
+    fn nav_go(&mut self, i: usize) {
+        if i < self.nav.len() {
+            self.nav_i = i;
+            self.nav_moving = true;
+            self.voice_view = false;
+            let v = self.nav[i].clone();
+            self.open(v);
+            self.nav_moving = false;
+        }
+    }
+
+    /// Título mostrado no centro da barra de título.
+    fn window_title(&self) -> String {
+        if self.voice_view {
+            if let Some(mv) = self.my_voice() {
+                return self.voice_place(mv.channel_id).map(|(c, _)| c).unwrap_or_default();
+            }
+        }
+        match &self.view {
+            View::Home => "Amigos".into(),
+            View::Dm(c) => self.snap.dms.iter().find(|d| d.channel_id == *c).map(|d| d.user.name.clone()).unwrap_or_default(),
+            View::Chan { channel, .. } => {
+                let name = self.snap.servers.iter().flat_map(|sv| sv.channels.iter()).find(|x| x.id == *channel).map(|x| x.name.clone()).unwrap_or_default();
+                format!("# {name}")
+            }
+        }
     }
 
     /// Id da última mensagem conhecida do canal (a do snapshot ou a mais nova já carregada).
@@ -1465,6 +1511,10 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if !self.fullscreen {
+            self.titlebar(ui, &ctx);
+            resize_edges(&ctx);
+        }
         if single::take_raise() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -1491,6 +1541,134 @@ impl eframe::App for App {
                 }
             }
             None => self.login_ui(ui, &ctx),
+        }
+    }
+}
+
+// ------------------------------------------------------------------ barra de título
+
+/// Bordas da janela sem moldura: o cursor muda e o arrasto redimensiona (o X não faz isso sem decoração).
+fn resize_edges(ctx: &egui::Context) {
+    use egui::{CursorIcon as C, ResizeDirection as D};
+    if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
+        return;
+    }
+    let Some(p) = ctx.input(|i| i.pointer.hover_pos()) else { return };
+    let r = ctx.content_rect();
+    let m = 5.0;
+    let (l, rt, t, b) = (p.x - r.left() < m, r.right() - p.x < m, p.y - r.top() < m, r.bottom() - p.y < m);
+    let dir = match (l, rt, t, b) {
+        (true, _, true, _) => Some((D::NorthWest, C::ResizeNwSe)),
+        (_, true, true, _) => Some((D::NorthEast, C::ResizeNeSw)),
+        (true, _, _, true) => Some((D::SouthWest, C::ResizeNeSw)),
+        (_, true, _, true) => Some((D::SouthEast, C::ResizeNwSe)),
+        (true, ..) => Some((D::West, C::ResizeHorizontal)),
+        (_, true, ..) => Some((D::East, C::ResizeHorizontal)),
+        (_, _, true, _) => Some((D::North, C::ResizeVertical)),
+        (_, _, _, true) => Some((D::South, C::ResizeVertical)),
+        _ => None,
+    };
+    if let Some((d, icon)) = dir {
+        ctx.set_cursor_icon(icon);
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(d));
+        }
+    }
+}
+
+impl App {
+    /// Barra de título própria, como a do Discord: ← → à esquerda, título no centro, minimizar/maximizar/fechar à direita.
+    fn titlebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let (title, can_back, can_fwd) = match &self.session {
+            Some(s) => (s.window_title(), s.nav_i > 0, s.nav_i + 1 < s.nav.len()),
+            None => ("Telacast".to_string(), false, false),
+        };
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        let (mut go_back, mut go_fwd) = (false, false);
+        egui::Panel::top("titlebar").frame(egui::Frame::NONE.fill(L0)).exact_size(32.0).show(ui, |ui| {
+            let (rect, drag) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click_and_drag());
+            if drag.drag_started_by(egui::PointerButton::Primary) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if drag.double_clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            // título centrado (com "#" ou o nome)
+            let pt = ui.painter();
+            pt.text(rect.center(), Align2::CENTER_CENTER, &title, egui::FontId::proportional(13.5), TEXT2);
+            // ← →
+            for (i, (can, forward)) in [(can_back, false), (can_fwd, true)].into_iter().enumerate() {
+                let r = egui::Rect::from_min_size(egui::pos2(rect.left() + 10.0 + i as f32 * 28.0, rect.top() + 4.0), egui::vec2(26.0, 24.0));
+                let resp = ui.interact(r, egui::Id::new(("nav-arrow", forward)), egui::Sense::click());
+                let hot = resp.hovered() && can;
+                let pt = ui.painter();
+                if hot {
+                    pt.rect_filled(r, 6.0, L3);
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let ink = if !can { alpha(TEXT2, 0.3) } else if hot { TEXT } else { TEXT2 };
+                let c = r.center();
+                let d = if forward { 1.0 } else { -1.0 };
+                let st = egui::Stroke::new(1.6, ink);
+                pt.line_segment([c + egui::vec2(-5.0 * d, 0.0), c + egui::vec2(5.0 * d, 0.0)], st);
+                pt.line_segment([c + egui::vec2(5.0 * d, 0.0), c + egui::vec2(1.0 * d, -4.0)], st);
+                pt.line_segment([c + egui::vec2(5.0 * d, 0.0), c + egui::vec2(1.0 * d, 4.0)], st);
+                if resp.on_hover_text(if forward { "Avançar" } else { "Voltar" }).clicked() && can {
+                    if forward {
+                        go_fwd = true;
+                    } else {
+                        go_back = true;
+                    }
+                }
+            }
+            // minimizar, maximizar e fechar
+            for (i, kind) in [0, 1, 2].into_iter().enumerate() {
+                let x = rect.right() - 46.0 * (3 - i) as f32;
+                let r = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(46.0, 32.0));
+                let resp = ui.interact(r, egui::Id::new(("win-btn", kind)), egui::Sense::click());
+                let hot = resp.hovered();
+                let pt = ui.painter();
+                if hot {
+                    pt.rect_filled(r, 0.0, if kind == 2 { RED } else { L3 });
+                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                let ink = if hot && kind == 2 { L0 } else if hot { TEXT } else { TEXT2 };
+                let c = r.center();
+                let st = egui::Stroke::new(1.3, ink);
+                match kind {
+                    0 => {
+                        pt.line_segment([c + egui::vec2(-5.0, 0.0), c + egui::vec2(5.0, 0.0)], st);
+                    }
+                    1 => {
+                        if maximized {
+                            pt.rect_stroke(egui::Rect::from_center_size(c + egui::vec2(-1.0, 1.0), egui::vec2(8.0, 8.0)), 0.0, st, egui::StrokeKind::Middle);
+                            pt.line_segment([c + egui::vec2(-1.0, -4.0), c + egui::vec2(5.0, -4.0)], st);
+                            pt.line_segment([c + egui::vec2(5.0, -4.0), c + egui::vec2(5.0, 2.0)], st);
+                        } else {
+                            pt.rect_stroke(egui::Rect::from_center_size(c, egui::vec2(9.0, 9.0)), 0.0, st, egui::StrokeKind::Middle);
+                        }
+                    }
+                    _ => {
+                        pt.line_segment([c + egui::vec2(-5.0, -5.0), c + egui::vec2(5.0, 5.0)], st);
+                        pt.line_segment([c + egui::vec2(-5.0, 5.0), c + egui::vec2(5.0, -5.0)], st);
+                    }
+                }
+                if resp.clicked() {
+                    match kind {
+                        0 => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                        1 => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized)),
+                        _ => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    }
+                }
+            }
+        });
+        if let Some(s) = self.session.as_mut() {
+            if go_back && s.nav_i > 0 {
+                s.nav_go(s.nav_i - 1);
+            }
+            if go_fwd && s.nav_i + 1 < s.nav.len() {
+                s.nav_go(s.nav_i + 1);
+            }
         }
     }
 }
@@ -3064,32 +3242,18 @@ impl App {
         }
     }
 
-    /// Atualiza a prévia da minha transmissão em segundo plano (uma captura reduzida a cada ~0,7 s).
+    /// Pega o quadro de prévia mais recente da minha transmissão (o publisher entrega ~10 por segundo).
     fn refresh_preview(&mut self, ctx: &egui::Context) {
-        let Some(src) = self.publishing_source.clone() else { return };
-        if let Some(rx) = &self.preview_rx {
-            if let Ok(res) = rx.try_recv() {
-                self.preview_rx = None;
-                if let Some(t) = res {
-                    let img = egui::ColorImage::from_rgba_unmultiplied([t.width as usize, t.height as usize], &t.rgba);
-                    match &mut self.preview_tex {
-                        Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
-                        None => self.preview_tex = Some(ctx.load_texture("my-stream-preview", img, egui::TextureOptions::LINEAR)),
-                    }
-                }
+        let Some((_, h)) = &self.publishing else { return };
+        let frame = h.preview.lock().ok().and_then(|mut g| g.take());
+        if let Some((w, hgt, rgba)) = frame {
+            let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, hgt as usize], &rgba);
+            match &mut self.preview_tex {
+                Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
+                None => self.preview_tex = Some(ctx.load_texture("my-stream-preview", img, egui::TextureOptions::LINEAR)),
             }
         }
-        if self.preview_rx.is_none() && self.preview_last.map_or(true, |t| t.elapsed() > Duration::from_millis(700)) {
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.preview_rx = Some(rx);
-            self.preview_last = Some(Instant::now());
-            let ctx2 = ctx.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(capture::thumbnail(&src, 960));
-                ctx2.request_repaint();
-            });
-        }
-        ctx.request_repaint_after(Duration::from_millis(350));
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 
     /// Visão do canal de voz: grade de participantes (16:9, linha incompleta centralizada) e barra de controles.

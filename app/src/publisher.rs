@@ -13,9 +13,31 @@ use std::{
 };
 use tungstenite::Message;
 
+/// Quadro reduzido (RGBA) do que está sendo transmitido, para a prévia da própria tela (~10 por segundo).
+pub type Preview = Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>;
+
 pub struct Handle {
     pub stop: Arc<AtomicBool>,
     pub status: Arc<Mutex<String>>,
+    pub preview: Preview,
+}
+
+/// Reduz um quadro BGRA `w`x`h` para no máximo 640 de largura (amostragem simples, ~1 ms) e vira RGBA.
+fn make_preview(frame: &[u8], w: usize, h: usize) -> Option<(u32, u32, Vec<u8>)> {
+    if w == 0 || h == 0 || frame.len() < w * h * 4 {
+        return None;
+    }
+    let step = w.div_ceil(640).max(1);
+    let (pw, ph) = (w / step, h / step);
+    let mut out = Vec::with_capacity(pw * ph * 4);
+    for y in 0..ph {
+        let row = y * step * w * 4;
+        for x in 0..pw {
+            let i = row + x * step * 4;
+            out.extend_from_slice(&[frame[i + 2], frame[i + 1], frame[i], 255]);
+        }
+    }
+    Some((pw as u32, ph as u32, out))
 }
 
 /// Qualidade pedida pelo diálogo Transmitir.
@@ -110,15 +132,16 @@ pub fn start(url: String, monitor: usize, fps: u32, kbps: u32) -> Handle {
 pub fn start_source(url: String, source: Source, q: Quality) -> Handle {
     let stop = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new("conectando…".to_string()));
-    let (s, st) = (stop.clone(), status.clone());
+    let preview: Preview = Arc::new(Mutex::new(None));
+    let (s, st, pv) = (stop.clone(), status.clone(), preview.clone());
     std::thread::spawn(move || {
-        let msg = match run(&url, &source, &q, &s, &st) {
+        let msg = match run(&url, &source, &q, &s, &st, &pv) {
             Ok(()) => "parado".to_string(),
             Err(e) => format!("erro: {e:#}"),
         };
         *st.lock().unwrap() = msg;
     });
-    Handle { stop, status }
+    Handle { stop, status, preview }
 }
 
 /// Quanto tempo uma janela pode ficar indisponível (minimizada, em outra área de
@@ -163,6 +186,7 @@ fn run(
     q: &Quality,
     stop: &AtomicBool,
     status: &Mutex<String>,
+    preview: &Preview,
 ) -> anyhow::Result<()> {
     let fps = q.fps.clamp(1, 240);
     let kbps = q.kbps;
@@ -178,16 +202,27 @@ fn run(
     let cap_stop = Arc::new(AtomicBool::new(false));
     let cs = cap_stop.clone();
     let (fail_tx, fail_rx) = std::sync::mpsc::channel::<String>();
+    let preview = preview.clone();
     let capture = std::thread::spawn(move || -> anyhow::Result<()> {
         let period = Duration::from_secs_f64(1.0 / fps as f64);
         let mut scaler = Scaler::default();
         let mut down_since: Option<Instant> = None;
+        let mut last_preview = Instant::now() - Duration::from_secs(1);
         while !cs.load(Ordering::Relaxed) {
             let tick = Instant::now();
             match grabber.grab() {
                 Ok(raw) => {
                     down_since = None;
                     let frame = make_frame(raw, base, (w as u32, h as u32), &mut scaler);
+                    // prévia da minha própria tela: um quadro reduzido a cada ~100 ms, do mesmo que vai ao encoder
+                    if last_preview.elapsed() >= Duration::from_millis(100) {
+                        last_preview = Instant::now();
+                        if let Some(p) = make_preview(&frame, w, h) {
+                            if let Ok(mut g) = preview.lock() {
+                                *g = Some(p);
+                            }
+                        }
+                    }
                     // Se o encoder ainda está ocupado, descarta o quadro.
                     let _ = tx.try_send(frame);
                 }
