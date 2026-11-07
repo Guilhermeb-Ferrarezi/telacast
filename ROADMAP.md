@@ -1,6 +1,6 @@
 # Telacast — Roadmap
 
-Clone próprio do Discord em Rust: cliente egui, servidor axum + SQLite, vídeo H.264 por NVENC.
+Clone próprio do Discord em Rust: cliente egui, servidor axum + PostgreSQL 18, vídeo H.264 por NVENC.
 Não usa a API nem os servidores do Discord. Este roadmap sai de 10 relatórios de pesquisa em
 [`docs/discord/`](docs/discord/) (01 a 10), lidos e consolidados em 2026-11-07.
 
@@ -22,6 +22,23 @@ Não usa a API nem os servidores do Discord. Este roadmap sai de 10 relatórios 
 | Interface | tema escuro estilo Discord, barra de servidores, canais, membros, login, modais |
 
 Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação, sem editar/apagar mensagem, sem reconexão automática.**
+
+## Decisões já tomadas
+
+| Tema | Decisão | Observação |
+|---|---|---|
+| Interface desktop | **egui** (descartados Tauri e iced) | Teste comparativo em `~/telacast-spike`: desempenho empatado (144 fps, ~38% de CPU, ~230 MB). O iced não tem texto selecionável nem acessibilidade; o egui tem os dois |
+| Direção visual | **Grafite**: camadas de cinza, **um acento âmbar**, linhas finas, títulos em serifa, só tema escuro | A direção "Glass/Aurora" foi testada e **rejeitada** (parece interface gerada por IA). Maquete: `docs/ui-preview/grafite.html` |
+| Fontes | **a escolher** (seletor na maquete; candidatas em `app/assets/fonts/`) | Ainda sem resposta |
+| Banco | **PostgreSQL 18**, acesso por `sqlx`, migrações embutidas | Em desenvolvimento roda no Docker (`docker-compose.dev.yml`). O SQLite foi abandonado |
+| Cache | **em memória** (`moka`), atrás de uma interface própria; Redis só se houver mais de um servidor | A confirmar |
+| IDs | snowflake em `i64` | Tabelas já usam `BIGINT` |
+| Cadastro | **fechado, só com convite** da instância (`telacast-server invite`) | O código aparece uma vez; no banco fica o hash |
+| Tokens | opacos, só o hash no banco, com validade (30 dias deslizantes) e `Logout` | |
+| Hospedagem | **VPS Oracle, Ampere A1 (ARM), 2 núcleos e 12 GB**; compilar na própria VPS | Local por enquanto (Marco A ainda não chegou) |
+| Plataformas | Desktop agora; **Android depois** (ver "Plano Android") | O protocolo JSON/WebSocket precisa ficar estável e documentado |
+| Git | repositório criado; commits sem linha de coautoria | |
+| Medições | PC do desenvolvimento: Ryzen 7 5700X (16 threads), RTX 5060 Ti, 15 GB de RAM (apertada) | O gargalo do PC é memória, não CPU |
 
 ## Mapa de dependências
 
@@ -84,7 +101,7 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 - [ ] **Respostas** com prévia e pular para a mensagem. P1 **M**
 - [ ] **"Digitando…"**, **fixadas**, mensagens de sistema (entrou/fixou). P1 **S** cada
 - [ ] **Reações** com emoji Unicode. P1 **M**
-- [ ] **Busca** com FTS5 do SQLite e filtros `from:`/`in:`/`has:`. P1 **M**
+- [ ] **Busca** com a busca de texto do Postgres (`tsvector`) e filtros `from:`/`in:`/`has:`. P1 **M**
 - [ ] **Anexos**: upload por HTTP (não pelo WebSocket), armazenamento por hash, prévia inline, arrastar-e-soltar, colar imagem. P1 **L** ([R03][R06][R09])
 - [ ] Prévia de link (cuidado com SSRF), emoji Unicode no picker. P2 **M**
 
@@ -149,6 +166,46 @@ Prioridade máxima do [R02]; moderação do [R07].
 - [ ] Botões, menus e modais — P3 **L**
 
 ---
+
+## Achados dos pareceres (`docs/review/`) que entram no plano
+
+**Reorganização da Fase 0 (R1).** Ela está inchada para um primeiro marco: dividir em **0a** (segurança + protocolo + migrações,
+leva ao Marco A) e **0b** (modelo de dados e polimento). O **runner de migrações** e os **testes automáticos** vêm primeiro
+(etapa 1, em andamento). `seq`/Resume depende dos eventos incrementais (Fase 1): fazer os dois juntos para não refazer.
+Kick/ban do dono **não dependem de cargos** e podem vir antes da Fase 3. A tela de Configurações precisa existir antes da voz.
+Faltam no plano: backup do banco, observabilidade (`tracing`) e deploy.
+
+**Bugs no código atual que o roadmap não cobria (R2).** O app apaga o token e faz logout quando o servidor cai (deveria
+reconectar); o espectador que entra no meio pode receber quadros sem referência; `Send` falha em silêncio; a thread de captura
+vaza ao parar; "não lido" existe só em memória. O cliente ainda não fala `wss://` (o `tungstenite` está sem TLS e o timeout de
+leitura só vale para conexão sem TLS). O número de 231 fps do NVENC veio de um teste com quadro parado e **não vale**.
+
+**Segurança nova (R3).** Uma amizade pendente já libera DM, e a DM não tem como ser fechada; o decoder do cliente não limita a
+resolução; o relay de vídeo podia usar até 512 MiB por sala (**já reduzido para 64 MiB** na etapa 1b). Pontos a cuidar nas
+correções: limite de taxa por IP atrás do Caddy (**tratado**: lê `X-Forwarded-For` só de conexão local), teto de `spawn_blocking`
+(**tratado**: semáforo), revogar token sem derrubar sockets abertos, o Caddy logar `?token=` antes do ticket de vídeo existir,
+e o convite de servidor ainda visível a todos os membros.
+
+**Viabilidade técnica (R5).** O crate `opus` compila a libopus sozinho (cmake e gcc já instalados): decisão do Opus resolvida.
+Descartar `webrtc-audio-processing` (pede meson e ninja), `single-instance` (parado desde 2021) e `audiopus_sys`. Bandeja com
+`ksni` (Rust puro). Mídia de voz numa conexão WebSocket própria, separada do vídeo; trocar para UDP depois é realista se o formato
+do quadro for fixado já na versão WebSocket. Maior risco do egui: lista de altura variável e texto rico com elementos inline.
+
+**Fatos do Discord (R4).** Cerca de 60 itens conferidos; cinco números estavam errados (voz base 96 kbps, não 64; exclusão de
+conta 15 dias, não 14; upload de 20 MB sem Nitro; Comunidade não exige 2FA de moderadores; Stage com vídeo 50/150/300).
+Nenhum número errado entrou neste roadmap.
+
+**Decodificação na placa (NVDEC) rebaixada:** com um Ryzen 7 5700X, decodificar 1080p a 60 fps por software cabe num núcleo.
+Fica relevante só para 4K ou 144 fps.
+
+## Plano Android (depois do desktop)
+
+Caminho recomendado: **app nativo Kotlin + Jetpack Compose**, falando o mesmo protocolo (captura por `MediaProjection`, vídeo
+por `MediaCodec`). Alternativa: egui no Android com JNI (uma linguagem só, experiência mais crua no celular). Tauri descartado
+para o desktop por causa do vídeo no WebKitGTK.
+Exigências para o servidor, já na Fase 0: **TLS obrigatório** (o Android bloqueia `ws://`), protocolo **versionado e
+documentado**, token por dispositivo, e **notificações push** (Firebase ou serviço próprio). Escopo a definir: só chat e assistir,
+ou também transmitir a tela do celular. Precisa de Android Studio, SDK e NDK.
 
 ## Fora do escopo (decisão: não fazer por enquanto)
 
