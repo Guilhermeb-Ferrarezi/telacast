@@ -1,0 +1,21 @@
+{
+  "Message": {
+    "id": 112624001234567890,
+    "channel_id": 112623700000000012,
+    "author_id": 112623612862660617,
+    "author": "marina.souza",
+    "content": "Mensagem de um servidor mais novo",
+    "ts": 1762512345678,
+    "edited": false,
+    "reply": { "id": 112624001234567800, "author": "joao_pedro", "content": "original", "avatar": "abc" },
+    "nonce": 0,
+    "reactions": [],
+    "kind": 0,
+    "pinned": false,
+    "attachments": [
+      { "id": 112624005550000001, "name": "mapa.png", "mime": "image/png", "size": 100, "width": 10, "height": 10, "blurhash": "LEHV6nWB2yk8" }
+    ],
+    "thread_id": 5,
+    "campo_futuro": { "qualquer": ["coisa", 1, null] }
+  }
+}

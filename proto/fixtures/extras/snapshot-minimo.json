@@ -1,0 +1,29 @@
+{
+  "Snapshot": {
+    "me": { "id": 112623612862660608, "name": "guilherme", "online": true },
+    "servers": [
+      {
+        "id": 112623700000000001,
+        "name": "Turma",
+        "owner": 112623612862660608,
+        "invite": "B4NZ-7TQK",
+        "channels": [
+          { "id": 112623700000000012, "name": "geral", "kind": 0, "parent": null, "position": 0, "last_message_id": 0, "last_read_id": 0 }
+        ],
+        "members": [
+          { "id": 112623612862660608, "name": "guilherme", "online": true }
+        ]
+      }
+    ],
+    "friends": [],
+    "dms": [
+      {
+        "channel_id": 112623800000000001,
+        "user": { "id": 112623612862660617, "name": "marina.souza", "online": false },
+        "last_message_id": 0,
+        "last_read_id": 0
+      }
+    ],
+    "live": []
+  }
+}

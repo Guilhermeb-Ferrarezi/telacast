@@ -1,0 +1,11 @@
+{
+  "Snapshot": {
+    "me": { "id": 112623612862660608, "name": "guilherme", "online": true },
+    "servers": [],
+    "friends": [
+      { "user": { "id": 112623612862660617, "name": "marina.souza", "online": true }, "status": "Blocked" }
+    ],
+    "dms": [],
+    "live": []
+  }
+}
