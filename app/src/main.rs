@@ -2515,7 +2515,14 @@ impl App {
             )
             .show(ui, |ui| {
                 if self.fullscreen {
-                    self.stream_area(ui, ctx, s, &mut acts, true);
+                    if self.watching.is_some() {
+                        self.stream_area(ui, ctx, s, &mut acts, true);
+                    } else if self.publishing.is_some() {
+                        self.preview_fullscreen(ui, ctx, s, &mut acts);
+                    } else {
+                        // nada para mostrar (a transmissão acabou): sai da tela cheia
+                        acts.push(Act::Fullscreen);
+                    }
                 } else {
                     self.center(ui, ctx, s, &mut acts);
                 }
@@ -3466,6 +3473,9 @@ impl App {
                     None => {
                         pt.text(sr.center(), Align2::CENTER_CENTER, "Preparando a prévia…", egui::FontId::proportional(15.0), MUTED);
                     }
+                }
+                if ui.interact(sr, egui::Id::new("my-preview"), egui::Sense::click()).double_clicked() {
+                    acts.push(Act::Fullscreen);
                 }
                 self.video_overlay(ui, ctx, &*s, sr, mv.channel_id, true, acts);
             }
@@ -4755,6 +4765,36 @@ impl App {
     }
 
     // ---- vídeo da transmissão
+    /// Tela cheia enquanto só eu transmito. Mostrar a própria tela ao vivo aqui vira um espelho infinito (a janela
+    /// que está sendo capturada exibe a prévia dela mesma e tudo converge para preto), então, como o Discord,
+    /// mostramos o cartão "Sua transmissão ainda está ligada!" com as métricas do encoder.
+    fn preview_fullscreen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &Session, acts: &mut Vec<Act>) {
+        let Some((ch, h)) = &self.publishing else { return };
+        let ch = *ch;
+        let status = h.status.lock().map(|g| g.clone()).unwrap_or_default();
+        let (rect, resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+        let pt = ui.painter();
+        pt.rect_filled(rect, 0.0, Color32::BLACK);
+        pt.text(rect.center() - egui::vec2(0.0, 22.0), Align2::CENTER_CENTER, "Sua transmissão ainda está ligada!", egui::FontId::proportional(22.0), TEXT);
+        pt.text(
+            rect.center() + egui::vec2(0.0, 8.0),
+            Align2::CENTER_CENTER,
+            "Pausamos esta prévia para preservar seus recursos (mostrar a tela inteira dentro dela mesma só gera um espelho).",
+            egui::FontId::proportional(13.0),
+            MUTED,
+        );
+        pt.text(rect.center() + egui::vec2(0.0, 36.0), Align2::CENTER_CENTER, status, egui::FontId::monospace(12.5), alpha(AMBER, 0.9));
+        let btn = egui::Rect::from_center_size(rect.center() + egui::vec2(0.0, 80.0), egui::vec2(170.0, 34.0));
+        if ui.put(btn, egui::Button::new("Sair da tela cheia")).clicked() {
+            acts.push(Act::Fullscreen);
+        }
+        if resp.double_clicked() {
+            acts.push(Act::Fullscreen);
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
+        self.video_overlay(ui, ctx, s, rect, ch, true, acts);
+    }
+
     /// Controles sobre o vídeo (assistindo ou a minha prévia): barras que somem após 1,8 s sem mexer o mouse,
     /// com título, quem transmite, espectadores, tela cheia, engrenagem (só a minha) e parar.
     #[allow(clippy::too_many_arguments)]
