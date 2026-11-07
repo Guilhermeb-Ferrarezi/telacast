@@ -1,0 +1,26 @@
+# Postgres 18 para desenvolvimento local. Escuta só em 127.0.0.1.
+# Subir:   sudo docker compose -f docker-compose.dev.yml up -d
+# Parar:   sudo docker compose -f docker-compose.dev.yml down
+# Apagar os dados de teste:  ... down -v
+services:
+  postgres:
+    image: postgres:18
+    container_name: telacast-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: telacast
+      POSTGRES_PASSWORD: telacast_dev   # só para desenvolvimento local
+      POSTGRES_DB: telacast
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # Postgres 18: o volume monta em /var/lib/postgresql (não em .../data como nas versões antigas)
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telacast -d telacast"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

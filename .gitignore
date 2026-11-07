@@ -10,3 +10,6 @@
 # arquivos locais do editor e do sistema
 .DS_Store
 *.swp
+
+# segredos locais
+.env
