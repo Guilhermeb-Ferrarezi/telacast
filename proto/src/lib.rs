@@ -123,6 +123,14 @@ pub struct Reply {
     pub content: String,
 }
 
+/// Reações de um emoji numa mensagem: quantas pessoas e se você é uma delas.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Reaction {
+    pub emoji: String,
+    pub count: u32,
+    pub me: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Message {
     pub id: i64,
@@ -138,6 +146,9 @@ pub struct Message {
     /// a mensagem provisória pela definitiva.
     #[serde(default)]
     pub nonce: u64,
+    /// Só vem preenchido no histórico e na busca; reações novas chegam por `S2C::Reaction`.
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
 }
 
 /// Um resultado de busca: a mensagem e onde ela está.
@@ -180,6 +191,8 @@ pub enum C2S {
         text: String,
         before: Option<i64>,
     },
+    /// Reage (ou tira a reação) com um emoji. Repetir não muda nada.
+    React { message_id: i64, emoji: String, add: bool },
     /// Marca o canal como lido até `message_id`.
     Ack { channel_id: i64, message_id: i64 },
     /// "Está digitando…" (reenviar a cada poucos segundos).
@@ -206,6 +219,8 @@ pub enum S2C {
     History { channel_id: i64, messages: Vec<Message> },
     /// Resultado de `Search` (mais novos primeiro); `more` indica que há outra página.
     SearchResults { nonce: u64, hits: Vec<SearchHit>, more: bool },
+    /// Alguém reagiu (`add`) ou tirou a reação.
+    Reaction { channel_id: i64, message_id: i64, emoji: String, user_id: i64, add: bool },
     MessageEdited { channel_id: i64, message_id: i64, content: String },
     MessageDeleted { channel_id: i64, message_id: i64 },
     Typing { channel_id: i64, user_id: i64 },

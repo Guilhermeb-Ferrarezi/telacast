@@ -82,6 +82,8 @@ enum Act {
     ToggleSpoiler(i64, u32),
     SetStatus(p::Status),
     Search(bool),
+    React { message: i64, emoji: String, add: bool },
+    OpenPicker(i64, egui::Pos2),
     Goto { channel: i64, id: i64 },
     CloseSearch,
     StartEdit(i64, String),
@@ -145,6 +147,8 @@ struct Session {
     /// Canais e DMs visitados, o mais recente primeiro.
     recent: Vec<i64>,
     search: Option<SearchState>,
+    /// Seletor de emoji aberto para uma mensagem: (id, posição na tela).
+    picker: Option<(i64, egui::Pos2)>,
     /// Ir até uma mensagem assim que o histórico do canal carregar: (canal, id).
     pending_goto: Option<(i64, i64)>,
     /// Divisor "novas mensagens": (canal, último id lido ao abrir, já rolei até ele).
@@ -197,6 +201,7 @@ impl Pending {
             edited: false,
             reply: self.reply.clone(),
             nonce: self.nonce,
+            reactions: Vec::new(),
         }
     }
 }
@@ -245,6 +250,7 @@ impl Session {
             visits: HashMap::new(),
             recent: Vec::new(),
             search: None,
+            picker: None,
             pending_goto: None,
             marker: None,
             older: HashSet::new(),
@@ -553,6 +559,30 @@ impl Session {
                                 st.more = more;
                                 st.loading = false;
                                 st.searched = true;
+                            }
+                        }
+                    }
+                    S2C::Reaction { channel_id, message_id, emoji, user_id, add } => {
+                        let mine = user_id == self.me.id;
+                        if let Some(msg) = self.msgs.get_mut(&channel_id).and_then(|v| v.iter_mut().find(|m| m.id == message_id)) {
+                            match msg.reactions.iter().position(|r| r.emoji == emoji) {
+                                Some(i) => {
+                                    let r = &mut msg.reactions[i];
+                                    if add {
+                                        r.count += 1;
+                                        r.me |= mine;
+                                    } else {
+                                        r.count = r.count.saturating_sub(1);
+                                        if mine {
+                                            r.me = false;
+                                        }
+                                        if r.count == 0 {
+                                            msg.reactions.remove(i);
+                                        }
+                                    }
+                                }
+                                None if add => msg.reactions.push(p::Reaction { emoji, count: 1, me: mine }),
+                                None => {}
                             }
                         }
                     }
@@ -1082,6 +1112,46 @@ impl App {
                     self.center(ui, ctx, s, &mut acts);
                 }
             });
+        if let Some((msg, pos)) = s.picker {
+            const EMOJIS: [&str; 48] = [
+                "👍", "👎", "😀", "😂", "😅", "😍", "😘", "🤔", "😮", "😢", "😡", "😎", "🙌", "👏", "🙏", "💪", "👀", "🎉", "🔥", "💯",
+                "✅", "❌", "⭐", "🚀", "💡", "🎮", "🍕", "☕", "🏆", "❤", "💔", "✨", "🎶", "🤝", "🤷", "👋", "😴", "🤯", "🥳", "😬",
+                "🍻", "🎂", "📌", "⚡", "🌙", "☀", "🐱", "🐶",
+            ];
+            let m = egui::Modal::new(egui::Id::new("emoji-picker"))
+                .backdrop_color(Color32::TRANSPARENT)
+                .area(
+                    egui::Area::new(egui::Id::new("emoji-picker"))
+                        .kind(egui::UiKind::Modal)
+                        .sense(egui::Sense::hover())
+                        .order(egui::Order::Foreground)
+                        .interactable(true)
+                        .fixed_pos(pos),
+                )
+                .frame(glass(10).inner_margin(egui::Margin::same(8)))
+                .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                    for row in EMOJIS.chunks(8) {
+                        ui.horizontal(|ui| {
+                            for e in row {
+                                let (r, resp) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::click());
+                                if resp.hovered() {
+                                    ui.painter().rect_filled(r, 8.0, L4);
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                ui.painter().text(r.center(), Align2::CENTER_CENTER, *e, egui::FontId::proportional(20.0), TEXT);
+                                if resp.clicked() {
+                                    acts.push(Act::React { message: msg, emoji: e.to_string(), add: true });
+                                    s.picker = None;
+                                }
+                            }
+                        });
+                    }
+                });
+            if m.should_close() {
+                s.picker = None;
+            }
+        }
         if let Some(q) = &mut self.qs {
             match quick::show(ctx, q, s) {
                 quick::Out::Stay => {}
@@ -1120,6 +1190,8 @@ impl App {
                     }
                 }
                 Act::CloseSearch => s.search = None,
+                Act::React { message, emoji, add } => s.gw.send(C2S::React { message_id: message, emoji, add }),
+                Act::OpenPicker(id, pos) => s.picker = Some((id, pos)),
                 Act::Goto { channel, id } => {
                     let server = s.snap.servers.iter().find(|sv| sv.channels.iter().any(|c| c.id == channel)).map(|sv| sv.id);
                     let already = s.current_channel() == Some(channel);
@@ -1889,6 +1961,10 @@ impl App {
                                 acts.push(Act::Reply(ch, reply_ref.clone()));
                                 ui.close();
                             }
+                            if ui.button("Reagir").clicked() {
+                                acts.push(Act::OpenPicker(m.id, ui.ctx().pointer_latest_pos().unwrap_or_default()));
+                                ui.close();
+                            }
                             if mine && ui.button("Editar mensagem").clicked() {
                                 acts.push(Act::StartEdit(m.id, m.content.clone()));
                                 ui.close();
@@ -1988,6 +2064,22 @@ impl App {
                                     }
                                 }
                             }
+                            if !m.reactions.is_empty() && !is_pending {
+                                ui.add_space(2.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                                    for r in &m.reactions {
+                                        let resp = reaction_chip(ui, &r.emoji, Some(r.count), r.me);
+                                        if resp.clicked() {
+                                            acts.push(Act::React { message: m.id, emoji: r.emoji.clone(), add: !r.me });
+                                        }
+                                    }
+                                    let plus = reaction_chip(ui, "+", None, false);
+                                    if plus.clicked() {
+                                        acts.push(Act::OpenPicker(m.id, plus.rect.left_bottom()));
+                                    }
+                                });
+                            }
                             if let Some((nonce, waited)) = pend {
                                 ui.horizontal(|ui| {
                                     if !link_up {
@@ -2049,7 +2141,7 @@ impl App {
                             );
                         }
                         // barra de ações, desenhada sem ocupar espaço no layout
-                        let mut items: Vec<(&str, u8)> = vec![("Responder", 0)];
+                        let mut items: Vec<(&str, u8)> = vec![("Responder", 0), ("Reagir", 4)];
                         if mine {
                             items.push(("Editar", 1));
                         }
@@ -2088,6 +2180,7 @@ impl App {
                                     0 => Act::Reply(ch, reply_ref.clone()),
                                     1 => Act::StartEdit(m.id, m.content.clone()),
                                     2 => Act::AskDelete(m.id, m.content.clone()),
+                                    4 => Act::OpenPicker(m.id, egui::pos2(r.left(), bar.bottom() + 4.0)),
                                     _ => Act::Copy(m.content.clone()),
                                 });
                             }

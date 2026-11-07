@@ -103,7 +103,7 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 - [~] **Menções**: destaque e contagem prontos; o campo de mensagem troca `@nome` (nome exato de quem está no canal) por `<@id>` ao enviar. **Falta** o autocomplete (popup ao digitar `@`) e `#canal`. P1 **M**
 - [x] **Respostas** com prévia e pular para a mensagem. P1 **M**
 - [~] **"Digitando…"** (pronto), **fixadas**, mensagens de sistema (entrou/fixou). P1 **S** cada
-- [ ] **Reações** com emoji Unicode. P1 **M**
+- [x] **Reações** com emoji Unicode: chips sob a mensagem (contagem, destaque se você reagiu, clique alterna), botão "Reagir" na barra de ações e no menu do botão direito, seletor com 48 emojis, evento em tempo real, contagem agregada no histórico e na busca, limite de 20 emojis por mensagem. **Falta** a dica com os nomes de quem reagiu. P1 **M**
 - [~] **Busca de mensagens** (Ctrl+F): texto completo do Postgres em português (índice GIN, radicais: "jogar" acha "jogo"), escopo servidor ou canal, filtros `de:nome`/`de:eu` e `em:#canal`, 25 por página com "Mostrar mais", clicar no resultado abre o canal e salta até a mensagem (busca páginas antigas). **Faltam** `tem:`/datas/`fixadas:`, destaque dos termos e ordenar. P1 **M**
 - [ ] **Anexos**: upload por HTTP (não pelo WebSocket), armazenamento por hash, prévia inline, arrastar-e-soltar, colar imagem. P1 **L** ([R03][R06][R09])
 - [ ] Prévia de link (cuidado com SSRF), emoji Unicode no picker. P2 **M**

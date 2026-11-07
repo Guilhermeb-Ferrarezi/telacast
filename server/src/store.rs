@@ -2,7 +2,7 @@
 use crate::ids::ts_ms;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
-use telacast_proto::{Message, Reply};
+use telacast_proto::{Message, Reaction, Reply};
 
 pub type R<T> = Result<T, sqlx::Error>;
 
@@ -344,6 +344,7 @@ impl Store {
             edited: false,
             reply,
             nonce: 0,
+            reactions: Vec::new(),
         }))
     }
 
@@ -398,6 +399,62 @@ impl Store {
         Ok(())
     }
 
+    /// Preenche `reactions` das mensagens (contagem por emoji, na ordem em que surgiram).
+    pub async fn attach_reactions(&self, msgs: &mut [Message], me: i64) -> R<()> {
+        if msgs.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+        let rows: Vec<(i64, String, i64, bool)> = sqlx::query_as(
+            "SELECT message_id, emoji, count(*), bool_or(user_id = $2)
+             FROM message_reactions WHERE message_id = ANY($1)
+             GROUP BY message_id, emoji ORDER BY message_id, min(created_at)",
+        )
+        .bind(&ids)
+        .bind(me)
+        .fetch_all(&self.pool)
+        .await?;
+        for (mid, emoji, count, mine) in rows {
+            if let Some(m) = msgs.iter_mut().find(|m| m.id == mid) {
+                m.reactions.push(Reaction { emoji, count: count as u32, me: mine });
+            }
+        }
+        Ok(())
+    }
+
+    /// Canal da mensagem.
+    pub async fn message_channel(&self, id: i64) -> R<Option<i64>> {
+        let r: Option<(i64,)> = sqlx::query_as("SELECT channel_id FROM messages WHERE id = $1").bind(id).fetch_optional(&self.pool).await?;
+        Ok(r.map(|x| x.0))
+    }
+
+    /// Reage ou tira a reação. `true` se algo mudou. No máximo 20 emojis diferentes por mensagem.
+    pub async fn set_reaction(&self, message: i64, user: i64, emoji: &str, add: bool) -> R<bool> {
+        let n = if add {
+            sqlx::query(
+                "INSERT INTO message_reactions(message_id, emoji, user_id)
+                 SELECT $1, $2, $3
+                 WHERE (SELECT count(DISTINCT emoji) FROM message_reactions WHERE message_id = $1 AND emoji <> $2) < 20
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(message)
+            .bind(emoji)
+            .bind(user)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+        } else {
+            sqlx::query("DELETE FROM message_reactions WHERE message_id = $1 AND emoji = $2 AND user_id = $3")
+                .bind(message)
+                .bind(emoji)
+                .bind(user)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+        };
+        Ok(n > 0)
+    }
+
     pub async fn is_member(&self, server: i64, user: i64) -> R<bool> {
         let r: (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM members WHERE server_id = $1 AND user_id = $2)")
             .bind(server)
@@ -416,6 +473,7 @@ impl Store {
         from: Option<i64>,
         text: &str,
         before: Option<i64>,
+        me: i64,
     ) -> R<Vec<(Message, String)>> {
         type Row = (i64, i64, String, i64, String, String, bool);
         let rows: Vec<Row> = sqlx::query_as(
@@ -436,15 +494,21 @@ impl Store {
         .bind(before)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
+        let mut out: Vec<(Message, String)> = rows
             .into_iter()
             .map(|(id, channel_id, channel_name, author_id, author, content, edited)| {
                 (
-                    Message { id, channel_id, author_id, author, content, ts: ts_ms(id), edited, reply: None, nonce: 0 },
+                    Message { id, channel_id, author_id, author, content, ts: ts_ms(id), edited, reply: None, nonce: 0, reactions: Vec::new() },
                     channel_name,
                 )
             })
-            .collect())
+            .collect();
+        let mut msgs: Vec<Message> = out.iter().map(|x| x.0.clone()).collect();
+        self.attach_reactions(&mut msgs, me).await?;
+        for (o, m) in out.iter_mut().zip(msgs) {
+            o.0.reactions = m.reactions;
+        }
+        Ok(out)
     }
 
     pub async fn ack(&self, user: i64, channel: i64, message: i64) -> R<()> {
@@ -462,7 +526,7 @@ impl Store {
     }
 
     /// Até 50 mensagens anteriores a `before`, em ordem cronológica.
-    pub async fn history(&self, channel: i64, before: Option<i64>) -> R<Vec<Message>> {
+    pub async fn history(&self, channel: i64, before: Option<i64>, me: i64) -> R<Vec<Message>> {
         type Row = (i64, i64, String, String, bool, Option<i64>, Option<String>, Option<String>);
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT m.id, m.author_id, u.display_name, m.content, m.edited_at IS NOT NULL,
@@ -492,9 +556,11 @@ impl Store {
                     _ => None,
                 },
                 nonce: 0,
+                reactions: Vec::new(),
             })
             .collect();
         v.reverse();
+        self.attach_reactions(&mut v, me).await?;
         Ok(v)
     }
 

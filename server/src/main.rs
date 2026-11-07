@@ -805,7 +805,7 @@ async fn handle_authed(
             }
             let scope_channel = channel_id;
             let scope_server = if channel_id.is_some() { None } else { server_id };
-            match app.store.search(scope_channel, scope_server, from, text, before).await {
+            match app.store.search(scope_channel, scope_server, from, text, before, me).await {
                 Ok(mut rows) => {
                     let more = rows.len() > 25;
                     rows.truncate(25);
@@ -813,6 +813,35 @@ async fn handle_authed(
                     let _ = tx.send(S2C::SearchResults { nonce, hits, more });
                 }
                 Err(e) => db_err("search", e),
+            }
+        }
+        C2S::React { message_id, emoji, add } => {
+            // emoji de verdade: sem letras/números/espaços ASCII, curto (sequências com ZWJ cabem)
+            let valid = !emoji.is_empty()
+                && emoji.chars().count() <= 8
+                && emoji.len() <= 32
+                && !emoji.chars().any(|c| c.is_ascii_alphanumeric() || c.is_whitespace() || c.is_control());
+            if !valid {
+                err(ErrorCode::InvalidInput, "Emoji inválido");
+            } else if busy("react", 30, 10) {
+                err(ErrorCode::RateLimited, ERR_BUSY);
+            } else {
+                match app.store.message_channel(message_id).await {
+                    Ok(Some(channel_id)) if app.store.can_access(channel_id, me).await.unwrap_or(false) => {
+                        match app.store.set_reaction(message_id, me, &emoji, add).await {
+                            Ok(true) => {
+                                let out = S2C::Reaction { channel_id, message_id, emoji, user_id: me, add };
+                                for u in app.store.participants(channel_id).await.unwrap_or_default() {
+                                    app.send_to(u, &out);
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(e) => db_err("set_reaction", e),
+                        }
+                    }
+                    Ok(_) => err(ErrorCode::NotFound, "Mensagem não encontrada"),
+                    Err(e) => db_err("message_channel", e),
+                }
             }
         }
         C2S::SetStatus { status } => {
@@ -856,7 +885,7 @@ async fn handle_authed(
             }
         }
         C2S::History { channel_id, before } => match app.store.can_access(channel_id, me).await {
-            Ok(true) => match app.store.history(channel_id, before).await {
+            Ok(true) => match app.store.history(channel_id, before, me).await {
                 Ok(messages) => {
                     let _ = tx.send(S2C::History { channel_id, messages });
                 }

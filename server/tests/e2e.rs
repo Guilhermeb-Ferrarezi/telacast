@@ -579,3 +579,62 @@ fn busca_de_mensagens() {
     fora.send(C2S::Search { nonce: 10, channel_id: None, server_id: None, from: None, text: "x".into(), before: None });
     assert_eq!(fora.error_code().0, telacast_proto::ErrorCode::InvalidInput);
 }
+
+#[test]
+fn reacoes_com_emoji() {
+    let env = Env::start();
+    let code = env.invite(2);
+    let mut ana = env.client();
+    let (_, ana_id) = ana.register("ana", &code);
+    let mut beto = env.client();
+    let (_, beto_id) = beto.register("beto", &code);
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    let geral = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
+    beto.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
+    beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+    ana.send(C2S::Send { channel_id: geral, content: "reaja a isto".into(), reply_to: None, nonce: 0 });
+    let msg = beto.wait("a mensagem", |m| if let S2C::Message(m) = m { Some(m.clone()) } else { None });
+
+    // o beto reage; a ana recebe o evento
+    beto.send(C2S::React { message_id: msg.id, emoji: "👍".into(), add: true });
+    let ev = ana.wait("o evento de reação", |m| match m {
+        S2C::Reaction { message_id, emoji, user_id, add, .. } => Some((*message_id, emoji.clone(), *user_id, *add)),
+        _ => None,
+    });
+    assert_eq!(ev, (msg.id, "👍".to_string(), beto_id, true));
+    // repetir não gera outro evento; a ana reage com o mesmo e com outro
+    beto.send(C2S::React { message_id: msg.id, emoji: "👍".into(), add: true });
+    ana.send(C2S::React { message_id: msg.id, emoji: "👍".into(), add: true });
+    ana.send(C2S::React { message_id: msg.id, emoji: "🎉".into(), add: true });
+    std::thread::sleep(Duration::from_millis(400));
+    // o histórico agrega: 👍 x2 (e a ana está entre eles), 🎉 x1
+    ana.send(C2S::History { channel_id: geral, before: None });
+    let hist = ana.wait("o histórico", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
+    let r = &hist[0].reactions;
+    assert_eq!(r.len(), 2, "dois emojis diferentes: {r:?}");
+    assert_eq!((r[0].emoji.as_str(), r[0].count, r[0].me), ("👍", 2, true));
+    assert_eq!((r[1].emoji.as_str(), r[1].count, r[1].me), ("🎉", 1, true));
+    // para o beto, só o 👍 é dele
+    beto.send(C2S::History { channel_id: geral, before: None });
+    let h2 = beto.wait("o histórico do beto", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
+    assert_eq!((h2[0].reactions[0].me, h2[0].reactions[1].me), (true, false));
+    // tirar a reação
+    ana.send(C2S::React { message_id: msg.id, emoji: "🎉".into(), add: false });
+    let ev = beto.wait("a remoção", |m| match m {
+        S2C::Reaction { user_id, add: false, emoji, .. } => Some((*user_id, emoji.clone())),
+        _ => None,
+    });
+    assert_eq!(ev, (ana_id, "🎉".to_string()));
+    // emoji inválido e mensagem de fora
+    ana.send(C2S::React { message_id: msg.id, emoji: "a".into(), add: true });
+    assert_eq!(ana.error_code().0, telacast_proto::ErrorCode::InvalidInput);
+    let code2 = env.invite(1);
+    let mut fora = env.client();
+    fora.register("carla", &code2);
+    fora.send(C2S::React { message_id: msg.id, emoji: "👍".into(), add: true });
+    assert_eq!(fora.error_code().0, telacast_proto::ErrorCode::NotFound);
+}

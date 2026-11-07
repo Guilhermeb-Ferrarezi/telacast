@@ -52,7 +52,7 @@ Cadastro é **fechado por convite**. Senha de 8 a 128 caracteres. Não ponha sen
 - `TextEdit::frame` recebe `egui::Frame` (use `Frame::NONE`). `Id::new` está depreciado (só avisa).
 - `consume_key(NONE, Enter)` engole Shift+Enter; use `take_plain_enter` (em `main.rs`).
 - Markdown: o texto cru vai e volta do servidor; `md_view` monta um `LayoutJob` por bloco (negrito = `TextFormat.coords` com o eixo `wght`) e acha spoiler/link pelo cursor do galley. Fundo de pílula não tem raio (limite do `TextFormat.background`).
-- Sem emoji colorido por padrão; negrito de verdade só por `TextFormat.coords` com o Inter variável.
+- Emoji: a maioria sai colorida no egui 0.37 deste projeto (conferido no seletor de reações), mas alguns (👍 👎 ❤ ⭐ ☕) saem monocromáticos; o app não escolhe fonte de emoji. Sem emoji colorido garantido; negrito de verdade só por `TextFormat.coords` com o Inter variável.
 - Lista de mensagens: `ScrollArea` com `stick_to_bottom`; o servidor devolve 50 por página (`History{before}`). Ao prepender páginas antigas a rolagem é mantida por uma âncora (id e posição da primeira mensagem) + `scroll_with_delta_animation(.., ScrollAnimation::none())`; durante um salto (`jump`/`jump_wanted`) a âncora é desligada.
 
 ## Modelo de canais (já no banco)

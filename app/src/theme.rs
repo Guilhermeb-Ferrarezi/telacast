@@ -416,6 +416,30 @@ pub fn list_row(ui: &mut Ui, selected: bool, add: impl FnOnce(&mut Ui)) -> Respo
     resp
 }
 
+// ---- reações
+
+/// Chip de reação: emoji e contagem. `me` = você reagiu (borda e fundo âmbar).
+pub fn reaction_chip(ui: &mut Ui, emoji: &str, count: Option<u32>, me: bool) -> Response {
+    let p = ui.painter();
+    let ge = p.layout_no_wrap(emoji.to_string(), FontId::proportional(15.0), TEXT);
+    let gc = count.map(|c| p.layout_no_wrap(c.to_string(), FontId::proportional(12.5), if me { AMBER } else { TEXT2 }));
+    let w = 10.0 + ge.size().x + gc.as_ref().map_or(0.0, |g| 6.0 + g.size().x) + 10.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(w.max(30.0), 24.0), Sense::click());
+    let hot = anim(ui, resp.id, resp.hovered(), 0.1);
+    let (fill, line) = if me { (alpha(AMBER, 0.12), AMBER) } else { (lerp(L3, L4, hot), lerp(LINE2, MUTED, hot)) };
+    let p = ui.painter();
+    p.rect_filled(rect, 8.0, fill);
+    p.rect_stroke(rect, 8.0, Stroke::new(1.0, line), StrokeKind::Inside);
+    let mut x = rect.left() + 10.0;
+    p.galley(egui::pos2(x, rect.center().y - ge.size().y / 2.0), ge.clone(), TEXT);
+    x += ge.size().x + 6.0;
+    if let Some(g) = gc {
+        p.galley(egui::pos2(x, rect.center().y - g.size().y / 2.0), g, TEXT);
+    }
+    hand(ui, &resp);
+    resp
+}
+
 // ---- modais
 
 /// Modal padrão (`egui::Modal`: bloqueia o que está por baixo): fundo escurecido, clique fora e Esc fecham,
