@@ -127,6 +127,14 @@ struct Session {
     jump: Option<Jump>,
     pending: Vec<Pending>,
     nonce_seq: u64,
+    /// Canais com uma página de mensagens antigas a caminho.
+    older: HashSet<i64>,
+    /// Canais que ainda têm mensagens mais antigas no servidor (a última página veio cheia).
+    has_more: HashMap<i64, bool>,
+    /// Saltando até uma mensagem antiga: (canal, id procurado, páginas que ainda posso buscar).
+    jump_wanted: Option<(i64, i64, u8)>,
+    /// (canal, id e posição na tela da primeira mensagem da lista), para manter a rolagem ao carregar antigas.
+    anchor: Option<(i64, i64, f32)>,
 }
 
 /// Mensagem enviada que o servidor ainda não confirmou (aparece apagada na lista).
@@ -194,6 +202,10 @@ impl Session {
             jump: None,
             pending: Vec::new(),
             nonce_seq: 0,
+            older: HashSet::new(),
+            has_more: HashMap::new(),
+            jump_wanted: None,
+            anchor: None,
         }
     }
 
@@ -260,6 +272,16 @@ impl Session {
             self.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce });
         }
         self.pending.push(pend);
+    }
+
+    /// Pede a página de mensagens anteriores à mais antiga já carregada.
+    fn load_older(&mut self, ch: i64) {
+        if self.older.contains(&ch) || self.has_more.get(&ch) != Some(&true) {
+            return;
+        }
+        let Some(oldest) = self.msgs.get(&ch).and_then(|v| v.iter().find(|m| m.id > 0)).map(|m| m.id) else { return };
+        self.older.insert(ch);
+        self.gw.send(C2S::History { channel_id: ch, before: Some(oldest) });
     }
 
     fn resend_pending(&mut self) {
@@ -429,7 +451,34 @@ impl Session {
                     S2C::Typing { channel_id, user_id } => {
                         self.typing.insert((channel_id, user_id), Instant::now());
                     }
+                    S2C::History { channel_id, messages } if self.older.remove(&channel_id) => {
+                        // página mais antiga: entra na frente, sem repetir ids
+                        let page = messages.len();
+                        let cur = self.msgs.entry(channel_id).or_default();
+                        let have: HashSet<i64> = cur.iter().map(|m| m.id).collect();
+                        let mut front: Vec<p::Message> = messages.into_iter().filter(|m| !have.contains(&m.id)).collect();
+                        front.append(cur);
+                        *cur = front;
+                        self.has_more.insert(channel_id, page >= 50);
+                        // estava procurando uma mensagem antiga (resposta a algo fora da tela)?
+                        if let Some((jch, id, pages)) = self.jump_wanted {
+                            if jch == channel_id {
+                                let found = self.msgs.get(&jch).is_some_and(|v| v.iter().any(|m| m.id == id));
+                                if found {
+                                    self.jump = Some(Jump { id, since: Instant::now(), scrolled: false });
+                                    self.jump_wanted = None;
+                                } else if pages > 0 && page >= 50 {
+                                    self.jump_wanted = Some((jch, id, pages - 1));
+                                    self.load_older(jch);
+                                } else {
+                                    self.jump_wanted = None;
+                                    self.toast = Some(("Não achei a mensagem original; ela é muito antiga".into(), Instant::now()));
+                                }
+                            }
+                        }
+                    }
                     S2C::History { channel_id, messages } => {
+                        self.has_more.insert(channel_id, messages.len() >= 50);
                         let mut v = messages;
                         let me = self.me.clone();
                         for p in self.pending.iter().filter(|p| p.ch == channel_id) {
@@ -824,8 +873,12 @@ impl App {
                         .is_some_and(|v| v.iter().any(|m| m.id == id));
                     if found {
                         s.jump = Some(Jump { id, since: Instant::now(), scrolled: false });
+                    } else if let Some(ch) = s.current_channel().filter(|c| s.has_more.get(c) == Some(&true)) {
+                        // vai buscando páginas antigas até achar (no máximo 10, ou 500 mensagens)
+                        s.jump_wanted = Some((ch, id, 10));
+                        s.load_older(ch);
                     } else {
-                        s.toast = Some(("A mensagem original é antiga e ainda não foi carregada".into(), Instant::now()));
+                        s.toast = Some(("A mensagem original não está mais disponível".into(), Instant::now()));
                     }
                 }
                 Act::StartEdit(id, text) => s.editing = Some((id, text)),
@@ -1274,12 +1327,14 @@ impl App {
         let replying_here = matches!(&s.replying, Some((c, _)) if *c == ch);
         let input_h = 82.0 + 22.0 + if replying_here { 38.0 } else { 0.0 };
         let h = (ui.available_height() - input_h).max(60.0);
-        egui::ScrollArea::vertical()
+        let prev_anchor = s.anchor.take().filter(|a| a.0 == ch);
+        let scroll = egui::ScrollArea::vertical()
             .id_salt(("chat", ch))
             .max_height(h)
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
+                let mut new_anchor: Option<(i64, i64, f32)> = None;
                 let empty = Vec::new();
                 let msgs = s.msgs.get(&ch).unwrap_or(&empty);
                 if msgs.is_empty() {
@@ -1436,6 +1491,19 @@ impl App {
                         });
                     });
                     let rc = row.response.rect;
+                    // mantém a mesma mensagem no lugar quando páginas antigas entram na frente
+                    if i == 0 {
+                        new_anchor = Some((ch, m.id, rc.top()));
+                    }
+                    if let Some((_, aid, atop)) = prev_anchor {
+                        // durante um salto a rolagem é decidida pelo próprio salto
+                        if i > 0 && m.id == aid && s.jump.is_none() && s.jump_wanted.is_none() {
+                            let delta = rc.top() - atop;
+                            if delta.abs() > 0.5 {
+                                ui.scroll_with_delta_animation(egui::vec2(0.0, -delta), egui::style::ScrollAnimation::none());
+                            }
+                        }
+                    }
                     let full = egui::Rect::from_min_max(
                         egui::pos2(ui.max_rect().left() - 28.0, rc.top()),
                         egui::pos2(ui.max_rect().right() + 28.0, rc.bottom() + 0.5),
@@ -1509,7 +1577,12 @@ impl App {
                     }
                     ui.add_space(if grouped { 1.0 } else { 8.0 });
                 }
+                s.anchor = new_anchor;
             });
+        // chegou perto do topo: busca as mensagens mais antigas
+        if scroll.state.offset().y < 150.0 {
+            s.load_older(ch);
+        }
 
         if s.jump.as_ref().is_some_and(|j| j.since.elapsed() > Duration::from_millis(1800)) {
             s.jump = None;

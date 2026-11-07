@@ -18,13 +18,13 @@ Atualizado em 2026-11-07 (marcas: `[x]` pronto, `[~]` parcial, `[ ]` pendente).
 |---|---|
 | Contas | cadastro **só com convite**, login (argon2 fora da thread principal, hash falso para usuário inexistente), token só com hash e validade deslizante de 30 dias, `Logout`, limite de tentativas, sessão salva no app |
 | Servidores | criar, convite por código (128 bits), entrar; **categorias recolhíveis** e canais de texto (só o dono cria), membros online/offline |
-| Chat | tempo real; **responder** (clicar na resposta salta até a original), **editar** ("(editado)"), **apagar** (autor ou dono), **não lido guardado no servidor** (`Ack`), **"digitando…"**, agrupamento, divisor de dia, hora ao passar o mouse, texto selecionável, menu do botão direito. Histórico: só as últimas 50 |
+| Chat | tempo real; **responder** (clicar na resposta salta até a original), **editar** ("(editado)"), **apagar** (autor ou dono), **não lido guardado no servidor** (`Ack`), **"digitando…"**, agrupamento, divisor de dia, hora ao passar o mouse, texto selecionável, menu do botão direito. Histórico: 50 por página, carrega mais ao rolar para cima |
 | Social | amigos (pedir/aceitar/remover), DMs 1:1, presença online/offline |
 | Vídeo | transmissão de tela por canal: captura X11, NVENC, relay por WebSocket, fallback openh264 |
 | Interface | tema **Grafite** (camadas de cinza, âmbar, serifa), barra de servidores com pílula 8/20/40 e sigla, cabeçalho do servidor com menu, canais com categorias, painel de membros, login, modais, barra de ações no hover |
 | Infra | Postgres 18, ids snowflake `i64`, migrações embutidas, **heartbeat e reconexão automática**, testes unitários e **3 e2e** (fluxo completo, limite de login, responder/editar/apagar/ler) |
 
-Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação, sem Markdown, sem paginação de histórico, sem anexos, sem busca.**
+Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação, sem Markdown, sem anexos, sem busca.**
 
 ## Decisões já tomadas
 
@@ -96,7 +96,7 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 
 - [~] **Eventos incrementais** (feitos: `MessageEdited`, `MessageDeleted`, `Typing`; o resto ainda vem por `Snapshot`) no lugar do Snapshot completo (`MessageUpdate/Delete`, `ChannelCreate…`, `MemberAdd…`, `PresenceUpdate`), começando por presença e mensagens; manter `RequestSnapshot` como válvula. P2 do [R06], mas **[minha decisão]: já aqui**, porque editar/apagar precisam de eventos e o Snapshot atual amplifica carga ([R07] #12). **L**
 - [x] **Editar e excluir** as próprias mensagens, com "(editado)". P0 **S** ([R03])
-- [ ] **Paginação ao rolar** (`before`) e `after`/`around`. P0 **S**
+- [~] **Paginação ao rolar** (`before`): feita no app (chega perto do topo e busca 50 mensagens mais antigas, mantendo a rolagem no lugar) e o salto até uma resposta antiga busca páginas (até 500 mensagens) até achar. **Falta** `after`/`around` e rolar para baixo depois de um salto. P0 **S**
 - [~] **Não lidos de verdade** (feito: `read_state` + `Ack` + barra e pílula; **falta** contagem de menções e o divisor "novas mensagens"): `last_read` no servidor, contagem de menções, divisor "novas mensagens". P0 **M** ([R03][R05][R10])
 - [ ] **Markdown básico** (negrito, itálico, código, bloco, citação, link, spoiler). P0 **M–L** (parser + layout rico em egui)
 - [~] **Base de UI** (feitos: tokens, menu de contexto, barra de ações no hover, confirmação ao apagar; **falta** padronizar modais com Esc/clique fora): tokens de tema, modal padronizado (Esc/clique fora/confirmação destrutiva), **menus de contexto**, **barra de ações ao passar o mouse**. P0 **M** ([R10])

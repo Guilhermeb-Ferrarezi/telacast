@@ -49,7 +49,7 @@ Cadastro é **fechado por convite**. Senha de 8 a 128 caracteres. Não ponha sen
 - `TextEdit::frame` recebe `egui::Frame` (use `Frame::NONE`). `Id::new` está depreciado (só avisa).
 - `consume_key(NONE, Enter)` engole Shift+Enter; use `take_plain_enter` (em `main.rs`).
 - Sem emoji colorido por padrão; negrito de verdade só por `TextFormat.coords` com o Inter variável.
-- Lista de mensagens: `ScrollArea` com `stick_to_bottom`; o servidor só devolve as últimas 50 (paginação por `History{before}` ainda não feita no app).
+- Lista de mensagens: `ScrollArea` com `stick_to_bottom`; o servidor devolve 50 por página (`History{before}`). Ao prepender páginas antigas a rolagem é mantida por uma âncora (id e posição da primeira mensagem) + `scroll_with_delta_animation(.., ScrollAnimation::none())`; durante um salto (`jump`/`jump_wanted`) a âncora é desligada.
 
 ## Modelo de canais (já no banco)
 
