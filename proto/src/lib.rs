@@ -54,7 +54,7 @@ pub struct User {
 pub struct Channel {
     pub id: i64,
     pub name: String,
-    /// 0 texto, 4 categoria (1 voz e 2 anúncio reservados).
+    /// 0 texto, 1 voz, 4 categoria (2 anúncio reservado).
     pub kind: u8,
     /// Categoria a que o canal pertence; `None` fica solto no topo.
     pub parent: Option<i64>,
@@ -118,6 +118,29 @@ pub struct Snapshot {
     /// Quem você bloqueou.
     #[serde(default)]
     pub blocked: Vec<User>,
+    /// Quem está em cada canal de voz dos seus servidores (estado completo; depois vêm `VoiceUpdate`/`VoiceLeft`).
+    #[serde(default)]
+    pub voice: Vec<VoiceState>,
+}
+
+/// Quadro de áudio no WebSocket do gateway (mensagem **binária**; o texto continua sendo JSON).
+///
+/// Cliente → servidor: `[VOICE_FRAME][seq: u32 big-endian][pacote Opus]`.
+/// Servidor → clientes do mesmo canal de voz: `[VOICE_FRAME][remetente: i64 big-endian][seq: u32 big-endian][pacote Opus]`.
+/// Opus mono, 48 kHz, quadros de 20 ms (um pacote por quadro); pacote de até 400 bytes. Quem está em silêncio
+/// (VAD) não manda nada: quem recebe considera "falando" quem mandou pacote nos últimos ~250 ms.
+/// O valor 1 identifica áudio; outros ficam livres (o vídeo usa conexão própria).
+pub const VOICE_FRAME: u8 = 1;
+pub const VOICE_MAX_PACKET: usize = 400;
+
+/// Quem está num canal de voz e com que estado. Mudo/surdo são escolha da própria pessoa.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct VoiceState {
+    pub user_id: i64,
+    pub channel_id: i64,
+    pub muted: bool,
+    /// Surdo: não ouve ninguém (e, como no Discord, também fica mudo).
+    pub deafened: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -202,6 +225,11 @@ pub enum C2S {
     Resume { token: String, #[serde(default)] proto: u32 },
     /// Encerra a sessão (revoga o token) e fecha a conexão.
     Logout,
+    /// Entra num canal de voz (sai do que estava; só um por vez). Depois disso valem os quadros binários.
+    VoiceJoin { channel_id: i64 },
+    VoiceLeave,
+    /// Mudo/surdo próprios.
+    VoiceSet { muted: bool, deafened: bool },
     /// Troca a senha. Encerra todas as outras sessões (a atual continua).
     ChangePassword { old: String, new: String },
     /// Pede a lista de sessões da conta (resposta: `Sessions`).
@@ -269,6 +297,10 @@ pub enum C2S {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum S2C {
     Auth { token: String, me: User },
+    /// Alguém entrou num canal de voz ou mudou de estado (inclui você).
+    VoiceUpdate(VoiceState),
+    /// Alguém saiu do canal de voz (ou a conexão dele caiu).
+    VoiceLeft { user_id: i64, channel_id: i64 },
     Sessions { list: Vec<SessionInfo> },
     /// A senha foi trocada (as outras sessões foram encerradas).
     PasswordChanged,

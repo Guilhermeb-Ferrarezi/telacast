@@ -329,7 +329,7 @@ impl Session {
             link: Link::Up,
             gw,
             token,
-            snap: p::Snapshot { me: me.clone(), servers: vec![], friends: vec![], dms: vec![], live: vec![], blocked: vec![] },
+            snap: p::Snapshot { me: me.clone(), servers: vec![], friends: vec![], dms: vec![], live: vec![], blocked: vec![], voice: vec![] },
             me,
             view: View::Home,
             tab: HomeTab::Online,
@@ -926,6 +926,7 @@ impl Session {
                         }
                         self.toast = Some(("Senha alterada. As outras sessões foram encerradas.".into(), Instant::now()));
                     }
+                    S2C::VoiceUpdate(_) | S2C::VoiceLeft { .. } => {} // TODO(voz): UI
                     S2C::Auth { .. } => {}
                 },
             }

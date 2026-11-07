@@ -222,7 +222,7 @@ impl App {
 
         let me_name = self.store.display_name(me).await?.unwrap_or_default();
         let blocked = self.store.blocked_by(me).await?.into_iter().map(|(id, name)| user(id, name)).collect();
-        Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live, blocked })
+        Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live, blocked, voice: vec![] })
     }
 
     async fn push_snapshot(&self, uid: i64) {
@@ -722,6 +722,8 @@ async fn handle_authed(
             let _ = app.store.revoke_session(token_hash).await;
             return false;
         }
+        // TODO(voz): servidor de voz (agente A)
+        C2S::VoiceJoin { .. } | C2S::VoiceLeave | C2S::VoiceSet { .. } => {}
         C2S::ListSessions => send_sessions(app, tx, me, token_hash).await,
         C2S::RevokeSession { id } => {
             match app.store.revoke_session_by_id(me, id).await {
