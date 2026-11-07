@@ -12,6 +12,11 @@ pub struct User {
 pub struct Channel {
     pub id: i64,
     pub name: String,
+    /// 0 texto, 4 categoria (1 voz e 2 anúncio reservados).
+    pub kind: u8,
+    /// Categoria a que o canal pertence; `None` fica solto no topo.
+    pub parent: Option<i64>,
+    pub position: i32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -81,7 +86,8 @@ pub enum C2S {
     Logout,
     CreateServer { name: String },
     JoinServer { code: String },
-    CreateChannel { server_id: i64, name: String },
+    /// `kind`: 0 texto ou 4 categoria. `parent_id`: categoria do novo canal (ignorado em categorias).
+    CreateChannel { server_id: i64, name: String, kind: u8, parent_id: Option<i64> },
     Send { channel_id: i64, content: String },
     History { channel_id: i64, before: Option<i64> },
     FriendRequest { username: String },

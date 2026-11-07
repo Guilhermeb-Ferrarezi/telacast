@@ -58,7 +58,7 @@ enum HomeTab {
 enum Modal {
     None,
     AddServer { create: bool, name: String, code: String },
-    NewChannel { server: i64, name: String },
+    NewChannel { server: i64, name: String, kind: u8, parent: Option<i64> },
     Invite(String),
     GoLive,
 }
@@ -68,6 +68,7 @@ enum Act {
     OpenServer(i64),
     Send(C2S),
     Modal(Modal),
+    ToggleCategory(i64),
     Logout,
     Watch(i64),
     StopWatch,
@@ -93,6 +94,7 @@ struct Session {
     last_channel: HashMap<i64, i64>,
     view_since: Instant,
     seen: HashMap<i64, Instant>,
+    collapsed: HashSet<i64>,
 }
 
 impl Session {
@@ -114,6 +116,7 @@ impl Session {
             last_channel: HashMap::new(),
             view_since: Instant::now(),
             seen: HashMap::new(),
+            collapsed: HashSet::new(),
         }
     }
 
@@ -150,8 +153,8 @@ impl Session {
         let ch = sv
             .channels
             .iter()
-            .find(|c| Some(c.id) == wanted)
-            .or(sv.channels.first())
+            .find(|c| c.kind == 0 && Some(c.id) == wanted)
+            .or(sv.channels.iter().find(|c| c.kind == 0))
             .map(|c| c.id);
         if let Some(channel) = ch {
             self.open(View::Chan { server: id, channel });
@@ -468,13 +471,14 @@ impl App {
 
 // ------------------------------------------------------------------ sessão
 
+/// Sigla do servidor: primeira letra de cada palavra, sem forçar maiúscula (regra do Discord).
 fn initials(name: &str) -> String {
-    let mut it = name.split_whitespace().filter_map(|w| w.chars().next());
-    match (it.next(), it.next()) {
-        (Some(a), Some(b)) => format!("{a}{b}").to_uppercase(),
-        (Some(a), None) => name.chars().take(2).collect::<String>().to_uppercase().replace(a, &a.to_uppercase().to_string()),
-        _ => "?".into(),
-    }
+    let s: String = name
+        .replace("'s ", " ")
+        .split(|c: char| !c.is_alphanumeric())
+        .filter_map(|w| w.chars().next())
+        .collect();
+    if s.is_empty() { "?".into() } else { s }
 }
 
 impl App {
@@ -519,6 +523,11 @@ impl App {
                 Act::OpenServer(id) => s.open_server(id),
                 Act::Send(m) => s.gw.send(m),
                 Act::Modal(m) => s.modal = m,
+                Act::ToggleCategory(id) => {
+                    if !s.collapsed.remove(&id) {
+                        s.collapsed.insert(id);
+                    }
+                }
                 Act::Logout => keep = false,
                 Act::Watch(ch) => {
                     self.stop_watch();
@@ -547,26 +556,28 @@ impl App {
     // ---- barra de servidores
     fn rail(&mut self, ui: &mut egui::Ui, s: &Session, acts: &mut Vec<Act>) {
         let pr = egui::Panel::left("rail")
-            .frame(egui::Frame::new().fill(RAIL).inner_margin(egui::Margin::symmetric(13, 14)))
+            .frame(egui::Frame::new().fill(RAIL).inner_margin(egui::Margin::symmetric(16, 12)))
             .resizable(false)
-            .exact_size(68.0)
+            .exact_size(72.0)
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 let home = matches!(s.view, View::Home | View::Dm(_));
-                ui.vertical_centered(|ui| ui.label(serif("t", 26.0)));
-                if rail_button(ui, "DM", home, BLURPLE).on_hover_text("Mensagens diretas").clicked() {
+                let dm_unread = s.snap.dms.iter().any(|d| s.unread.contains(&d.channel_id));
+                if rail_item(ui, "DM", home, dm_unread, false).on_hover_text("Mensagens diretas").clicked() {
                     acts.push(Act::Open(View::Home));
                 }
-                ui.separator();
+                let (sep, _) = ui.allocate_exact_size(egui::vec2(32.0, 1.0), egui::Sense::hover());
+                ui.painter().rect_filled(sep.translate(egui::vec2(-4.0, 0.0)), 1.0, LINE2);
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 8.0;
                     for sv in &s.snap.servers {
                         let sel = matches!(&s.view, View::Chan { server, .. } if *server == sv.id);
-                        if rail_button(ui, &initials(&sv.name), sel, BLURPLE).on_hover_text(&sv.name).clicked() {
+                        let unread = sv.channels.iter().any(|c| s.unread.contains(&c.id));
+                        if rail_item(ui, &initials(&sv.name), sel, unread, false).on_hover_text(&sv.name).clicked() {
                             acts.push(Act::OpenServer(sv.id));
                         }
                     }
-                    if rail_button(ui, "+", false, GREEN).on_hover_text("Adicionar um servidor").clicked() {
+                    if rail_item(ui, "+", false, false, true).on_hover_text("Adicionar um servidor").clicked() {
                         acts.push(Act::Modal(Modal::AddServer { create: true, name: String::new(), code: String::new() }));
                     }
                 });
@@ -577,53 +588,26 @@ impl App {
     // ---- canais / DMs
     fn channel_panel(&mut self, ui: &mut egui::Ui, s: &Session, acts: &mut Vec<Act>) {
         let pr = egui::Panel::left("channels")
-            .frame(egui::Frame::new().fill(SIDE).inner_margin(egui::Margin::same(10)))
+            .frame(egui::Frame::new().fill(SIDE))
             .resizable(false)
             .exact_size(240.0)
             .show(ui, |ui| {
-                let list_h = (ui.available_height() - 52.0).max(50.0);
-                ui.allocate_ui(egui::vec2(ui.available_width(), list_h), |ui| {
-                    match &s.view {
-                        View::Chan { server, channel } => {
-                            let Some(sv) = s.snap.servers.iter().find(|x| x.id == *server) else { return };
-                            ui.horizontal(|ui| {
-                                ui.label(serif(&sv.name, 22.0));
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if small_button(ui, "Convite", FIELD) {
-                                        acts.push(Act::Modal(Modal::Invite(sv.invite.clone())));
-                                    }
-                                });
+                let w = ui.available_width();
+                let list_h = (ui.available_height() - 60.0).max(50.0);
+                ui.allocate_ui(egui::vec2(w, list_h), |ui| match &s.view {
+                    View::Chan { server, channel } => {
+                        let Some(sv) = s.snap.servers.iter().find(|x| x.id == *server) else { return };
+                        self.server_header(ui, s, sv, acts);
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 8)).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                self.channel_tree(ui, s, sv, *channel, acts);
                             });
-                            ui.separator();
-                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(caps(&"CANAIS DE TEXTO"));
-                                    if sv.owner == s.me.id {
-                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                            if ui.small_button("+").on_hover_text("Criar canal").clicked() {
-                                                acts.push(Act::Modal(Modal::NewChannel { server: sv.id, name: String::new() }));
-                                            }
-                                        });
-                                    }
-                                });
-                                for c in &sv.channels {
-                                    let live = s.snap.live.iter().any(|l| l.channel_id == c.id);
-                                    let unread = s.unread.contains(&c.id);
-                                    let r = list_row(ui, c.id == *channel, |ui| {
-                                        let col = if unread || c.id == *channel { TEXT } else { TEXT2 };
-                                        let t = RichText::new(format!("# {}", c.name)).color(col);
-                                        ui.label(if unread { t.strong() } else { t });
-                                        if live {
-                                            ui.label(RichText::new("AO VIVO").size(10.0).strong().color(AMBER));
-                                        }
-                                    });
-                                    if r.clicked() {
-                                        acts.push(Act::Open(View::Chan { server: sv.id, channel: c.id }));
-                                    }
-                                }
-                            });
-                        }
-                        _ => {
+                        });
+                    }
+                    _ => {
+                        egui::Frame::new().inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
                             let r = list_row(ui, matches!(s.view, View::Home), |ui| {
                                 ui.label(RichText::new("Amigos").strong());
                                 let pending = s.snap.friends.iter().filter(|f| f.status == p::FriendStatus::Incoming).count();
@@ -635,7 +619,7 @@ impl App {
                                 acts.push(Act::Open(View::Home));
                             }
                             ui.add_space(6.0);
-                            ui.label(caps(&"MENSAGENS DIRETAS"));
+                            ui.label(caps("Mensagens diretas"));
                             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                                 for d in &s.snap.dms {
                                     let sel = matches!(s.view, View::Dm(c) if c == d.channel_id);
@@ -643,46 +627,187 @@ impl App {
                                     let r = list_row(ui, sel, |ui| {
                                         avatar(ui, &d.user.name, d.user.id, 24.0, Some(d.user.online), SIDE);
                                         let t = RichText::new(&d.user.name);
-                                        ui.label(if unread { t.strong() } else { t.color(MUTED) });
+                                        ui.label(if unread { t.strong().color(TEXT) } else { t.color(TEXT2) });
                                     });
                                     if r.clicked() {
                                         acts.push(Act::Open(View::Dm(d.channel_id)));
                                     }
                                 }
                             });
-                        }
+                        });
                     }
                 });
                 // cartão do usuário
-                egui::Frame::new()
-                    .fill(L2)
-                    .corner_radius(egui::CornerRadius::same(10))
-                    .inner_margin(egui::Margin::same(8))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            avatar(ui, &s.me.name, s.me.id, 32.0, Some(true), L2);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                ui.label(RichText::new(&s.me.name).strong());
-                                ui.label(RichText::new("Online").size(11.0).color(MUTED));
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if small_button(ui, "Sair", FIELD) {
-                                    acts.push(Act::Logout);
-                                }
+                egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 0)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::Frame::new()
+                        .fill(L2)
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                avatar(ui, &s.me.name, s.me.id, 32.0, Some(true), L2);
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    ui.label(RichText::new(&s.me.name).strong().color(TEXT));
+                                    ui.label(RichText::new("Online").size(11.5).color(MUTED));
+                                });
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Sair", FIELD) {
+                                        acts.push(Act::Logout);
+                                    }
+                                });
                             });
                         });
-                    });
+                });
             });
         edge(ui, pr.response.rect, true);
+    }
+
+    /// Cabeçalho do servidor: nome em serifa, seta e menu suspenso.
+    fn server_header(&mut self, ui: &mut egui::Ui, s: &Session, sv: &p::ServerInfo, acts: &mut Vec<Act>) {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::click());
+        let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
+        let hot = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || open, 0.12);
+        let p = ui.painter();
+        p.rect_filled(rect, 0.0, lerp(L1, if open { L3 } else { L2 }, hot));
+        p.text(
+            rect.left_center() + egui::vec2(16.0, 0.0),
+            Align2::LEFT_CENTER,
+            &sv.name,
+            egui::FontId::new(18.0, serif_family()),
+            TEXT,
+        );
+        let ink = lerp(MUTED, TEXT, hot);
+        let c = rect.right_center() - egui::vec2(20.0, 0.0);
+        if open {
+            let st = egui::Stroke::new(1.5, ink);
+            p.line_segment([c + egui::vec2(-4.0, -4.0), c + egui::vec2(4.0, 4.0)], st);
+            p.line_segment([c + egui::vec2(-4.0, 4.0), c + egui::vec2(4.0, -4.0)], st);
+        } else {
+            chevron(p, c, true, ink);
+        }
+        p.hline(rect.x_range(), rect.bottom() - 0.5, egui::Stroke::new(1.0, LINE));
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let owner = sv.owner == s.me.id;
+        egui::Popup::menu(&resp).width(220.0).show(|ui| {
+            ui.set_min_width(210.0);
+            if ui.button("Convidar pessoas").clicked() {
+                acts.push(Act::Modal(Modal::Invite(sv.invite.clone())));
+            }
+            if owner {
+                ui.separator();
+                if ui.button("Criar canal").clicked() {
+                    acts.push(Act::Modal(Modal::NewChannel { server: sv.id, name: String::new(), kind: 0, parent: None }));
+                }
+                if ui.button("Criar categoria").clicked() {
+                    acts.push(Act::Modal(Modal::NewChannel { server: sv.id, name: String::new(), kind: 4, parent: None }));
+                }
+            }
+        });
+    }
+
+    /// Canais soltos primeiro, depois as categorias; canais de texto por posição.
+    fn channel_tree(&mut self, ui: &mut egui::Ui, s: &Session, sv: &p::ServerInfo, current: i64, acts: &mut Vec<Act>) {
+        let owner = sv.owner == s.me.id;
+        let mut cats: Vec<&p::Channel> = sv.channels.iter().filter(|c| c.kind == 4).collect();
+        cats.sort_by_key(|c| (c.position, c.id));
+        let texts = |parent: Option<i64>| {
+            let mut v: Vec<&p::Channel> = sv
+                .channels
+                .iter()
+                .filter(|c| c.kind == 0 && match parent {
+                    Some(p) => c.parent == Some(p),
+                    None => c.parent.map_or(true, |p| !cats.iter().any(|k| k.id == p)),
+                })
+                .collect();
+            v.sort_by_key(|c| (c.position, c.id));
+            v
+        };
+        let row = |ui: &mut egui::Ui, c: &p::Channel, acts: &mut Vec<Act>| {
+            let selected = c.id == current;
+            let unread = s.unread.contains(&c.id);
+            let live = s.snap.live.iter().any(|l| l.channel_id == c.id);
+            let r = list_row(ui, selected, |ui| {
+                let strong = selected || unread;
+                ui.label(RichText::new("#").size(18.0).color(if strong { TEXT2 } else { MUTED }));
+                let t = RichText::new(&c.name).color(if strong { TEXT } else { TEXT2 });
+                ui.label(if unread && !selected { t.strong() } else { t });
+                if live {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new("AO VIVO").size(10.0).strong().color(AMBER));
+                    });
+                }
+            });
+            if unread && !selected {
+                let rc = r.rect;
+                ui.painter().rect_filled(
+                    egui::Rect::from_center_size(egui::pos2(rc.left() - 6.5, rc.center().y), egui::vec2(3.0, 8.0)),
+                    2.0,
+                    TEXT,
+                );
+            }
+            if r.clicked() {
+                acts.push(Act::Open(View::Chan { server: sv.id, channel: c.id }));
+            }
+        };
+        for c in texts(None) {
+            row(ui, c, acts);
+        }
+        for (i, cat) in cats.iter().enumerate() {
+            let kids = texts(Some(cat.id));
+            let collapsed = s.collapsed.contains(&cat.id);
+            ui.add_space(if i == 0 && texts(None).is_empty() { 4.0 } else { 14.0 });
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), egui::Sense::click());
+            let hot = ui.ctx().animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.12);
+            let ink = lerp(MUTED, TEXT2, hot);
+            let plus_rect = egui::Rect::from_center_size(rect.right_center() - egui::vec2(12.0, 0.0), egui::vec2(20.0, 20.0));
+            let plus = owner.then(|| ui.interact(plus_rect, resp.id.with("plus"), egui::Sense::click()));
+            let p = ui.painter();
+            chevron(p, rect.left_center() + egui::vec2(8.0, 0.0), !collapsed, ink);
+            p.text(
+                rect.left_center() + egui::vec2(20.0, 0.0),
+                Align2::LEFT_CENTER,
+                cat.name.to_uppercase(),
+                egui::FontId::proportional(11.5),
+                ink,
+            );
+            let mut plus_hit = false;
+            if let Some(pl) = &plus {
+                if resp.hovered() || pl.hovered() {
+                    p.text(plus_rect.center(), Align2::CENTER_CENTER, "+", egui::FontId::proportional(18.0), if pl.hovered() { TEXT } else { MUTED });
+                }
+                if pl.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if pl.clicked() {
+                    plus_hit = true;
+                    acts.push(Act::Modal(Modal::NewChannel { server: sv.id, name: String::new(), kind: 0, parent: Some(cat.id) }));
+                }
+            }
+            if resp.hovered() && !plus_hit {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.clicked() && !plus.as_ref().is_some_and(|p| p.hovered()) {
+                acts.push(Act::ToggleCategory(cat.id));
+            }
+            for c in kids {
+                if collapsed && c.id != current && !s.unread.contains(&c.id) {
+                    continue;
+                }
+                row(ui, c, acts);
+            }
+        }
     }
 
     // ---- membros
     fn members_panel(&mut self, ui: &mut egui::Ui, s: &Session, server: i64, acts: &mut Vec<Act>) {
         let Some(sv) = s.snap.servers.iter().find(|x| x.id == server) else { return };
         let pr = egui::Panel::right("members")
-            .frame(egui::Frame::new().fill(SIDE).inner_margin(egui::Margin::same(10)))
+            .frame(egui::Frame::new().fill(SIDE).inner_margin(egui::Margin { left: 10, right: 10, top: 16, bottom: 10 }))
             .resizable(false)
             .exact_size(220.0)
             .show(ui, |ui| {
@@ -735,7 +860,7 @@ impl App {
                     .find(|d| d.channel_id == ch)
                     .map(|d| d.user.name.clone())
                     .unwrap_or_default();
-                self.chat_view(ui, ctx, s, acts, ch, &title, "Enviar mensagem");
+                self.chat_view(ui, ctx, s, acts, ch, &title, false, "Enviar mensagem");
             }
             View::Chan { server, channel } => {
                 let name = s
@@ -746,7 +871,7 @@ impl App {
                     .and_then(|x| x.channels.iter().find(|c| c.id == channel))
                     .map(|c| c.name.clone())
                     .unwrap_or_default();
-                self.chat_view(ui, ctx, s, acts, channel, &name, &format!("Conversar em #{name}"));
+                self.chat_view(ui, ctx, s, acts, channel, &name, true, &format!("Conversar em #{name}"));
             }
         }
     }
@@ -759,10 +884,14 @@ impl App {
         acts: &mut Vec<Act>,
         ch: i64,
         title: &str,
+        hash: bool,
         hint: &str,
     ) {
         // cabeçalho
         ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 63.0), Layout::left_to_right(Align::Center), |ui| {
+            if hash {
+                ui.label(RichText::new("#").size(26.0).color(MUTED));
+            }
             ui.label(serif(title, 24.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 match &self.publishing {
@@ -846,28 +975,46 @@ impl App {
                         && m.ts - msgs[i - 1].ts < 5 * 60 * 1000;
                     let born = *s.seen.entry(m.id).or_insert_with(Instant::now);
                     let age = born.elapsed().as_secs_f32() / 0.22;
-                    ui.horizontal_top(|ui| {
+                    let bg = ui.painter().add(egui::Shape::Noop);
+                    let row = ui.horizontal_top(|ui| {
                         if age < 1.0 {
                             ui.set_opacity(ease_out(age));
                             ui.ctx().request_repaint();
                         }
                         if grouped {
-                            ui.add_space(50.0);
+                            ui.add_space(54.0);
                         } else {
-                            avatar(ui, &m.author, m.author_id, 36.0, None, BG);
+                            avatar(ui, &m.author, m.author_id, 40.0, None, BG);
                             ui.add_space(6.0);
                         }
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             if !grouped {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&m.author).strong().color(TEXT));
-                                    ui.label(RichText::new(fmt_clock(m.ts)).size(11.5).color(MUTED));
+                                    ui.label(RichText::new(&m.author).size(15.5).strong().color(TEXT));
+                                    ui.label(RichText::new(fmt_clock(m.ts)).size(12.0).color(MUTED));
                                 });
                             }
-                            ui.add(egui::Label::new(RichText::new(&m.content).color(TEXT2)).wrap());
+                            ui.add(egui::Label::new(RichText::new(&m.content).size(15.5).color(TEXT2)).wrap());
                         });
                     });
+                    let rc = row.response.rect;
+                    if ui.rect_contains_pointer(rc.expand2(egui::vec2(28.0, 3.0))) {
+                        let full = egui::Rect::from_min_max(
+                            egui::pos2(ui.max_rect().left() - 28.0, rc.top() - 3.0),
+                            egui::pos2(ui.max_rect().right() + 28.0, rc.bottom() + 3.0),
+                        );
+                        ui.painter().set(bg, egui::Shape::rect_filled(full, 0.0, Color32::from_white_alpha(6)));
+                        if grouped {
+                            ui.painter().text(
+                                egui::pos2(rc.left() + 20.0, rc.top() + 11.0),
+                                Align2::CENTER_CENTER,
+                                fmt_clock(m.ts),
+                                egui::FontId::proportional(11.0),
+                                MUTED,
+                            );
+                        }
+                    }
                     ui.add_space(if grouped { 1.0 } else { 8.0 });
                 }
             });
@@ -890,6 +1037,7 @@ impl App {
                             .id(input_id)
                             .frame(egui::Frame::NONE)
                             .hint_text(hint)
+                            .vertical_align(Align::Center)
                             .margin(egui::Margin::symmetric(0, 6)),
                     );
                     let enter = r.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
@@ -1117,17 +1265,47 @@ impl App {
                         }
                     });
             }
-            Modal::NewChannel { server, name } => {
-                egui::Window::new("Criar canal")
+            Modal::NewChannel { server, name, kind, parent } => {
+                let cats: Vec<(i64, String)> = s
+                    .snap
+                    .servers
+                    .iter()
+                    .find(|x| x.id == *server)
+                    .map(|sv| sv.channels.iter().filter(|c| c.kind == 4).map(|c| (c.id, c.name.clone())).collect())
+                    .unwrap_or_default();
+                egui::Window::new(if *kind == 4 { "Criar categoria" } else { "Criar canal" })
                     .collapsible(false)
                     .resizable(false)
                     .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(ctx, |ui| {
-                        ui.set_width(300.0);
-                        ui.label(caps(&"NOME DO CANAL"));
+                        ui.set_width(320.0);
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(kind, 0, "Canal de texto");
+                            ui.selectable_value(kind, 4, "Categoria");
+                        });
+                        ui.add_space(6.0);
+                        ui.label(caps(if *kind == 4 { "Nome da categoria" } else { "Nome do canal" }));
                         ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
-                        if big_button(ui, "Criar canal", BLURPLE) && !name.trim().is_empty() {
-                            acts.push(Act::Send(C2S::CreateChannel { server_id: *server, name: name.clone() }));
+                        if *kind == 0 && !cats.is_empty() {
+                            ui.label(caps("Categoria"));
+                            let shown = parent
+                                .and_then(|p| cats.iter().find(|c| c.0 == p).map(|c| c.1.clone()))
+                                .unwrap_or_else(|| "Nenhuma".into());
+                            egui::ComboBox::from_id_salt("newchan-parent").width(ui.available_width()).selected_text(shown).show_ui(ui, |ui| {
+                                ui.selectable_value(parent, None, "Nenhuma");
+                                for (id, n) in &cats {
+                                    ui.selectable_value(parent, Some(*id), n);
+                                }
+                            });
+                        }
+                        ui.add_space(6.0);
+                        if big_button(ui, "Criar", BLURPLE) && !name.trim().is_empty() {
+                            acts.push(Act::Send(C2S::CreateChannel {
+                                server_id: *server,
+                                name: name.clone(),
+                                kind: *kind,
+                                parent_id: if *kind == 0 { *parent } else { None },
+                            }));
                             close = true;
                         }
                         if ui.button("Cancelar").clicked() {

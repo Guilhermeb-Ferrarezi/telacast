@@ -126,6 +126,7 @@ pub fn apply_theme(ctx: &egui::Context) {
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = vec2(8.0, 6.0);
         s.spacing.button_padding = vec2(12.0, 6.0);
+        s.interaction.tooltip_delay = 0.1;
         s.text_styles.insert(TextStyle::Body, FontId::new(14.5, FontFamily::Proportional));
         s.text_styles.insert(TextStyle::Button, FontId::new(13.5, FontFamily::Proportional));
         s.text_styles.insert(TextStyle::Small, FontId::new(12.0, FontFamily::Proportional));
@@ -289,26 +290,48 @@ pub fn small_button(ui: &mut Ui, label: &str, fill: Color32) -> bool {
     resp.clicked()
 }
 
-/// Botão quadrado da barra de servidores com a sigla. Selecionado: claro, com cantos mais abertos.
-/// Com `accent == GREEN` vira o botão "adicionar" (só contorno).
-pub fn rail_button(ui: &mut Ui, label: &str, selected: bool, accent: Color32) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(42.0, 42.0), Sense::click());
-    let hov = anim(ui, resp.id.with("h"), resp.hovered(), 0.12);
-    let sel = anim(ui, resp.id.with("s"), selected, 0.18);
+/// Item da barra de servidores: quadrado arredondado de 40 px com a sigla, e uma pílula
+/// encostada na borda esquerda do painel (8 não lido, 20 hover, 40 selecionado).
+/// Hover e selecionado pintam o fundo de âmbar. `add` desenha o botão "adicionar" (só contorno).
+pub fn rail_item(ui: &mut Ui, label: &str, selected: bool, unread: bool, add: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click());
+    let hov = anim(ui, resp.id.with("h"), resp.hovered() || selected, 0.15);
+    let target = if selected { 40.0 } else if resp.hovered() { 20.0 } else if unread { 8.0 } else { 0.0 };
+    let h = ui.ctx().animate_value_with_time(resp.id.with("pill"), target, 0.2);
     let p = ui.painter();
-    let radius = (12.0 + 2.0 * ease_out(sel)) as u8;
-    let cr = egui::CornerRadius::same(radius);
-    if accent == GREEN {
+    let cr = egui::CornerRadius::same(12);
+    let press = if resp.is_pointer_button_down_on() { 1.0 } else { 0.0 };
+    let rect = rect.translate(vec2(0.0, press));
+    if h > 0.5 {
+        let bar = Rect::from_center_size(
+            egui::pos2(rect.left() - 14.0, rect.center().y - press),
+            vec2(4.0, h),
+        );
+        p.rect_filled(bar, egui::CornerRadius { nw: 0, sw: 0, ne: 4, se: 4 }, TEXT);
+    }
+    if add {
         p.rect_stroke(rect, cr, Stroke::new(1.0, lerp(LINE2, TEXT2, hov)), StrokeKind::Inside);
-        p.text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(18.0), lerp(MUTED, TEXT, hov));
+        p.text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(20.0), lerp(MUTED, TEXT, hov));
     } else {
-        let fill = lerp(lerp(L3, L4, hov), TEXT, ease_out(sel));
-        p.rect_filled(rect, cr, fill);
-        let ink = lerp(lerp(TEXT2, TEXT, hov), L0, ease_out(sel));
-        p.text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(13.0), ink);
+        p.rect_filled(rect, cr, lerp(L3, AMBER, ease_out(hov)));
+        let n = label.chars().count();
+        let size = [18.0, 18.0, 16.0, 16.0, 14.0, 12.0, 10.0][n.clamp(1, 7) - 1];
+        p.text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(size), lerp(TEXT2, AMBER_INK, ease_out(hov)));
     }
     hand(ui, &resp);
     resp
+}
+
+/// Seta de categoria: aponta para baixo (aberta) ou para a direita (recolhida).
+pub fn chevron(p: &egui::Painter, c: egui::Pos2, open: bool, color: Color32) {
+    let (a, b, d) = if open {
+        (c + vec2(-3.5, -1.8), c + vec2(0.0, 1.8), c + vec2(3.5, -1.8))
+    } else {
+        (c + vec2(-1.8, -3.5), c + vec2(1.8, 0.0), c + vec2(-1.8, 3.5))
+    };
+    let s = Stroke::new(1.5, color);
+    p.line_segment([a, b], s);
+    p.line_segment([b, d], s);
 }
 
 /// Linha clicável de lista (canal, DM, membro). Selecionada: camada 3. Hover: camada 2.

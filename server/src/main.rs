@@ -131,7 +131,7 @@ impl App {
                 channels: chans
                     .iter()
                     .filter(|c| c.0 == id)
-                    .map(|c| p::Channel { id: c.1, name: c.2.clone() })
+                    .map(|c| p::Channel { id: c.1, name: c.2.clone(), kind: c.3 as u8, parent: c.4, position: c.5 })
                     .collect(),
                 members: mems.iter().filter(|m| m.0 == id).map(|m| user(m.1, m.2.clone())).collect(),
             })
@@ -559,7 +559,7 @@ async fn handle_authed(
                 err(ERR_BUSY);
             } else {
                 let sid = app.sf.next();
-                match app.store.create_server(sid, app.sf.next(), me, name, &auth::new_code()).await {
+                match app.store.create_server(sid, app.sf.next(), app.sf.next(), me, name, &auth::new_code()).await {
                     Ok(()) => {
                         app.push_snapshot(me).await;
                         let _ = tx.send(S2C::ServerJoined { server_id: sid });
@@ -583,25 +583,29 @@ async fn handle_authed(
                 }
             }
         }
-        C2S::CreateChannel { server_id, name } => {
+        C2S::CreateChannel { server_id, name, kind, parent_id } => {
             let name: String = name
                 .trim()
                 .to_lowercase()
                 .chars()
                 .map(|c| if c.is_whitespace() { '-' } else { c })
                 .collect();
-            if name.is_empty() || name.chars().count() > 32 {
+            if kind != 0 && kind != 4 {
+                err("Tipo de canal inválido");
+            } else if name.is_empty() || name.chars().count() > 32 {
                 err("Nome do canal: 1 a 32 caracteres");
             } else if busy("mkchan", 20, 3600) {
                 err(ERR_BUSY);
             } else if app.store.server_owner(server_id).await.ok().flatten() != Some(me) {
                 err("Só o dono do servidor cria canais");
             } else {
-                match app.store.create_channel(app.sf.next(), server_id, &name).await {
-                    Ok(()) => {
+                let parent = if kind == 4 { None } else { parent_id };
+                match app.store.create_channel(app.sf.next(), server_id, &name, kind as i16, parent).await {
+                    Ok(true) => {
                         let ids = app.store.server_member_ids(server_id).await.unwrap_or_default();
                         app.push_many(&ids).await;
                     }
+                    Ok(false) => err("Categoria não encontrada"),
                     Err(e) => db_err("create_channel", e),
                 }
             }

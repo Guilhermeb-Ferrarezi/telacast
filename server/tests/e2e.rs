@@ -179,10 +179,16 @@ fn fluxo_completo() {
     });
     let casa = &snap.servers[0];
     let server_id = casa.id;
-    assert_eq!(casa.channels.len(), 1);
-    assert_eq!(casa.channels[0].name, "geral");
+    // servidor novo: a categoria "canais de texto" com o canal "geral" dentro
+    assert_eq!(casa.channels.len(), 2);
+    let cat = casa.channels.iter().find(|c| c.kind == 4).expect("categoria padrão");
+    let geral_ch = casa.channels.iter().find(|c| c.kind == 0).expect("canal padrão");
+    assert_eq!(cat.name, "canais de texto");
+    assert_eq!(geral_ch.name, "geral");
+    assert_eq!(geral_ch.parent, Some(cat.id));
+    let cat_id = cat.id;
     assert_eq!(casa.invite.len(), 26, "convite de servidor com 128 bits");
-    let geral = casa.channels[0].id;
+    let geral = geral_ch.id;
     let invite = casa.invite.clone();
 
     beto.send(C2S::JoinServer { code: "CODIGO-INVALIDO".into() });
@@ -191,14 +197,30 @@ fn fluxo_completo() {
     beto.wait("ServerJoined do beto", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
 
     // só o dono cria canais
-    beto.send(C2S::CreateChannel { server_id, name: "Planos de Hoje".into() });
+    beto.send(C2S::CreateChannel { server_id, name: "Planos de Hoje".into(), kind: 0, parent_id: None });
     assert!(beto.error().contains("dono"));
-    ana.send(C2S::CreateChannel { server_id, name: "Planos de Hoje".into() });
+    ana.send(C2S::CreateChannel { server_id, name: "Planos de Hoje".into(), kind: 0, parent_id: None });
     let snap = ana.wait("snapshot com o novo canal", |m| match m {
-        S2C::Snapshot(s) if s.servers.iter().any(|x| x.channels.len() == 2) => Some(s.clone()),
+        S2C::Snapshot(s) if s.servers.iter().any(|x| x.channels.len() == 3) => Some(s.clone()),
         _ => None,
     });
-    assert_eq!(snap.servers[0].channels[1].name, "planos-de-hoje");
+    // a categoria que não existe é recusada; categoria dentro de outra é ignorada
+    ana.send(C2S::CreateChannel { server_id, name: "x".into(), kind: 0, parent_id: Some(geral) });
+    assert!(ana.error().contains("Categoria"), "pai precisa ser categoria");
+    ana.send(C2S::CreateChannel { server_id, name: "x".into(), kind: 7, parent_id: None });
+    assert!(ana.error().contains("Tipo"));
+    ana.send(C2S::CreateChannel { server_id, name: "Voz".into(), kind: 0, parent_id: Some(cat_id) });
+    let snap = ana.wait("snapshot com o canal dentro da categoria", |m| match m {
+        S2C::Snapshot(s) if s.servers.iter().any(|x| x.channels.len() == 4) => Some(s.clone()),
+        _ => None,
+    });
+    let novo = snap.servers[0].channels.iter().find(|c| c.name == "planos-de-hoje").expect("canal novo");
+    assert_eq!((novo.kind, novo.parent), (0, None));
+    let voz = snap.servers[0].channels.iter().find(|c| c.name == "voz").expect("canal na categoria");
+    assert_eq!(voz.parent, Some(cat_id));
+
+    // categoria não recebe mensagem
+    ana.send(C2S::Send { channel_id: cat_id, content: "isso não vai".into() });
 
     // --- mensagens em tempo real e histórico
     ana.send(C2S::Send { channel_id: geral, content: "oi beto!".into() });

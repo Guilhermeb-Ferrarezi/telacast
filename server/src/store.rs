@@ -157,7 +157,7 @@ impl Store {
 
     // ------------------------------------------------------------- servidores
 
-    pub async fn create_server(&self, id: i64, channel_id: i64, owner: i64, name: &str, invite: &str) -> R<()> {
+    pub async fn create_server(&self, id: i64, category_id: i64, channel_id: i64, owner: i64, name: &str, invite: &str) -> R<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO servers(id, name, owner_id) VALUES ($1, $2, $3)")
             .bind(id)
@@ -170,9 +170,15 @@ impl Store {
             .bind(owner)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO channels(id, server_id, kind, name) VALUES ($1, $2, 0, 'geral')")
+        sqlx::query("INSERT INTO channels(id, server_id, kind, name, position) VALUES ($1, $2, 4, 'canais de texto', 0)")
+            .bind(category_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO channels(id, server_id, parent_id, kind, name, position) VALUES ($1, $2, $3, 0, 'geral', 1)")
             .bind(channel_id)
             .bind(id)
+            .bind(category_id)
             .execute(&mut *tx)
             .await?;
         sqlx::query("INSERT INTO server_invites(code, server_id, created_by) VALUES ($1, $2, $3)")
@@ -223,17 +229,23 @@ impl Store {
         Ok(r.map(|x| x.0))
     }
 
-    pub async fn create_channel(&self, id: i64, server: i64, name: &str) -> R<()> {
-        sqlx::query(
-            "INSERT INTO channels(id, server_id, kind, name, position)
-             VALUES ($1, $2, 0, $3, COALESCE((SELECT max(position) + 1 FROM channels WHERE server_id = $2), 0))",
+    /// Cria canal de texto (kind 0) ou categoria (kind 4). Devolve false se a categoria-pai
+    /// não existe neste servidor.
+    pub async fn create_channel(&self, id: i64, server: i64, name: &str, kind: i16, parent: Option<i64>) -> R<bool> {
+        let r = sqlx::query(
+            "INSERT INTO channels(id, server_id, parent_id, kind, name, position)
+             SELECT $1, $2, $5, $4, $3, COALESCE((SELECT max(position) + 1 FROM channels WHERE server_id = $2), 0)
+             WHERE $5::bigint IS NULL
+                OR EXISTS (SELECT 1 FROM channels WHERE id = $5 AND server_id = $2 AND kind = 4)",
         )
         .bind(id)
         .bind(server)
         .bind(name)
+        .bind(kind)
+        .bind(parent)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(r.rows_affected() == 1)
     }
 
     pub async fn server_member_ids(&self, server: i64) -> R<Vec<i64>> {
@@ -262,7 +274,7 @@ impl Store {
     pub async fn can_access(&self, channel: i64, user: i64) -> R<bool> {
         let r: (bool,) = sqlx::query_as(
             "SELECT EXISTS (SELECT 1 FROM channels c JOIN members m ON m.server_id = c.server_id
-                            WHERE c.id = $1 AND m.user_id = $2)
+                            WHERE c.id = $1 AND m.user_id = $2 AND c.kind = 0)
                  OR EXISTS (SELECT 1 FROM channel_members WHERE channel_id = $1 AND user_id = $2)",
         )
         .bind(channel)
@@ -466,11 +478,11 @@ impl Store {
         .await
     }
 
-    /// (servidor, canal, nome) dos canais de texto.
-    pub async fn channels_in(&self, servers: &[i64]) -> R<Vec<(i64, i64, String)>> {
+    /// (servidor, canal, nome, tipo, categoria, posição) dos canais de texto e categorias.
+    pub async fn channels_in(&self, servers: &[i64]) -> R<Vec<(i64, i64, String, i16, Option<i64>, i32)>> {
         sqlx::query_as(
-            "SELECT server_id, id, name FROM channels
-             WHERE server_id = ANY($1) AND kind = 0 ORDER BY server_id, position, id",
+            "SELECT server_id, id, name, kind, parent_id, position FROM channels
+             WHERE server_id = ANY($1) AND kind IN (0, 4) ORDER BY server_id, position, id",
         )
         .bind(servers)
         .fetch_all(&self.pool)
