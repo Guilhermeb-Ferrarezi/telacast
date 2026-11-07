@@ -30,6 +30,18 @@ fn main() -> eframe::Result {
     if !single::acquire() {
         return Ok(());
     }
+    // sobras de imagens coladas por execuções que já terminaram (o nome leva o PID)
+    if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if let Some(rest) = name.strip_prefix("telacast-paste-") {
+                let alive = rest.split('-').next().is_some_and(|pid| std::path::Path::new("/proc").join(pid).exists());
+                if !alive {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
+    }
     eframe::run_native(
         "Telacast",
         eframe::NativeOptions {
@@ -423,6 +435,23 @@ impl Session {
             self.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce, attachments: ids });
         }
         self.pending.push(pend);
+    }
+
+    /// Ctrl+V com uma imagem na área de transferência: grava um PNG temporário e envia como anexo.
+    fn paste_image(&mut self, img: &egui::ColorImage) {
+        if self.current_channel().is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("telacast-paste-{}-{}", std::process::id(), self.upload_key + 1));
+        let path = dir.join("imagem.png");
+        let [w, h] = img.size;
+        let saved = std::fs::create_dir_all(&dir).is_ok()
+            && image::save_buffer(&path, img.as_raw(), w as u32, h as u32, image::ColorType::Rgba8).is_ok();
+        if saved {
+            self.start_upload(path);
+        } else {
+            self.toast = Some(("Não consegui ler a imagem colada.".into(), Instant::now()));
+        }
     }
 
     /// Começa a enviar um arquivo para o canal aberto; o resultado volta por `upload_rx`.
@@ -942,8 +971,14 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         self.poll_login(&ctx);
+        let pasted: Vec<std::sync::Arc<egui::ColorImage>> = ctx.input(|i| {
+            i.events.iter().filter_map(|e| if let egui::Event::PasteImage(img) = e { Some(img.clone()) } else { None }).collect()
+        });
         match self.session.take() {
             Some(mut s) => {
+                for img in &pasted {
+                    s.paste_image(img);
+                }
                 if let Some(why) = s.pump() {
                     self.logout(&why);
                     self.login_ui(ui, &ctx);
