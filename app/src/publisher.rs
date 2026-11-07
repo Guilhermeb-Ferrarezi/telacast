@@ -22,20 +22,19 @@ pub struct Handle {
     pub preview: Preview,
 }
 
-/// Reduz um quadro BGRA `w`x`h` para no máximo 640 de largura (amostragem simples, ~1 ms) e vira RGBA.
-fn make_preview(frame: &[u8], w: usize, h: usize) -> Option<(u32, u32, Vec<u8>)> {
+/// Reduz um quadro BGRA `w`x`h` para no máximo 1280 de largura com média de área (sem serrilhado) e vira RGBA.
+/// Quadros que já cabem não são reduzidos. Custa alguns ms; roda ~10 vezes por segundo.
+fn make_preview(frame: &[u8], w: usize, h: usize, scaler: &mut Scaler) -> Option<(u32, u32, Vec<u8>)> {
     if w == 0 || h == 0 || frame.len() < w * h * 4 {
         return None;
     }
-    let step = w.div_ceil(640).max(1);
-    let (pw, ph) = (w / step, h / step);
-    let mut out = Vec::with_capacity(pw * ph * 4);
-    for y in 0..ph {
-        let row = y * step * w * 4;
-        for x in 0..pw {
-            let i = row + x * step * 4;
-            out.extend_from_slice(&[frame[i + 2], frame[i + 1], frame[i], 255]);
-        }
+    let (pw, ph) = if w > 1280 { (1280, (h * 1280 / w).max(1)) } else { (w, h) };
+    let mut out = vec![0u8; pw * ph * 4];
+    scaler.scale(frame, w, w, h, &mut out, pw, pw, ph);
+    // BGRA -> RGBA, opaco
+    for px in out.chunks_exact_mut(4) {
+        px.swap(0, 2);
+        px[3] = 255;
     }
     Some((pw as u32, ph as u32, out))
 }
@@ -208,6 +207,7 @@ fn run(
         let mut scaler = Scaler::default();
         let mut down_since: Option<Instant> = None;
         let mut last_preview = Instant::now() - Duration::from_secs(1);
+        let mut preview_scaler = Scaler::default();
         while !cs.load(Ordering::Relaxed) {
             let tick = Instant::now();
             match grabber.grab() {
@@ -217,7 +217,7 @@ fn run(
                     // prévia da minha própria tela: um quadro reduzido a cada ~100 ms, do mesmo que vai ao encoder
                     if last_preview.elapsed() >= Duration::from_millis(100) {
                         last_preview = Instant::now();
-                        if let Some(p) = make_preview(&frame, w, h) {
+                        if let Some(p) = make_preview(&frame, w, h, &mut preview_scaler) {
                             if let Ok(mut g) = preview.lock() {
                                 *g = Some(p);
                             }
