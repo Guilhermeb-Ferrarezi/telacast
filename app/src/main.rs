@@ -1,3 +1,4 @@
+mod capture;
 mod gateway;
 mod files;
 mod gpu;
