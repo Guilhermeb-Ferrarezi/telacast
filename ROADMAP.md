@@ -12,16 +12,19 @@ Não usa a API nem os servidores do Discord. Este roadmap sai de 10 relatórios 
 
 ## Onde estamos
 
+Atualizado em 2026-11-07 (marcas: `[x]` pronto, `[~]` parcial, `[ ]` pendente).
+
 | Área | Já existe |
 |---|---|
-| Contas | cadastro/login (argon2), token de sessão, sessão salva no app |
-| Servidores | criar, convite por código, entrar, canais de texto (só o dono cria), membros online/offline |
-| Chat | mensagens em tempo real, histórico das últimas 50, agrupamento por autor, não lido em negrito |
+| Contas | cadastro **só com convite**, login (argon2 fora da thread principal, hash falso para usuário inexistente), token só com hash e validade deslizante de 30 dias, `Logout`, limite de tentativas, sessão salva no app |
+| Servidores | criar, convite por código (128 bits), entrar; **categorias recolhíveis** e canais de texto (só o dono cria), membros online/offline |
+| Chat | tempo real; **responder** (clicar na resposta salta até a original), **editar** ("(editado)"), **apagar** (autor ou dono), **não lido guardado no servidor** (`Ack`), **"digitando…"**, agrupamento, divisor de dia, hora ao passar o mouse, texto selecionável, menu do botão direito. Histórico: só as últimas 50 |
 | Social | amigos (pedir/aceitar/remover), DMs 1:1, presença online/offline |
-| Vídeo | transmissão de tela por canal: captura X11, NVENC (231 fps medidos em 1080p), relay por WebSocket, fallback openh264 |
-| Interface | tema escuro estilo Discord, barra de servidores, canais, membros, login, modais |
+| Vídeo | transmissão de tela por canal: captura X11, NVENC, relay por WebSocket, fallback openh264 |
+| Interface | tema **Grafite** (camadas de cinza, âmbar, serifa), barra de servidores com pílula 8/20/40 e sigla, cabeçalho do servidor com menu, canais com categorias, painel de membros, login, modais, barra de ações no hover |
+| Infra | Postgres 18, ids snowflake `i64`, migrações embutidas, testes unitários e **3 e2e** (fluxo completo, limite de login, responder/editar/apagar/ler) |
 
-Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação, sem editar/apagar mensagem, sem reconexão automática.**
+Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação, sem reconexão automática, sem Markdown, sem paginação de histórico, sem anexos, sem busca.**
 
 ## Decisões já tomadas
 
@@ -59,17 +62,17 @@ então dá para trocar as fases 2 e 3 se você quiser falar antes de moderar (ve
 Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de expor o servidor fora do localhost** ([R07]).
 
 ### 0.1 Decidir o modelo de dados agora (ainda não há dados reais, migrar depois custa caro)
-- [ ] **IDs estilo snowflake** (ms | nó | seq, gerado no servidor) em todas as tabelas, **mantendo `i64`** (cabe em 63 bits; string no JSON só se um dia houver cliente web) — [R06] P2, **[minha decisão]: fazer já**, porque sem dados reais não há migração. Fica pequeno: um gerador no servidor no lugar do `AUTOINCREMENT`. **S**
-- [ ] **`display_name` separado do `username`** — [R01] P0, base de identidade. **S**
-- [ ] `channels` ganha `kind` (texto/voz/anúncio/palco) e `parent_id` (categorias); DM vira canal com tabela `channel_members` (prepara DM em grupo) — [R02][R05]. **M**
-- [ ] Tabelas já previstas: `read_state`, `roles`, `member_roles`, `channel_overwrites`, `bans`, `invites`, `audit` — criar o esquema junto, usar nas fases seguintes. **S**
+- [x] **IDs estilo snowflake** (ms | nó | seq, gerado no servidor) em todas as tabelas, **mantendo `i64`** (cabe em 63 bits; string no JSON só se um dia houver cliente web) — [R06] P2, **[minha decisão]: fazer já**, porque sem dados reais não há migração. Fica pequeno: um gerador no servidor no lugar do `AUTOINCREMENT`. **S**
+- [x] **`display_name` separado do `username`** — [R01] P0, base de identidade. **S**
+- [x] `channels` ganha `kind` (texto/voz/anúncio/palco) e `parent_id` (categorias); DM vira canal com tabela `channel_members` (prepara DM em grupo) — [R02][R05]. **M**
+- [~] Tabelas já previstas (feitas: `read_state`, `blocks`, convites de instância e de servidor; **faltam** `roles`, `member_roles`, `channel_overwrites`, `bans`, `invites`, `audit` — criar o esquema junto, usar nas fases seguintes. **S**
 
 ### 0.2 Segurança (auditoria do servidor, 19 riscos em [R07])
 - [ ] **TLS (`wss://`)**: proxy reverso (Caddy) na frente do servidor; cliente com TLS (rustls) e que recuse `ws://` fora de localhost. P0 **M**
-- [ ] **Rate limit** por IP e por conta (login/cadastro, `Send`, `JoinServer`, pedidos de amizade) e **Argon2 em `spawn_blocking`** com semáforo + hash falso para usuário inexistente. P0 **M**
-- [ ] **Tokens**: guardar só o hash, expiração, `Logout`, revogar ao trocar senha, lista de sessões; **tirar o token da URL do vídeo** (ticket de uso único). P0 **M** ([R07]+[R01])
-- [ ] **Cadastro fechado — decidido: só entra quem tem convite** (por enquanto). O `Register` passa a exigir um **código de convite da instância** (128 bits, com expiração e limite de usos, revogável), gerado pelo operador do servidor por linha de comando (`telacast-server invite`), o que também resolve a criação da primeira conta. Os convites de *servidor* (guild) também passam a 128 bits. P1 **S**
-- [ ] **Limites**: conexões por IP, ping/idle timeout, canal limitado no lugar de `unbounded_channel`, tamanho máximo de quadro de vídeo, limites de servidores/canais por usuário. P1 **M**
+- [x] **Rate limit** por IP e por conta (login/cadastro, `Send`, `JoinServer`, pedidos de amizade) e **Argon2 em `spawn_blocking`** com semáforo + hash falso para usuário inexistente. P0 **M**
+- [~] **Tokens** (feito: só o hash, expiração, `Logout`; **falta** revogar ao trocar senha, lista de sessões e o ticket de uso único no vídeo): guardar só o hash, expiração, `Logout`, revogar ao trocar senha, lista de sessões; **tirar o token da URL do vídeo** (ticket de uso único). P0 **M** ([R07]+[R01])
+- [x] **Cadastro fechado — decidido: só entra quem tem convite** (por enquanto). O `Register` passa a exigir um **código de convite da instância** (128 bits, com expiração e limite de usos, revogável), gerado pelo operador do servidor por linha de comando (`telacast-server invite`), o que também resolve a criação da primeira conta. Os convites de *servidor* (guild) também passam a 128 bits. P1 **S**
+- [~] **Limites** (feito: fila limitada e tamanho máximo de mensagem; **falta** conexões por IP, ping/idle e limites por usuário): conexões por IP, ping/idle timeout, canal limitado no lugar de `unbounded_channel`, tamanho máximo de quadro de vídeo, limites de servidores/canais por usuário. P1 **M**
 - [ ] Nomes de usuário: restringir Unicode (homóglifos). P2 **S**
 
 ### 0.3 Protocolo ([R06])
@@ -79,7 +82,7 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 - [ ] **`ErrorCode` estáveis** + variante `Unknown` nos enums (cliente antigo não quebra). P0 **S**
 - [ ] **`PROTO_VERSION`** no login. P1 **S**
 - [ ] **`seq` nos eventos + Resume** com buffer; re-sync por `after`. P1 **M**
-- [ ] Testes automáticos do servidor (hoje só o script manual que usei) — **[minha decisão]** **S/M**
+- [x] Testes automáticos do servidor (hoje só o script manual que usei) — **[minha decisão]** **S/M**
 
 ### 0.4 Cliente ([R09])
 - [ ] **Token no keyring** do sistema (hoje está em texto no arquivo do app), diretórios XDG, log em arquivo, panic hook. P0 **S**
@@ -91,15 +94,15 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 
 ## Fase 1 — Chat completo
 
-- [ ] **Eventos incrementais** no lugar do Snapshot completo (`MessageUpdate/Delete`, `ChannelCreate…`, `MemberAdd…`, `PresenceUpdate`), começando por presença e mensagens; manter `RequestSnapshot` como válvula. P2 do [R06], mas **[minha decisão]: já aqui**, porque editar/apagar precisam de eventos e o Snapshot atual amplifica carga ([R07] #12). **L**
-- [ ] **Editar e excluir** as próprias mensagens, com "(editado)". P0 **S** ([R03])
+- [~] **Eventos incrementais** (feitos: `MessageEdited`, `MessageDeleted`, `Typing`; o resto ainda vem por `Snapshot`) no lugar do Snapshot completo (`MessageUpdate/Delete`, `ChannelCreate…`, `MemberAdd…`, `PresenceUpdate`), começando por presença e mensagens; manter `RequestSnapshot` como válvula. P2 do [R06], mas **[minha decisão]: já aqui**, porque editar/apagar precisam de eventos e o Snapshot atual amplifica carga ([R07] #12). **L**
+- [x] **Editar e excluir** as próprias mensagens, com "(editado)". P0 **S** ([R03])
 - [ ] **Paginação ao rolar** (`before`) e `after`/`around`. P0 **S**
-- [ ] **Não lidos de verdade**: `last_read` no servidor, contagem de menções, divisor "novas mensagens". P0 **M** ([R03][R05][R10])
+- [~] **Não lidos de verdade** (feito: `read_state` + `Ack` + barra e pílula; **falta** contagem de menções e o divisor "novas mensagens"): `last_read` no servidor, contagem de menções, divisor "novas mensagens". P0 **M** ([R03][R05][R10])
 - [ ] **Markdown básico** (negrito, itálico, código, bloco, citação, link, spoiler). P0 **M–L** (parser + layout rico em egui)
-- [ ] **Base de UI**: tokens de tema, modal padronizado (Esc/clique fora/confirmação destrutiva), **menus de contexto**, **barra de ações ao passar o mouse**. P0 **M** ([R10])
+- [~] **Base de UI** (feitos: tokens, menu de contexto, barra de ações no hover, confirmação ao apagar; **falta** padronizar modais com Esc/clique fora): tokens de tema, modal padronizado (Esc/clique fora/confirmação destrutiva), **menus de contexto**, **barra de ações ao passar o mouse**. P0 **M** ([R10])
 - [ ] **Menções** `@usuário`/`#canal` com autocomplete e destaque. P1 **M**
-- [ ] **Respostas** com prévia e pular para a mensagem. P1 **M**
-- [ ] **"Digitando…"**, **fixadas**, mensagens de sistema (entrou/fixou). P1 **S** cada
+- [x] **Respostas** com prévia e pular para a mensagem. P1 **M**
+- [~] **"Digitando…"** (pronto), **fixadas**, mensagens de sistema (entrou/fixou). P1 **S** cada
 - [ ] **Reações** com emoji Unicode. P1 **M**
 - [ ] **Busca** com a busca de texto do Postgres (`tsvector`) e filtros `from:`/`in:`/`has:`. P1 **M**
 - [ ] **Anexos**: upload por HTTP (não pelo WebSocket), armazenamento por hash, prévia inline, arrastar-e-soltar, colar imagem. P1 **L** ([R03][R06][R09])
@@ -124,7 +127,7 @@ Prioridade máxima do [R02]; moderação do [R07].
 
 - [ ] **Cargos + `@everyone` + bitfield u64 + `compute_permissions(member, canal)`** único e **com testes**. P0 **L**
 - [ ] **Hierarquia** e regra "só concede o que tem" (sem isso é falha de segurança). P0 **M**
-- [ ] **Categorias** e **canais privados** (overrides por canal/categoria). P0 **M**
+- [~] **Categorias** (prontas) e **canais privados** (overrides por canal/categoria). P0 **M**
 - [ ] **Sair, editar e excluir servidor**, transferir propriedade. P0 **S**
 - [ ] **Kick e ban** (tabela `bans` checada no `JoinServer`), lista de banidos, **revalidar acesso nas transmissões ao expulsar**. P1 **M** ([R07] #8, #10)
 - [ ] **Convites avançados**: expiração, usos máximos, revogar, listar. P1 **M**
