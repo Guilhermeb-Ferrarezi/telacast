@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Roda como root (via sudo sem senha, só este comando). Arma o alarme do RTC para acordar o PC
+# daqui a N segundos. Valida o argumento: só aceita de 30 a 3600 segundos.
+set -euo pipefail
+secs="${1:-}"
+[[ "$secs" =~ ^[0-9]{2,4}$ ]] || { echo "uso: telacast-wake <segundos 30..3600>" >&2; exit 2; }
+(( secs >= 30 && secs <= 3600 )) || { echo "segundos fora de 30..3600" >&2; exit 2; }
+exec /usr/sbin/rtcwake -m no -s "$secs"

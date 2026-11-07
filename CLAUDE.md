@@ -54,3 +54,9 @@ Cadastro é **fechado por convite**. Senha de 8 a 128 caracteres. Não ponha sen
 ## Modelo de canais (já no banco)
 
 `channels.kind`: 0 texto, 1 voz, 2 anúncio, 3 palco, 4 categoria, 10 DM. Servidor novo nasce com a categoria "canais de texto" e o canal "geral" dentro. `read_state` guarda o último lido por usuário; o `Snapshot` traz `last_message_id` e `last_read_id` por canal e por DM.
+
+## Trabalho em ciclos de 15 minutos (PC suspende e acorda sozinho)
+
+Para trabalhar de madrugada sem deixar o PC ligado o tempo todo: `tools/wake/`. Instalação, **uma vez** (pede a senha): `sudo bash tools/wake/install.sh`. Depois, ao terminar uma tarefa, rode **em segundo plano** (`run_in_background`): `tools/wake/cycle.sh 15 2`.
+
+O ciclo arma o alarme do RTC para 13 min, confere o alarme (se não conferir, **não suspende**), suspende, e ao acordar segura o PC acordado por 2 min (a rede volta); o comando termina aos 15 min e aí eu retomo. `tools/wake/awake.sh start|stop|status` impede a suspensão por inatividade enquanto trabalho; o `cycle.sh` já solta e retoma isso. Teste sem suspender: `tools/wake/cycle.sh 15 2 dry`.
