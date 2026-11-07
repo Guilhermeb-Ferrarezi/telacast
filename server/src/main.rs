@@ -719,6 +719,14 @@ async fn serve(store: Store, sf: ids::Snowflake) {
 /// IP do cliente. Atrás do proxy local (Caddy) usa o cabeçalho X-Forwarded-For; senão, o IP da conexão.
 fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
     if peer.ip().is_loopback() {
+        // Cloudflare (túnel/proxy) manda o IP real em CF-Connecting-IP e o cliente não consegue forjá-lo;
+        // X-Forwarded-For pode vir com valores do próprio cliente na frente, por isso este vem primeiro.
+        if let Some(v) = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()) {
+            let v = v.trim();
+            if !v.is_empty() && v.parse::<std::net::IpAddr>().is_ok() {
+                return v.to_string();
+            }
+        }
         if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             if let Some(first) = v.split(',').next() {
                 let first = first.trim();
