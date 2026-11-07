@@ -19,5 +19,7 @@ cudarc = { version = "0.16", default-features = false, features = ["std", "drive
 telacast-proto = { version = "0.1.0", path = "../proto" }
 serde_json = "1.0.154"
 chrono = "0.4.45"
+sha2 = "0.10"
+ed25519-dalek = "2"
 telacast-md = { path = "../md" }
 telacast-qs = { path = "../qs" }

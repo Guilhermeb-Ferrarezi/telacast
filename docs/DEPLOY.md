@@ -119,3 +119,21 @@ O app **recusa** `ws://` para qualquer servidor fora da sua máquina e da rede l
 - [ ] Login pelo app com `wss://` funciona; com `ws://` o app recusa.
 - [ ] Backup restaurado uma vez num banco de teste.
 - [ ] Senha do Postgres trocada e `/etc/telacast.env` com permissão 600.
+
+## Atualização do app (verificador de hash)
+
+O servidor entrega os executáveis do app; o app confere antes de trocar o próprio arquivo.
+
+1. **Uma vez**, crie a chave de assinatura (guarde fora do repositório e faça backup):
+   `telacast-server update-keygen --out ~/.config/telacast/update.key`. Ele imprime a chave pública.
+2. Compile o app com a chave pública embutida: `TELACAST_UPDATE_PUBKEY=<hex> cargo build --release -p telacast`.
+3. A cada versão (suba `version` no `app/Cargo.toml`), publique:
+   `TELACAST_UPDATE_KEY_FILE=~/.config/telacast/update.key telacast-server publish-update --file target/release/telacast --version 0.2.0 --notes "o que mudou"`
+   (plataforma padrão: a desta máquina, por exemplo `linux-x86_64`; `--platform` troca). Os arquivos ficam em
+   `TELACAST_UPDATES_DIR` (padrão `./updates`, ignorado pelo git): o executável com o SHA-256 como nome e `manifest-<plataforma>.json`.
+4. O app consulta `GET /update/manifest?platform=...` ao entrar. Havendo versão mais nova, mostra a faixa
+   "Nova versão X disponível"; "Atualizar agora" baixa `GET /update/file/<sha256>` calculando o SHA-256 no caminho e
+   **só instala se** o tamanho e o hash batem com o manifesto **e** a assinatura Ed25519 do manifesto é válida
+   (versão, plataforma, hash e tamanho entram na assinatura). Falhou: apaga o arquivo parcial, não troca nada e mostra o motivo.
+5. Sem chave pública embutida o app só confere o hash (protege contra corrupção, não contra um servidor adulterado):
+   use a assinatura em produção.

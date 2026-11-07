@@ -346,3 +346,66 @@ mod tests {
         assert!(matches!(m, C2S::Login { proto: 0, .. }));
     }
 }
+
+// ------------------------------------------------------------------ atualização do app
+
+/// Manifesto de atualização: o servidor publica, o app confere (hash e, se houver chave, assinatura).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UpdateManifest {
+    /// Versão do app, por exemplo `0.2.0`.
+    pub version: String,
+    /// `linux-x86_64` (sistema e arquitetura, como em `std::env::consts`).
+    pub platform: String,
+    /// SHA-256 do executável, em hexadecimal minúsculo (64 caracteres).
+    pub sha256: String,
+    pub size: u64,
+    #[serde(default)]
+    pub notes: String,
+    /// Assinatura Ed25519 (hex) de [`update_signing_message`]. Vazia = sem assinatura.
+    #[serde(default)]
+    pub signature: String,
+}
+
+/// Bytes que a assinatura cobre: amarra versão, plataforma, hash e tamanho (trocar qualquer um invalida).
+pub fn update_signing_message(version: &str, platform: &str, sha256: &str, size: u64) -> Vec<u8> {
+    format!("telacast-update-v1\n{version}\n{platform}\n{sha256}\n{size}\n").into_bytes()
+}
+
+/// `candidate` é uma versão mais nova que `current`? Compara `maior.menor.correção` numericamente
+/// (ignora sufixo depois de `-` ou `+`); o que não for número vale 0.
+pub fn version_is_newer(candidate: &str, current: &str) -> bool {
+    fn parts(v: &str) -> [u64; 3] {
+        let core = v.trim().trim_start_matches('v').split(['-', '+']).next().unwrap_or("");
+        let mut out = [0u64; 3];
+        for (i, p) in core.split('.').take(3).enumerate() {
+            out[i] = p.parse().unwrap_or(0);
+        }
+        out
+    }
+    parts(candidate) > parts(current)
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    #[test]
+    fn compara_versoes() {
+        assert!(version_is_newer("0.2.0", "0.1.9"));
+        assert!(version_is_newer("0.10.0", "0.9.5"));
+        assert!(version_is_newer("1.0.0", "0.99.99"));
+        assert!(!version_is_newer("0.1.0", "0.1.0"));
+        assert!(!version_is_newer("0.1.0", "0.1.1"));
+        assert!(version_is_newer("v0.2.0-beta", "0.1.0"));
+        assert!(!version_is_newer("lixo", "0.0.1"));
+    }
+
+    #[test]
+    fn mensagem_de_assinatura_amarra_os_campos() {
+        let a = update_signing_message("0.2.0", "linux-x86_64", "ab", 10);
+        assert_ne!(a, update_signing_message("0.2.1", "linux-x86_64", "ab", 10));
+        assert_ne!(a, update_signing_message("0.2.0", "linux-aarch64", "ab", 10));
+        assert_ne!(a, update_signing_message("0.2.0", "linux-x86_64", "ac", 10));
+        assert_ne!(a, update_signing_message("0.2.0", "linux-x86_64", "ab", 11));
+    }
+}

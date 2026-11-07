@@ -1348,3 +1348,49 @@ fn voz_rele_de_quadros() {
     let recebidos = beto.bins_in(Duration::from_secs(1)).len();
     assert!((50..=250).contains(&recebidos), "a rajada de 400 deveria ser limitada, chegaram {recebidos}");
 }
+
+#[test]
+fn atualizacao_publicar_e_baixar() {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = format!("/tmp/telacast_test_updates_{nanos}");
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = format!("{dir}/chave");
+    let bin = env!("CARGO_BIN_EXE_telacast-server");
+    // chave de assinatura: 600, e a chave pública sai no texto
+    let out = Command::new(bin).args(["update-keygen", "--out", &key]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let public = String::from_utf8_lossy(&out.stdout).lines().last().unwrap().trim().to_string();
+    assert_eq!(public.len(), 64);
+    // não sobrescreve uma chave existente
+    assert!(!Command::new(bin).args(["update-keygen", "--out", &key]).output().unwrap().status.success());
+
+    let exe = format!("{dir}/app.bin");
+    std::fs::write(&exe, b"binario falso do app").unwrap();
+    let srv = format!("{dir}/srv");
+    let out = Command::new(bin)
+        .args(["publish-update", "--file", &exe, "--version", "0.2.0", "--platform", "linux-x86_64", "--notes", "novidades"])
+        .env("TELACAST_UPDATES_DIR", &srv)
+        .env("TELACAST_UPDATE_KEY_FILE", &key)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let env = Env::start_with(&[("TELACAST_UPDATES_DIR", &srv)]);
+    let (st, _, body) = http(env.port, "GET", "/update/manifest?platform=linux-x86_64", b"");
+    assert_eq!(st, 200);
+    let m: telacast_proto::UpdateManifest = serde_json::from_slice(&body).unwrap();
+    assert_eq!(m.version, "0.2.0");
+    assert_eq!(m.size, 20);
+    assert_eq!(m.signature.len(), 128, "assinatura Ed25519 em hex");
+    // o arquivo vem pelo hash e confere
+    let (st, _, file) = http(env.port, "GET", &format!("/update/file/{}", m.sha256), b"");
+    assert_eq!(st, 200);
+    assert_eq!(file, b"binario falso do app");
+    // plataforma sem publicação, plataforma e hash malformados
+    assert_eq!(http(env.port, "GET", "/update/manifest?platform=linux-aarch64", b"").0, 404);
+    assert_eq!(http(env.port, "GET", "/update/manifest?platform=..%2Fx", b"").0, 400);
+    assert_eq!(http(env.port, "GET", "/update/file/../../etc/passwd", b"").0, 404);
+    assert_eq!(http(env.port, "GET", &format!("/update/file/{}", "0".repeat(64)), b"").0, 404);
+    assert_eq!(http(env.port, "GET", "/update/file/XYZ", b"").0, 400);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -6,6 +6,7 @@ mod md_view;
 mod net;
 mod publisher;
 mod quick;
+mod update;
 mod single;
 mod theme;
 mod viewer;
@@ -253,6 +254,9 @@ struct Session {
     voice_since: Option<Instant>,
     /// Volume de cada pessoa que ouço (0.0 a 2.0; ausente = 1.0).
     voice_volumes: HashMap<i64, f32>,
+    /// Atualização do app: estado compartilhado com a thread de consulta/download.
+    update: std::sync::Arc<std::sync::Mutex<update::State>>,
+    update_dismissed: bool,
     /// Rolagem horizontal da bandeja de anexos e onde ela ficou na tela (para a roda do mouse).
     tray_x: f32,
     tray_rect: egui::Rect,
@@ -389,6 +393,8 @@ impl Session {
             voice_view: false,
             voice_since: None,
             voice_volumes: HashMap::new(),
+            update: std::sync::Arc::new(std::sync::Mutex::new(update::State::Idle)),
+            update_dismissed: false,
             tray_x: 0.0,
             tray_rect: egui::Rect::NOTHING,
             upload_tx,
@@ -509,6 +515,46 @@ impl Session {
             self.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce, attachments: ids });
         }
         self.pending.push(pend);
+    }
+
+    /// Consulta o servidor por uma versão mais nova (em segundo plano). Uma vez por execução.
+    fn check_update(&self) {
+        let (state, base, ctx) = (self.update.clone(), self.http_base.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let res = update::check(&base);
+            if let Ok(mut st) = state.lock() {
+                *st = match res {
+                    Ok(Some(m)) => update::State::Available(m),
+                    // erro de consulta não incomoda: só aparece se o usuário pedir a verificação
+                    _ => update::State::Idle,
+                };
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Baixa, confere (tamanho, SHA-256 e assinatura) e instala a versão `m`.
+    fn start_update(&self, m: telacast_proto::UpdateManifest) {
+        let (state, base, ctx) = (self.update.clone(), self.http_base.clone(), self.ctx.clone());
+        if let Ok(mut st) = state.lock() {
+            *st = update::State::Downloading { got: 0, total: m.size };
+        }
+        std::thread::spawn(move || {
+            let progress = |got: u64, total: u64| {
+                if let Ok(mut st) = state.lock() {
+                    *st = update::State::Downloading { got, total };
+                }
+                ctx.request_repaint();
+            };
+            let res = update::download(&base, &m, &progress).and_then(|path| update::install(&path));
+            if let Ok(mut st) = state.lock() {
+                *st = match res {
+                    Ok(()) => update::State::Ready,
+                    Err(e) => update::State::Failed(e),
+                };
+            }
+            ctx.request_repaint();
+        });
     }
 
     /// Meu estado de voz (canal onde estou), se estiver conectado.
@@ -1108,7 +1154,9 @@ impl App {
                     self.login.pass.clear();
                     self.login.error.clear();
                     self.login.resuming = false;
-                    self.session = Some(Session::new(gw, self.login.server.clone(), ctx.clone(), token, me));
+                    let sess = Session::new(gw, self.login.server.clone(), ctx.clone(), token, me);
+                    sess.check_update();
+                    self.session = Some(sess);
                     return;
                 }
                 Event::Msg(S2C::Error { code, msg }) => {
@@ -1880,6 +1928,56 @@ impl App {
         }
         if !idle_now {
             ctx.request_repaint_after(self.idle_after.saturating_sub(parado) + Duration::from_millis(200));
+        }
+
+        // faixa de atualização (versão nova disponível, baixando, pronta ou com erro)
+        let upd = s.update.lock().map(|g| g.clone()).unwrap_or_default();
+        if !self.fullscreen && !s.update_dismissed && !matches!(upd, update::State::Idle) {
+            egui::Panel::top("update")
+                .frame(egui::Frame::new().fill(L3).inner_margin(egui::Margin::symmetric(16, 7)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        dot(ui, AMBER);
+                        match &upd {
+                            update::State::Available(m) => {
+                                ui.label(RichText::new(format!("Nova versão {} disponível (você está na {}).", m.version, update::CURRENT)).color(TEXT));
+                                if !m.notes.is_empty() {
+                                    ui.label(RichText::new(&m.notes).size(12.5).color(MUTED));
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Depois", FIELD) {
+                                        s.update_dismissed = true;
+                                    }
+                                    if small_button(ui, "Atualizar agora", BLURPLE) {
+                                        s.start_update(m.clone());
+                                    }
+                                });
+                            }
+                            update::State::Downloading { got, total } => {
+                                let pct = if *total > 0 { *got as f32 / *total as f32 } else { 0.0 };
+                                ui.label(RichText::new(format!("Baixando e conferindo a atualização… {:.0}%", pct * 100.0)).color(TEXT));
+                                ctx.request_repaint_after(Duration::from_millis(200));
+                            }
+                            update::State::Ready => {
+                                ui.label(RichText::new("Atualização instalada, hash conferido. Reinicie para usar a nova versão.").color(TEXT));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Reiniciar agora", BLURPLE) {
+                                        update::restart();
+                                    }
+                                });
+                            }
+                            update::State::Failed(e) => {
+                                ui.label(RichText::new(format!("Atualização recusada: {e}")).color(RED));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Fechar", FIELD) {
+                                        s.update_dismissed = true;
+                                    }
+                                });
+                            }
+                            update::State::Idle => {}
+                        }
+                    });
+                });
         }
 
         // faixa de conexão: aparece só enquanto a ligação com o servidor está fora

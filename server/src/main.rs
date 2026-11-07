@@ -2,6 +2,7 @@
 mod auth;
 mod ids;
 mod files;
+mod updates;
 mod store;
 
 use axum::{
@@ -493,6 +494,24 @@ enum Cmd {
         #[arg(long)]
         label: Option<String>,
     },
+    /// Cria a chave que assina as atualizações (guarde o arquivo; a chave pública vai embutida no app).
+    UpdateKeygen {
+        /// Onde gravar a chave secreta (não pode existir).
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Publica um executável do app para atualização automática (assina se `TELACAST_UPDATE_KEY_FILE` existir).
+    PublishUpdate {
+        #[arg(long)]
+        file: std::path::PathBuf,
+        #[arg(long)]
+        version: String,
+        /// Padrão: a plataforma desta máquina (por exemplo linux-x86_64).
+        #[arg(long)]
+        platform: Option<String>,
+        #[arg(long, default_value = "")]
+        notes: String,
+    },
     /// Define uma senha nova (gerada aqui) para um usuário e encerra todas as sessões dele.
     /// Recuperação de conta: o cadastro não tem e-mail. A senha só aparece agora.
     ResetPassword {
@@ -509,6 +528,43 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let cli = Cli::parse();
+
+    // comandos de atualização não precisam do banco
+    match &cli.cmd {
+        Some(Cmd::UpdateKeygen { out }) => {
+            match updates::keygen(out) {
+                Ok(public) => {
+                    println!("Chave secreta gravada em {} (modo 600). Guarde com cuidado e NÃO a coloque no repositório.", out.display());
+                    println!("Chave pública (compile o app com TELACAST_UPDATE_PUBKEY={public}):");
+                    println!("{public}");
+                }
+                Err(e) => {
+                    eprintln!("Erro: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some(Cmd::PublishUpdate { file, version, platform, notes }) => {
+            let platform = platform.clone().unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
+            match updates::publish(file, version, &platform, notes) {
+                Ok(m) => {
+                    println!("Publicado {} para {}: sha256 {} ({} bytes)", m.version, m.platform, m.sha256, m.size);
+                    if m.signature.is_empty() {
+                        println!("Aviso: sem assinatura (defina TELACAST_UPDATE_KEY_FILE com uma chave de update-keygen).");
+                    } else {
+                        println!("Assinado com Ed25519.");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Erro: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
 
     let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         eprintln!("Defina DATABASE_URL (veja .env.example).");
@@ -537,6 +593,7 @@ async fn main() {
             );
             println!("  Guarde agora: o código não pode ser consultado depois.");
         }
+        Cmd::UpdateKeygen { .. } | Cmd::PublishUpdate { .. } => unreachable!("tratados antes de abrir o banco"),
         Cmd::ResetPassword { user } => {
             let Ok(Some(uid)) = store.find_user_id(user.trim()).await else {
                 eprintln!("Usuário não encontrado: {user}");
@@ -583,6 +640,8 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         .route("/watch/{channel}", get(watch))
         .route("/upload", axum::routing::post(files::upload).layer(axum::extract::DefaultBodyLimit::max(files::max_upload())))
         .route("/files/{id}/{name}", get(files::download))
+        .route("/update/manifest", get(updates::manifest))
+        .route("/update/file/{hash}", get(updates::file))
         .route("/health", get(|| async { "ok" }))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
