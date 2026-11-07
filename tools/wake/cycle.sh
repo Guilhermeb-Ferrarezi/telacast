@@ -19,7 +19,7 @@ if [[ -z "$alarm" ]] || (( alarm < now + secs - 5 || alarm > now + secs + 5 )); 
   exit 1
 fi
 echo "alarme armado para $(date -d "@$alarm" +%H:%M:%S) (daqui a $((secs/60)) min); suspendendo às $(date +%H:%M:%S)"
-[[ "$mode" == "dry" ]] && { echo "(dry: não suspendi)"; exit 0; }
+[[ "$mode" == "dry" ]] && { sudo -n /usr/local/sbin/telacast-wake off >/dev/null; echo "(dry: não suspendi e cancelei o alarme)"; exit 0; }
 sync; sleep 2
 systemctl suspend
 echo "acordei às $(date +%H:%M:%S)"

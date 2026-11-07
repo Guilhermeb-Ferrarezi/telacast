@@ -7,7 +7,7 @@ user="${SUDO_USER:?rode com sudo, não direto como root}"
 here="$(cd "$(dirname "$0")" && pwd)"
 install -o root -g root -m 755 "$here/telacast-wake" /usr/local/sbin/telacast-wake
 tmp="$(mktemp)"
-echo "$user ALL=(root) NOPASSWD: /usr/local/sbin/telacast-wake [0-9]*" > "$tmp"
+echo "$user ALL=(root) NOPASSWD: /usr/local/sbin/telacast-wake" > "$tmp"
 visudo -cf "$tmp" >/dev/null
 install -o root -g root -m 440 "$tmp" /etc/sudoers.d/telacast-wake
 rm -f "$tmp"
