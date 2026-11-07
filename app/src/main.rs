@@ -125,6 +125,8 @@ enum Modal {
     Preview(p::Attachment),
     /// Prévia de um anexo ainda não enviado (arquivo local).
     PreviewLocal { key: u64, name: String, path: std::path::PathBuf },
+    /// Arquivo de texto aberto por inteiro (até 50 KB lidos).
+    TextView(p::Attachment),
 }
 
 enum Act {
@@ -135,6 +137,7 @@ enum Act {
     ToggleCategory(i64),
     Copy(String),
     Toast(String),
+    ToggleText(i64),
     OpenProfile { user: i64, name: String, anchor: egui::Rect, left: bool },
     Reply(i64, p::Reply),
     CancelReply,
@@ -225,6 +228,9 @@ struct Session {
     /// Servidor HTTP dos anexos (o mesmo endereço do WebSocket, com http/https).
     http_base: String,
     images: files::Images,
+    texts: files::Texts,
+    /// Prévias de texto expandidas (até 100 linhas em vez de 6).
+    text_open: HashSet<i64>,
     /// Arquivos sendo enviados para o campo de mensagem (por canal) e o canal por onde chegam os resultados.
     uploads: Vec<files::Upload>,
     upload_key: u64,
@@ -352,6 +358,8 @@ impl Session {
             search: None,
             http_base,
             images: files::Images::new(),
+            texts: files::Texts::new(),
+            text_open: HashSet::new(),
             uploads: Vec::new(),
             upload_key: 0,
             armed: Vec::new(),
@@ -1273,7 +1281,7 @@ fn system_row(ui: &mut egui::Ui, m: &p::Message, acts: &mut Vec<Act>) {
 }
 
 /// Anexo de uma mensagem: imagem (até 400x300) ou cartão do arquivo; clicar abre no navegador.
-fn attachment_view(ui: &mut egui::Ui, a: &p::Attachment, base: &str, token: &str, images: &mut files::Images, acts: &mut Vec<Act>) {
+fn attachment_view(ui: &mut egui::Ui, a: &p::Attachment, base: &str, token: &str, images: &mut files::Images, texts: &mut files::Texts, expanded: bool, acts: &mut Vec<Act>) {
     let open = |ui: &egui::Ui| ui.ctx().open_url(egui::OpenUrl::new_tab(files::url(base, a, token)));
     ui.add_space(4.0);
     if a.mime.starts_with("image/") && a.width > 0 && a.height > 0 {
@@ -1299,6 +1307,25 @@ fn attachment_view(ui: &mut egui::Ui, a: &p::Attachment, base: &str, token: &str
                 return;
             }
             files::Img::Failed => {}
+        }
+    }
+    // texto e código: prévia das primeiras linhas, como no Discord
+    if files::is_text_like(a) {
+        let ctx = ui.ctx().clone();
+        match texts.get(&ctx, base, token, a) {
+            files::Text::Ready { text, lines, bytes_left } => {
+                text_card(ui, a, text, *lines, *bytes_left, expanded, files::url(base, a, token), acts);
+                return;
+            }
+            files::Text::Loading => {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width().min(520.0), 96.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 8.0, L2);
+                ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0, LINE2), egui::StrokeKind::Inside);
+                ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Carregando prévia…", egui::FontId::proportional(13.0), MUTED);
+                ctx.request_repaint_after(Duration::from_millis(300));
+                return;
+            }
+            files::Text::Failed => {}
         }
     }
     // arquivo comum (ou imagem que não carregou)
@@ -1454,6 +1481,67 @@ fn upload_tile(ui: &mut egui::Ui, u: &files::Upload, images: &mut files::Images,
     });
 }
 
+/// Cartão de prévia de texto (no estilo do Discord): primeiras linhas em fonte monoespaçada e, embaixo,
+/// uma barra com expandir/recolher, nome e tamanho, "Abrir" (tudo, num modal) e "Baixar".
+/// Recolhido mostra 6 linhas; expandido, 100. O Discord lê só os primeiros ~50 KB do arquivo.
+fn text_card(ui: &mut egui::Ui, a: &p::Attachment, text: &str, lines: usize, bytes_left: u64, expanded: bool, url: String, acts: &mut Vec<Act>) {
+    let max_lines = if expanded { 100 } else { 6 };
+    let whole = bytes_left == 0;
+    let shown: String = text.split('\n').take(max_lines).collect::<Vec<_>>().join("\n");
+    let mut notice = String::new();
+    if whole && expanded && lines > max_lines {
+        notice = format!("… ({} linhas a mais)", lines - max_lines);
+    } else if !whole {
+        notice = format!("… ({} restantes)", files::human_size(bytes_left));
+    }
+    let can_toggle = expanded || lines > 6 || !whole;
+    let w = ui.available_width().min(520.0);
+    egui::Frame::new().fill(L2).stroke(egui::Stroke::new(1.0, LINE2)).corner_radius(egui::CornerRadius::same(8)).show(ui, |ui| {
+        ui.set_width(w - 2.0);
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+        egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 10 }).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let mut job = egui::text::LayoutJob::default();
+            let mono = egui::FontId::monospace(12.5);
+            job.append(&shown, 0.0, egui::TextFormat { font_id: mono.clone(), color: TEXT, line_height: Some(18.0), ..Default::default() });
+            if !notice.is_empty() && expanded {
+                job.append(&format!("\n{notice}"), 0.0, egui::TextFormat { font_id: mono, color: MUTED, line_height: Some(18.0), ..Default::default() });
+            }
+            job.wrap.max_width = ui.available_width();
+            // recolhido corta em 6 linhas na tela (com as quebras), como o Discord; expandido, em 100
+            job.wrap.max_rows = if expanded { 102 } else { 6 };
+            ui.add(egui::Label::new(job).selectable(true));
+        });
+        let y = ui.cursor().top();
+        ui.painter().hline(ui.max_rect().x_range(), y, egui::Stroke::new(1.0, LINE2));
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 7)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if can_toggle && small_button(ui, if expanded { "Recolher" } else { "Expandir" }, FIELD) {
+                    acts.push(Act::ToggleText(a.id));
+                }
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    let name: String = if a.name.chars().count() > 26 { format!("{}…", a.name.chars().take(25).collect::<String>()) } else { a.name.clone() };
+                    ui.label(RichText::new(name).size(13.0).color(TEXT)).on_hover_text(&a.name);
+                    let count = if whole { format!("{} · {} linhas", files::human_size(a.size), lines) } else { files::human_size(a.size) };
+                    ui.label(RichText::new(count).size(11.5).color(MUTED));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if small_button(ui, "Baixar", FIELD) {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                    }
+                    if small_button(ui, "Abrir", FIELD) {
+                        acts.push(Act::Modal(Modal::TextView(a.clone())));
+                    }
+                });
+            });
+        });
+    });
+}
+
 fn is_pending_or_own_echo(m: &p::Message, me: i64) -> bool {
     m.id < 0 || (m.author_id == me && m.nonce != 0)
 }
@@ -1523,6 +1611,7 @@ impl App {
         let mut acts: Vec<Act> = Vec::new();
 
         s.images.pump(ctx);
+        s.texts.pump(ctx);
         // arrastar arquivos para a janela anexa ao canal aberto
         if !matches!(s.view, View::Home) {
             let dropped = ctx.input(|i| i.raw.dropped_files.clone());
@@ -1828,6 +1917,11 @@ impl App {
                 }
                 Act::AskDelete(id, preview) => s.modal = Modal::DeleteMsg { id, preview },
                 Act::Toast(msg) => s.toast = Some((msg, Instant::now())),
+                Act::ToggleText(id) => {
+                    if !s.text_open.remove(&id) {
+                        s.text_open.insert(id);
+                    }
+                }
                 Act::OpenProfile { user, name, anchor, left } => {
                     s.profile = Some(Profile { user, name, anchor, left, opened: ctx.cumulative_pass_nr(), more: false });
                 }
@@ -2619,6 +2713,8 @@ impl App {
                     }
                     // mensagem de alguém que você bloqueou: some, com um aviso e a opção de mostrar
                     if blocked_ids.contains(&m.author_id) && m.kind == 0 && !s.revealed.contains(&(m.id, u32::MAX)) {
+                        // já "nasceu" faz tempo: ao mostrar, a mensagem não repete a animação de entrada
+                        s.seen.entry(m.id).or_insert_with(|| Instant::now().checked_sub(Duration::from_secs(5)).unwrap_or_else(Instant::now));
                         ui.horizontal(|ui| {
                             ui.add_space(54.0);
                             ui.label(RichText::new("Mensagem de usuário bloqueado.").size(13.0).color(MUTED));
@@ -2791,7 +2887,7 @@ impl App {
                                 }
                             }
                             for a in &m.attachments {
-                                attachment_view(ui, a, &http_base, &token, &mut s.images, acts);
+                                attachment_view(ui, a, &http_base, &token, &mut s.images, &mut s.texts, s.text_open.contains(&a.id), acts);
                             }
                             if !m.reactions.is_empty() && !is_pending {
                                 ui.add_space(2.0);
@@ -3398,6 +3494,50 @@ impl App {
                 if lightbox(ctx, tex, &caption, Some(files::url(&base, a, &token))) {
                     dismissed = true;
                 }
+            }
+            Modal::TextView(a) => {
+                let (base, token) = (s.http_base.clone(), s.token.clone());
+                let url = files::url(&base, a, &token);
+                let loaded = match s.texts.get(ctx, &base, &token, a) {
+                    files::Text::Ready { text, bytes_left, .. } => Some((text.clone(), *bytes_left)),
+                    _ => None,
+                };
+                let max_h = (ctx.content_rect().height() - 260.0).max(160.0);
+                let name = a.name.clone();
+                modal(ctx, &name, 720.0, &mut dismissed, |ui| {
+                    ui.set_width(680.0);
+                    match &loaded {
+                        Some((text, left)) => {
+                            egui::Frame::new().fill(L2).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                                    let mut job = egui::text::LayoutJob::default();
+                                    let mono = egui::FontId::monospace(12.5);
+                                    job.append(text, 0.0, egui::TextFormat { font_id: mono.clone(), color: TEXT, line_height: Some(18.0), ..Default::default() });
+                                    if *left > 0 {
+                                        job.append(&format!("\n… ({} restantes)", files::human_size(*left)), 0.0, egui::TextFormat { font_id: mono, color: MUTED, line_height: Some(18.0), ..Default::default() });
+                                    }
+                                    job.wrap.max_width = ui.available_width();
+                                    ui.add(egui::Label::new(job).selectable(true));
+                                });
+                            });
+                        }
+                        None => {
+                            ui.label(RichText::new("Carregando…").color(MUTED));
+                            ui.ctx().request_repaint_after(Duration::from_millis(200));
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(files::human_size(a.size)).size(13.0).color(MUTED));
+                        if small_button(ui, "Baixar", BLURPLE) {
+                            ctx.open_url(egui::OpenUrl::new_tab(url.clone()));
+                        }
+                        if small_button(ui, "Fechar", FIELD) {
+                            close = true;
+                        }
+                    });
+                });
             }
             Modal::PreviewLocal { key, name, path } => {
                 let thumb = match s.images.get_local(ctx, *key, path, false) {

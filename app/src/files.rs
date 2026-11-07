@@ -206,3 +206,85 @@ fn decode(bytes: &[u8], lim: (u32, u32)) -> Option<egui::ColorImage> {
     let rgba = img.to_rgba8();
     Some(egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
 }
+
+// ------------------------------------------------------------ prévia de texto
+
+/// Quantos bytes do começo do arquivo a prévia lê (como no Discord: `Range: bytes=0-50000`).
+const TEXT_PREVIEW_BYTES: u64 = 50_000;
+
+/// Arquivo de texto/código que ganha prévia no chat (pela extensão ou pelo tipo `text/*`).
+pub fn is_text_like(a: &p::Attachment) -> bool {
+    const EXT: &[&str] = &[
+        "txt", "md", "markdown", "log", "json", "jsonc", "toml", "yaml", "yml", "ini", "cfg", "conf", "csv", "tsv", "xml", "html", "htm", "css",
+        "js", "mjs", "ts", "tsx", "jsx", "rs", "py", "rb", "go", "java", "kt", "c", "h", "cpp", "hpp", "cs", "sh", "bash", "fish", "sql", "lua",
+        "php", "swift", "diff", "patch", "env", "lock", "gradle", "properties",
+    ];
+    let ext = Path::new(&a.name).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    (a.mime.starts_with("text/") || EXT.contains(&ext.as_str())) && !a.mime.starts_with("image/")
+}
+
+pub enum Text {
+    Loading,
+    /// `bytes_left`: o que ficou de fora (0 = arquivo inteiro).
+    Ready { text: String, lines: usize, bytes_left: u64 },
+    Failed,
+}
+
+/// Cache das prévias de texto: lê só o começo do arquivo, em segundo plano.
+pub struct Texts {
+    map: HashMap<i64, Text>,
+    tx: Sender<(i64, Option<(String, u64)>)>,
+    rx: Receiver<(i64, Option<(String, u64)>)>,
+}
+
+impl Texts {
+    pub fn new() -> Self {
+        let (tx, rx) = channel();
+        Self { map: HashMap::new(), tx, rx }
+    }
+
+    pub fn pump(&mut self, ctx: &egui::Context) {
+        while let Ok((id, res)) = self.rx.try_recv() {
+            self.map.insert(
+                id,
+                match res {
+                    Some((text, bytes_left)) => {
+                        let lines = text.lines().count().max(1);
+                        Text::Ready { text, lines, bytes_left }
+                    }
+                    None => Text::Failed,
+                },
+            );
+            ctx.request_repaint();
+        }
+    }
+
+    pub fn get(&mut self, ctx: &egui::Context, base: &str, token: &str, a: &p::Attachment) -> &Text {
+        if !self.map.contains_key(&a.id) {
+            self.map.insert(a.id, Text::Loading);
+            let (tx, ctx2, u, total, id) = (self.tx.clone(), ctx.clone(), url(base, a, token), a.size, a.id);
+            std::thread::spawn(move || {
+                let _ = tx.send((id, fetch_text(&u, total)));
+                ctx2.request_repaint();
+            });
+        }
+        self.map.get(&a.id).unwrap_or(&Text::Loading)
+    }
+}
+
+fn fetch_text(url: &str, total: u64) -> Option<(String, u64)> {
+    let resp = agent().get(url).set("Range", &format!("bytes=0-{}", TEXT_PREVIEW_BYTES)).call().ok()?;
+    let mut bytes = Vec::new();
+    resp.into_reader().take(TEXT_PREVIEW_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    let truncated = (bytes.len() as u64) > TEXT_PREVIEW_BYTES || total > bytes.len() as u64;
+    bytes.truncate(TEXT_PREVIEW_BYTES as usize);
+    let mut text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+    if truncated {
+        // o corte pode ter partido um caractere no meio
+        while text.ends_with('\u{FFFD}') {
+            text.pop();
+        }
+    }
+    let left = if truncated { total.saturating_sub(bytes.len() as u64).max(1) } else { 0 };
+    Some((text, left))
+}
