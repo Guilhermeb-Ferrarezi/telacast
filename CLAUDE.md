@@ -22,6 +22,7 @@ Implantação na VPS (Caddy + systemd + Postgres): `docs/DEPLOY.md`. Planos: `RO
 docker compose -f docker-compose.dev.yml up -d        # Postgres 18 (precisa de sudo/grupo docker)
 cp .env.example .env                                  # DATABASE_URL e TELACAST_ADDR
 cargo run -p telacast-server -- invite --uses 5 --days 30 --label dev   # o código aparece uma vez
+cargo run -p telacast-server -- reset-password --user NOME   # esqueceu a senha: gera outra e encerra as sessões
 cargo run -p telacast-server -- serve                 # ws://127.0.0.1:8080
 cargo run --release -p telacast                       # o app
 cargo test -p telacast-server                         # unitários + e2e (precisa do Postgres no ar)

@@ -328,6 +328,13 @@ enum Cmd {
         #[arg(long)]
         label: Option<String>,
     },
+    /// Define uma senha nova (gerada aqui) para um usuário e encerra todas as sessões dele.
+    /// Recuperação de conta: o cadastro não tem e-mail. A senha só aparece agora.
+    ResetPassword {
+        /// Nome de usuário.
+        #[arg(long)]
+        user: String,
+    },
 }
 
 #[tokio::main]
@@ -364,6 +371,21 @@ async fn main() {
                 days.map(|d| format!("{d} dias")).unwrap_or_else(|| "sem expiração".into())
             );
             println!("  Guarde agora: o código não pode ser consultado depois.");
+        }
+        Cmd::ResetPassword { user } => {
+            let Ok(Some(uid)) = store.find_user_id(user.trim()).await else {
+                eprintln!("Usuário não encontrado: {user}");
+                std::process::exit(1);
+            };
+            let pw: String = auth::new_code().to_lowercase().chars().take(16).collect();
+            let hash = auth::hash_password(&pw).expect("argon2");
+            if let Err(e) = store.set_password_hash(uid, &hash).await {
+                eprintln!("Erro ao gravar a senha: {e}");
+                std::process::exit(1);
+            }
+            let _ = store.revoke_other_sessions(uid, &[]).await;
+            println!("Nova senha de {user}: {pw}");
+            println!("  Todas as sessões foram encerradas. Entre e troque a senha em Minha conta.");
         }
         Cmd::Serve => serve(store, sf).await,
     }
