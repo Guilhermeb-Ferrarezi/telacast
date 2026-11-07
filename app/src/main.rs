@@ -1566,6 +1566,63 @@ fn apply_mention(text: &mut String, start: usize, cursor: usize, name: &str) -> 
     start + 1 + name.chars().count() + 1
 }
 
+/// Nomes (minúsculos) que viram menção no campo de mensagem: membros do canal, `everyone` e `here`.
+fn known_mention_names(s: &Session, ch: i64) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    match s.snap.servers.iter().find(|sv| sv.channels.iter().any(|c| c.id == ch)) {
+        Some(sv) => {
+            out.extend(sv.members.iter().map(|m| m.name.to_lowercase()));
+            out.insert("everyone".into());
+            out.insert("here".into());
+        }
+        None => {
+            out.extend(s.snap.dms.iter().filter(|d| d.channel_id == ch).map(|d| d.user.name.to_lowercase()));
+            out.insert(s.me.name.to_lowercase());
+        }
+    }
+    out
+}
+
+/// Texto do campo de mensagem com as menções completas (`@nome` de quem existe) em âmbar, como no chat.
+fn mention_job(ui: &egui::Ui, text: &str, known: &HashSet<String>, wrap: f32) -> egui::text::LayoutJob {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let plain = egui::TextFormat { font_id: font.clone(), color: ui.visuals().text_color(), ..Default::default() };
+    let hot = egui::TextFormat {
+        font_id: font,
+        color: AMBER_HOT,
+        background: alpha(AMBER, 0.14),
+        coords: egui::epaint::text::VariationCoords::new([(b"wght", 600.0)]),
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut last = 0; // byte
+    let mut i = 0;
+    while i < chars.len() {
+        let (b, c) = chars[i];
+        let starts = c == '@' && (i == 0 || chars[i - 1].1.is_whitespace());
+        if starts {
+            let mut j = i + 1;
+            while j < chars.len() && (chars[j].1.is_alphanumeric() || matches!(chars[j].1, '_' | '.' | '-')) {
+                j += 1;
+            }
+            let end = chars.get(j).map(|x| x.0).unwrap_or(text.len());
+            let name = text[b + 1..end].to_lowercase();
+            if !name.is_empty() && known.contains(&name) {
+                job.append(&text[last..b], 0.0, plain.clone());
+                job.append(&text[b..end], 0.0, hot.clone());
+                last = end;
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    job.append(&text[last..], 0.0, plain);
+    job
+}
+
 /// Cartão de prévia de texto (no estilo do Discord): primeiras linhas em fonte monoespaçada e, embaixo,
 /// uma barra com expandir/recolher, nome e tamanho, "Abrir" (tudo, num modal) e "Baixar".
 /// Recolhido mostra 6 linhas; expandido, 100. O Discord lê só os primeiros ~50 KB do arquivo.
@@ -3279,9 +3336,15 @@ impl App {
                     if presp.on_hover_text("Anexar arquivo").clicked() {
                         acts.push(Act::PickFile);
                     }
+                    let known = known_mention_names(s, ch);
+                    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap: f32| {
+                        let job = mention_job(ui, text.as_str(), &known, wrap);
+                        ui.painter().layout_job(job)
+                    };
                     let r = ui.add_sized(
                         [ui.available_width() - 84.0, 32.0],
                         egui::TextEdit::singleline(&mut s.input)
+                            .layouter(&mut layouter)
                             .id(input_id)
                             .frame(egui::Frame::NONE)
                             .hint_text(hint)
