@@ -242,7 +242,7 @@ enum Act {
     /// Abre o diálogo Transmitir (com o canal de voz como destino, ou o aberto se `None`).
     OpenGoLive(Option<i64>),
     OpenVoiceSettings,
-    SetVoiceOptions { ns: bool, monitor: bool },
+    SetVoiceOptions { ns: bool, monitor: bool, low: bool },
     SetVoiceDevices { input: Option<String>, output: Option<String> },
     OpenProfile { user: i64, name: String, anchor: egui::Rect, left: bool },
     Reply(i64, p::Reply),
@@ -371,6 +371,7 @@ struct Session {
     voice_err_shown: bool,
     /// Supressão de ruído (padrão ligada) e "ouvir meu microfone" (só com as configurações abertas).
     voice_ns: bool,
+    voice_ll: bool,
     voice_monitor: bool,
     /// Motor só para testar o microfone nas configurações, quando não estou numa chamada.
     test_engine: Option<std::sync::Arc<voice::Engine>>,
@@ -522,6 +523,7 @@ impl Session {
             voice_out: None,
             voice_err_shown: false,
             voice_ns: true,
+            voice_ll: true,
             voice_monitor: false,
             test_engine: None,
             tray_x: 0.0,
@@ -737,7 +739,7 @@ impl Session {
             f.extend_from_slice(pkt);
             let _ = bin_tx.send(f);
         });
-        match voice::Engine::start(voice::Config { input: self.voice_in.clone(), output: self.voice_out.clone() }, send) {
+        match voice::Engine::start(voice::Config { input: self.voice_in.clone(), output: self.voice_out.clone(), low_latency: self.voice_ll }, send) {
             Ok(e) => {
                 let e = std::sync::Arc::new(e);
                 e.set_muted(self.voice_muted || self.voice_deaf);
@@ -776,7 +778,7 @@ impl Session {
         if self.engine.is_some() || self.test_engine.is_some() {
             return;
         }
-        match voice::Engine::start(voice::Config { input: self.voice_in.clone(), output: self.voice_out.clone() }, Box::new(|_, _| {})) {
+        match voice::Engine::start(voice::Config { input: self.voice_in.clone(), output: self.voice_out.clone(), low_latency: self.voice_ll }, Box::new(|_, _| {})) {
             Ok(e) => {
                 let e = std::sync::Arc::new(e);
                 e.set_noise_suppression(self.voice_ns);
@@ -785,6 +787,11 @@ impl Session {
             }
             Err(e) => self.toast = Some((format!("Não consegui abrir o microfone: {e}"), Instant::now())),
         }
+    }
+
+    /// Atraso estimado do motor que está com o microfone aberto: (ouvir a si mesmo, vozes dos outros), em ms.
+    fn mic_engine_latency(&self) -> Option<(f32, f32)> {
+        self.engine.as_ref().or(self.test_engine.as_ref()).map(|e| e.latency_estimate_ms())
     }
 
     fn apply_voice_options(&self) {
@@ -1347,6 +1354,7 @@ struct App {
     voice_in: Option<String>,
     voice_out: Option<String>,
     voice_ns: bool,
+    voice_ll: bool,
     monitors: Vec<String>,
     monitor: usize,
     golive: GoLive,
@@ -1401,6 +1409,7 @@ impl App {
             session: None,
             token_saved: token,
             voice_ns: get("voice_ns") != "0",
+            voice_ll: get("voice_ll") != "0",
             voice_in: Some(get("voice_in")).filter(|v| !v.is_empty()),
             voice_out: Some(get("voice_out")).filter(|v| !v.is_empty()),
             fps: get("fps").parse().unwrap_or(60),
@@ -1463,6 +1472,7 @@ impl App {
                     sess.voice_in = self.voice_in.clone();
                     sess.voice_out = self.voice_out.clone();
                     sess.voice_ns = self.voice_ns;
+                    sess.voice_ll = self.voice_ll;
                     self.session = Some(sess);
                     return;
                 }
@@ -1519,6 +1529,7 @@ impl App {
 
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string("voice_ll", if self.voice_ll { "1" } else { "0" }.into());
         storage.set_string("voice_ns", if self.voice_ns { "1" } else { "0" }.into());
         storage.set_string("voice_in", self.voice_in.clone().unwrap_or_default());
         storage.set_string("voice_out", self.voice_out.clone().unwrap_or_default());
@@ -2632,12 +2643,26 @@ impl App {
                     s.modal = Modal::VoiceSettings(voice::list_devices());
                     s.start_test_engine();
                 }
-                Act::SetVoiceOptions { ns, monitor } => {
+                Act::SetVoiceOptions { ns, monitor, low } => {
+                    let low_changed = s.voice_ll != low;
+                    s.voice_ll = low;
+                    self.voice_ll = low;
                     s.voice_ns = ns;
                     self.voice_ns = ns;
                     s.voice_monitor = monitor;
                     if monitor {
                         s.start_test_engine();
+                    }
+                    if low_changed {
+                        // reabre o áudio com o tamanho de bloco novo
+                        if s.engine.is_some() {
+                            s.stop_voice_engine();
+                            s.start_voice_engine();
+                        }
+                        if s.test_engine.is_some() {
+                            s.test_engine = None;
+                            s.start_test_engine();
+                        }
                     }
                     s.apply_voice_options();
                 }
@@ -5082,7 +5107,8 @@ impl App {
                 let (mut input, mut output) = (s.voice_in.clone(), s.voice_out.clone());
                 let level = s.engine.as_ref().or(s.test_engine.as_ref()).map(|e| e.mic_level());
                 let connected = s.engine.is_some();
-                let (mut ns, mut monitor) = (s.voice_ns, s.voice_monitor);
+                let (mut ns, mut monitor, mut low) = (s.voice_ns, s.voice_monitor, s.voice_ll);
+                let lat = s.engine.as_ref().or(s.test_engine.as_ref()).map(|e| e.latency_estimate_ms());
                 modal(ctx, "Configurações de voz", 440.0, &mut dismissed, |ui| {
                     ui.set_width(400.0);
                     let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "Padrão do sistema".into());
@@ -5122,6 +5148,13 @@ impl App {
                     ui.checkbox(&mut ns, "Supressão de ruído");
                     ui.label(RichText::new("Tira teclado, ventilador e barulho de fundo antes de enviar (RNNoise).").size(12.0).color(MUTED));
                     ui.add_space(4.0);
+                    ui.checkbox(&mut low, "Baixa latência");
+                    let lat_txt = match lat {
+                        Some((m, r)) if m > 0.0 => format!("Atraso estimado: ouvir a si mesmo ~{m:.0} ms · vozes dos outros ~{r:.0} ms (sem a rede)."),
+                        _ => "Pede blocos de áudio pequenos ao sistema. Se estalar, desligue.".to_string(),
+                    };
+                    ui.label(RichText::new(lat_txt).size(12.0).color(MUTED));
+                    ui.add_space(4.0);
                     ui.checkbox(&mut monitor, "Ouvir meu microfone");
                     ui.label(RichText::new("Toca o que os outros ouvem. Use fone de ouvido: com caixa de som dá microfonia.").size(12.0).color(if monitor { AMBER } else { MUTED }));
                     ui.add_space(10.0);
@@ -5132,8 +5165,8 @@ impl App {
                 if input != s.voice_in || output != s.voice_out {
                     acts.push(Act::SetVoiceDevices { input, output });
                 }
-                if ns != s.voice_ns || monitor != s.voice_monitor {
-                    acts.push(Act::SetVoiceOptions { ns, monitor });
+                if ns != s.voice_ns || monitor != s.voice_monitor || low != s.voice_ll {
+                    acts.push(Act::SetVoiceOptions { ns, monitor, low });
                 }
             }
             Modal::TextView(a) => {
