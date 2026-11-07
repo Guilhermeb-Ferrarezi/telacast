@@ -113,8 +113,8 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 
 Proposta do [R04]: começar simples, trocar o transporte depois.
 
-- [~] **Canal de voz**: servidor pronto (estado em memória, `VoiceJoin/Leave/Set`, `VoiceUpdate/Left`, `Snapshot.voice`, relé de quadros binários com limites, 4 e2e) e interface pronta (lista com participantes, painel "Voz conectada", mudo/surdo, grade); falta ligar o motor de áudio (ver `docs/VOICE.md`). P0 **M**
-- [ ] **Áudio Opus pelo WebSocket atual** (`cpal` + Opus + jitter buffer + mixagem), com o mesmo formato de quadro que um UDP futuro usaria. P0 **M**
+- [x] **Canal de voz** (servidor, interface e motor): estado em memória, `VoiceJoin/Leave/Set`, relé de quadros Opus com limites (4 e2e), lista com participantes, painel "Voz conectada", mudo/surdo, grade com anel de fala, volume por pessoa e configurações de dispositivo. Falta: teste de áudio ponta a ponta com duas pessoas reais, reconexão de dispositivo, push-to-talk (ver `docs/VOICE.md`). P0 **M**
+- [x] **Áudio Opus pelo WebSocket atual** (`app/src/voice.rs`: cpal + Opus embutido + jitter buffer + mixagem, VAD por energia, em threads próprias).
 - [ ] **Mudo, ensurdecer, indicador de fala** (VAD por energia). P0 **S**
 - [ ] **Volume por usuário**, seleção de dispositivos, push-to-talk dentro da janela. P1 **S**
 - [ ] **Áudio do sistema na transmissão de tela** (monitor do PipeWire/Pulse → Opus como 2º fluxo). P1 **M**

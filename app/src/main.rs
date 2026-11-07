@@ -7,6 +7,7 @@ mod net;
 mod publisher;
 mod quick;
 mod update;
+mod voice;
 mod single;
 mod theme;
 mod viewer;
@@ -129,6 +130,8 @@ enum Modal {
     PreviewLocal { key: u64, name: String, path: std::path::PathBuf },
     /// Arquivo de texto aberto por inteiro (até 50 KB lidos).
     TextView(p::Attachment),
+    /// Configurações de voz: microfone e saída de áudio.
+    VoiceSettings(voice::Devices),
 }
 
 enum Act {
@@ -145,6 +148,8 @@ enum Act {
     ToggleMute,
     ToggleDeaf,
     OpenVoiceView,
+    OpenVoiceSettings,
+    SetVoiceDevices { input: Option<String>, output: Option<String> },
     OpenProfile { user: i64, name: String, anchor: egui::Rect, left: bool },
     Reply(i64, p::Reply),
     CancelReply,
@@ -257,6 +262,11 @@ struct Session {
     /// Atualização do app: estado compartilhado com a thread de consulta/download.
     update: std::sync::Arc<std::sync::Mutex<update::State>>,
     update_dismissed: bool,
+    /// Motor de áudio da voz (existe só enquanto estou num canal de voz) e dispositivos escolhidos.
+    engine: Option<std::sync::Arc<voice::Engine>>,
+    voice_in: Option<String>,
+    voice_out: Option<String>,
+    voice_err_shown: bool,
     /// Rolagem horizontal da bandeja de anexos e onde ela ficou na tela (para a roda do mouse).
     tray_x: f32,
     tray_rect: egui::Rect,
@@ -395,6 +405,10 @@ impl Session {
             voice_volumes: HashMap::new(),
             update: std::sync::Arc::new(std::sync::Mutex::new(update::State::Idle)),
             update_dismissed: false,
+            engine: None,
+            voice_in: None,
+            voice_out: None,
+            voice_err_shown: false,
             tray_x: 0.0,
             tray_rect: egui::Rect::NOTHING,
             upload_tx,
@@ -557,6 +571,59 @@ impl Session {
         });
     }
 
+    /// Liga o motor de áudio: o que ele codifica sai pelo gateway e os quadros que chegam vão para ele.
+    fn start_voice_engine(&mut self) {
+        if self.engine.is_some() {
+            return;
+        }
+        let bin_tx = self.gw.bin_tx.clone();
+        let send: Box<dyn FnMut(u32, &[u8]) + Send> = Box::new(move |seq, pkt| {
+            let mut f = Vec::with_capacity(5 + pkt.len());
+            f.push(p::VOICE_FRAME);
+            f.extend_from_slice(&seq.to_be_bytes());
+            f.extend_from_slice(pkt);
+            let _ = bin_tx.send(f);
+        });
+        match voice::Engine::start(voice::Config { input: self.voice_in.clone(), output: self.voice_out.clone() }, send) {
+            Ok(e) => {
+                let e = std::sync::Arc::new(e);
+                e.set_muted(self.voice_muted || self.voice_deaf);
+                e.set_deafened(self.voice_deaf);
+                for (u, v) in &self.voice_volumes {
+                    e.set_user_volume(*u, *v);
+                }
+                let e2 = e.clone();
+                self.gw.set_sink(Some(Box::new(move |b: &[u8]| {
+                    // [VOICE_FRAME][remetente i64][seq u32][opus]
+                    if b.len() > 13 && b[0] == p::VOICE_FRAME {
+                        let uid = i64::from_be_bytes(b[1..9].try_into().unwrap_or([0; 8]));
+                        let seq = u32::from_be_bytes(b[9..13].try_into().unwrap_or([0; 4]));
+                        e2.push_packet(uid, seq, &b[13..]);
+                    }
+                })));
+                self.voice_err_shown = false;
+                self.engine = Some(e);
+            }
+            Err(e) => {
+                self.toast = Some((format!("Não consegui abrir o áudio: {e}"), Instant::now()));
+                self.gw.send(C2S::VoiceLeave);
+            }
+        }
+    }
+
+    fn stop_voice_engine(&mut self) {
+        self.gw.set_sink(None);
+        self.engine = None;
+    }
+
+    /// Passa ao motor meu mudo/surdo atuais.
+    fn apply_voice_flags(&self) {
+        if let Some(e) = &self.engine {
+            e.set_muted(self.voice_muted || self.voice_deaf);
+            e.set_deafened(self.voice_deaf);
+        }
+    }
+
     /// Meu estado de voz (canal onde estou), se estiver conectado.
     fn my_voice(&self) -> Option<&p::VoiceState> {
         self.voice.iter().find(|v| v.user_id == self.me.id)
@@ -572,9 +639,13 @@ impl Session {
         self.snap.servers.iter().find_map(|sv| sv.channels.iter().find(|c| c.id == ch).map(|c| (c.name.clone(), sv.name.clone())))
     }
 
-    /// Está falando agora? (o motor de áudio responde; por ora ninguém)
-    fn voice_speaking(&self, _user: i64) -> bool {
-        false
+    /// Está falando agora? (o motor de áudio responde)
+    fn voice_speaking(&self, user: i64) -> bool {
+        match &self.engine {
+            Some(e) if user == self.me.id => e.self_speaking(),
+            Some(e) => e.speaking(user),
+            None => false,
+        }
     }
 
     /// Nome de um usuário conhecido (ou "?").
@@ -814,6 +885,11 @@ impl Session {
         while let Ok(ev) = self.gw.rx.try_recv() {
             match ev {
                 Event::Closed(why) => {
+                    // a conexão caiu: o servidor já tirou a pessoa da voz
+                    self.stop_voice_engine();
+                    self.voice.clear();
+                    self.voice_view = false;
+                    self.voice_since = None;
                     let attempt = match &self.link {
                         Link::Up => 1,
                         Link::Down { attempt, .. } | Link::Resuming { attempt } => attempt + 1,
@@ -857,6 +933,10 @@ impl Session {
                     S2C::Snapshot(sn) => {
                         self.me = sn.me.clone();
                         self.voice = sn.voice.clone();
+                        if self.my_voice().is_none() && self.engine.is_some() {
+                            self.stop_voice_engine();
+                            self.voice_view = false;
+                        }
                         // não lido = há mensagem mais nova que a última lida (fora o canal aberto)
                         let cur = self.current_channel();
                         self.unread = sn
@@ -1027,16 +1107,23 @@ impl Session {
                     }
                     S2C::VoiceUpdate(st) => {
                         self.voice.retain(|v| v.user_id != st.user_id);
-                        if st.user_id == self.me.id && self.voice_since.is_none() {
+                        let mine = st.user_id == self.me.id;
+                        if mine && self.voice_since.is_none() {
                             self.voice_since = Some(Instant::now());
                         }
                         self.voice.push(st);
+                        if mine {
+                            self.start_voice_engine();
+                        }
                     }
                     S2C::VoiceLeft { user_id, channel_id } => {
                         self.voice.retain(|v| !(v.user_id == user_id && v.channel_id == channel_id));
                         if user_id == self.me.id {
                             self.voice_view = false;
                             self.voice_since = None;
+                            self.stop_voice_engine();
+                        } else if let Some(e) = &self.engine {
+                            e.remove_user(user_id);
                         }
                     }
                     S2C::Auth { .. } => {}
@@ -1065,6 +1152,8 @@ struct App {
     token_saved: String,
     fps: u32,
     kbps: u32,
+    voice_in: Option<String>,
+    voice_out: Option<String>,
     monitors: Vec<String>,
     monitor: usize,
     publishing: Option<(i64, publisher::Handle)>,
@@ -1107,6 +1196,8 @@ impl App {
             login,
             session: None,
             token_saved: token,
+            voice_in: Some(get("voice_in")).filter(|v| !v.is_empty()),
+            voice_out: Some(get("voice_out")).filter(|v| !v.is_empty()),
             fps: get("fps").parse().unwrap_or(60),
             kbps: get("kbps").parse().unwrap_or(8000),
             monitors: publisher::monitor_names(),
@@ -1154,8 +1245,10 @@ impl App {
                     self.login.pass.clear();
                     self.login.error.clear();
                     self.login.resuming = false;
-                    let sess = Session::new(gw, self.login.server.clone(), ctx.clone(), token, me);
+                    let mut sess = Session::new(gw, self.login.server.clone(), ctx.clone(), token, me);
                     sess.check_update();
+                    sess.voice_in = self.voice_in.clone();
+                    sess.voice_out = self.voice_out.clone();
                     self.session = Some(sess);
                     return;
                 }
@@ -1209,6 +1302,8 @@ impl App {
 
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string("voice_in", self.voice_in.clone().unwrap_or_default());
+        storage.set_string("voice_out", self.voice_out.clone().unwrap_or_default());
         storage.set_string("server", self.login.server.clone());
         storage.set_string("user", self.login.user.clone());
         storage.set_string("token", self.token_saved.clone());
@@ -1930,6 +2025,17 @@ impl App {
             ctx.request_repaint_after(self.idle_after.saturating_sub(parado) + Duration::from_millis(200));
         }
 
+        // voz: redesenha para os anéis de "falando" e avisa se o dispositivo de áudio falhar
+        if let Some(e) = &s.engine {
+            ctx.request_repaint_after(Duration::from_millis(120));
+            if let Some(err) = e.error() {
+                if !s.voice_err_shown {
+                    s.voice_err_shown = true;
+                    s.toast = Some((format!("Problema no áudio: {err}"), Instant::now()));
+                }
+            }
+        }
+
         // faixa de atualização (versão nova disponível, baixando, pronta ou com erro)
         let upd = s.update.lock().map(|g| g.clone()).unwrap_or_default();
         if !self.fullscreen && !s.update_dismissed && !matches!(upd, update::State::Idle) {
@@ -2126,12 +2232,30 @@ impl App {
                         s.voice_muted = !s.voice_muted;
                     }
                     s.send_voice_set();
+                    s.apply_voice_flags();
                 }
                 Act::ToggleDeaf => {
                     s.voice_deaf = !s.voice_deaf;
                     s.send_voice_set();
+                    s.apply_voice_flags();
                 }
                 Act::OpenVoiceView => s.voice_view = true,
+                Act::OpenVoiceSettings => {
+                    // listar os dispositivos pode levar um instante (e o ALSA reclama no terminal; é normal)
+                    s.modal = Modal::VoiceSettings(voice::list_devices());
+                }
+                Act::SetVoiceDevices { input, output } => {
+                    let changed = s.voice_in != input || s.voice_out != output;
+                    self.voice_in = input.clone();
+                    self.voice_out = output.clone();
+                    s.voice_in = input;
+                    s.voice_out = output;
+                    if changed && s.engine.is_some() {
+                        // reabre os dispositivos já com a escolha nova
+                        s.stop_voice_engine();
+                        s.start_voice_engine();
+                    }
+                }
                 Act::OpenServer(id) => s.open_server(id),
                 Act::Send(m) => s.gw.send(m),
                 Act::Modal(m) => s.modal = m,
@@ -2526,6 +2650,10 @@ impl App {
                                     }
                                 }
                                 ui.separator();
+                                if ui.button("Configurações de voz").clicked() {
+                                    acts.push(Act::OpenVoiceSettings);
+                                    ui.close();
+                                }
                                 if ui.button("Minha conta").clicked() {
                                     acts.push(Act::OpenAccount);
                                     ui.close();
@@ -2810,6 +2938,9 @@ impl App {
                     let mut vol = s.voice_volumes.get(&uid).copied().unwrap_or(1.0);
                     if ui.add(egui::Slider::new(&mut vol, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)).show_value(true)).changed() {
                         s.voice_volumes.insert(uid, vol);
+                        if let Some(e) = &s.engine {
+                            e.set_user_volume(uid, vol);
+                        }
                     }
                 });
             }
@@ -2817,7 +2948,7 @@ impl App {
         // barra de controles
         let bar = egui::Rect::from_min_max(egui::pos2(total.min.x, total.max.y - controls_h), total.max);
         let (bw, bh, bgap) = (44.0_f32, 44.0_f32, 8.0_f32);
-        let total_w = bw * 2.0 + 56.0 + bgap * 2.0;
+        let total_w = bw * 3.0 + 56.0 + bgap * 3.0;
         let mut x = bar.center().x - total_w / 2.0;
         let yb = bar.center().y - bh / 2.0;
         let deaf = s.voice_deaf;
@@ -2858,6 +2989,18 @@ impl App {
         }
         if resp.on_hover_text("Desconectar").clicked() {
             acts.push(Act::LeaveVoice);
+        }
+        let g = egui::Rect::from_min_size(egui::pos2(r.right() + bgap, yb), egui::vec2(bw, bh));
+        let gresp = ui.interact(g, egui::Id::new("voice-settings"), egui::Sense::click());
+        let ghot = gresp.hovered();
+        ui.painter().rect_filled(g, 12.0, if ghot { L4 } else { L3 });
+        ui.painter().rect_stroke(g, 12.0, egui::Stroke::new(1.0, LINE2), egui::StrokeKind::Inside);
+        gear_icon(ui.painter(), g.center(), 22.0, if ghot { TEXT } else { TEXT2 });
+        if ghot {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if gresp.on_hover_text("Configurações de voz").clicked() {
+            acts.push(Act::OpenVoiceSettings);
         }
     }
 
@@ -4223,6 +4366,54 @@ impl App {
                 let caption = format!("{} · {}", a.name, files::human_size(a.size));
                 if lightbox(ctx, tex, &caption, Some(files::url(&base, a, &token))) {
                     dismissed = true;
+                }
+            }
+            Modal::VoiceSettings(devs) => {
+                let (mut input, mut output) = (s.voice_in.clone(), s.voice_out.clone());
+                let level = s.engine.as_ref().map(|e| e.mic_level());
+                let connected = s.engine.is_some();
+                modal(ctx, "Configurações de voz", 440.0, &mut dismissed, |ui| {
+                    ui.set_width(400.0);
+                    let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "Padrão do sistema".into());
+                    ui.label(caps("MICROFONE"));
+                    egui::ComboBox::from_id_salt("voice-in").width(ui.available_width()).selected_text(shown(&input)).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut input, None, "Padrão do sistema");
+                        for d in &devs.inputs {
+                            ui.selectable_value(&mut input, Some(d.clone()), d);
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(caps("SAÍDA DE ÁUDIO"));
+                    egui::ComboBox::from_id_salt("voice-out").width(ui.available_width()).selected_text(shown(&output)).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut output, None, "Padrão do sistema");
+                        for d in &devs.outputs {
+                            ui.selectable_value(&mut output, Some(d.clone()), d);
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(caps("NÍVEL DO MICROFONE"));
+                    let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
+                    ui.painter().rect_filled(bar, 5.0, L2);
+                    match level {
+                        Some(l) => {
+                            let w = bar.width() * l.clamp(0.0, 1.0);
+                            ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, egui::vec2(w, bar.height())), 5.0, OK);
+                            ctx.request_repaint_after(Duration::from_millis(80));
+                        }
+                        None => {
+                            ui.label(RichText::new("Entre num canal de voz para ver o nível do microfone.").size(12.0).color(MUTED));
+                        }
+                    }
+                    if connected {
+                        ui.label(RichText::new("Mudar o dispositivo reabre o áudio na hora.").size(12.0).color(MUTED));
+                    }
+                    ui.add_space(10.0);
+                    if small_button(ui, "Fechar", FIELD) {
+                        close = true;
+                    }
+                });
+                if input != s.voice_in || output != s.voice_out {
+                    acts.push(Act::SetVoiceDevices { input, output });
                 }
             }
             Modal::TextView(a) => {

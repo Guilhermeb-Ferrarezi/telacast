@@ -619,3 +619,15 @@ pub fn speaking_ring(p: &egui::Painter, c: egui::Pos2, r: f32, width: f32, surfa
     p.circle_stroke(c, r - width / 2.0, Stroke::new(width, OK));
     p.circle_stroke(c, r - width - 0.5, Stroke::new(1.0, surface));
 }
+
+/// Engrenagem (configurações).
+pub fn gear_icon(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) {
+    let s = size;
+    let st = Stroke::new((s * 0.11).max(1.6), color);
+    p.circle_stroke(c, 0.22 * s, st);
+    for i in 0..8 {
+        let a = (i as f32) * std::f32::consts::TAU / 8.0;
+        let d = vec2(a.cos(), a.sin());
+        p.line_segment([c + d * 0.30 * s, c + d * 0.42 * s], Stroke::new((s * 0.16).max(2.0), color));
+    }
+}

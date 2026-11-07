@@ -63,3 +63,7 @@ de cada um → saída (cpal, 48 kHz mono duplicado nos canais do dispositivo). S
 | Servidor: estado de voz, relé de quadros, limites, testes e2e | `server/` | agente A |
 | Motor de áudio + testes sem hardware | `app/src/voice.rs` (desenvolvido num crate de laboratório) | agente B |
 | Interface: lista de canais, painel "Voz conectada", cartão com mudo/surdo, visão do canal, ligação ao gateway | `app/src/main.rs`, `theme.rs`, `gateway.rs` | eu |
+
+## Estado (2026-11-07)
+
+Feito: protocolo, servidor, motor (`app/src/voice.rs`, dependências `cpal 0.16`, `opus 0.4` com libopus embutida, `rtrb`), interface e ligação ao gateway (o motor é criado quando o servidor confirma a entrada e destruído ao sair/cair a conexão; quadros binários vão direto da thread da rede ao motor). Testado: entrada real no PipeWire, medidor de microfone, anel de fala de um remoto simulado por pacotes. Não testado: duas pessoas reais conversando, troca de dispositivo com o áudio aberto por muito tempo.
