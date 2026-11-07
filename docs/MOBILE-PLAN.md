@@ -13,9 +13,33 @@ Objetivo: o app Android conversa com o **mesmo servidor** (mesmo protocolo JSON/
 | Protocolo | **contrato por fixtures**: o Rust grava JSONs de exemplo de cada mensagem em `proto/fixtures/`, o Kotlin lê os mesmos arquivos | mudança no protocolo quebra o teste dos dois lados |
 | Verificação visual | **Paparazzi** (renderiza telas Compose em PNG na JVM, sem emulador, sem tocar no seu celular) | cabe na RAM e roda sozinho de madrugada |
 | Pacote | `app.telacast`, pasta `~/telacast/android/` (fora do workspace Cargo) | |
-| Segredos | token em EncryptedSharedPreferences; keystore de release local e fora do git | |
+| Segredos | token cifrado com Android Keystore; keystore de release local e fora do git | |
 | Notificações | v1: serviço em primeiro plano opcional + notificações locais. **FCM só depois do deploy** (exige servidor público) | |
 | Transmissão | assistir primeiro; transmitir a tela do celular depois (MediaProjection) | |
+
+### 1.1 Stack Kotlin (versões)
+
+Versões marcadas ✔ já compilam nesta máquina (projeto do widget, `~/Projects/spotify-widget/android`) e estão no cache do Gradle. As outras eu fixo no A1 depois de resolver as dependências de verdade.
+
+| Camada | Escolha | Versão |
+|---|---|---|
+| Build | Android Gradle Plugin / Gradle / JDK | 8.5.2 ✔ / 8.9 ✔ / 21 ✔ |
+| Linguagem | Kotlin + plugin do compilador Compose + plugin de serialização | 2.0.21 ✔ |
+| UI | Jetpack Compose (BOM) com **foundation + ui + animation**; Material3 só como base de widgets, todo o visual vem do tema Grafite | BOM 2024.09.03 ✔ |
+| Atividade/ciclo de vida | activity-compose, lifecycle-runtime/viewmodel-compose | 1.9.2 ✔ / 2.8.6 ✔ |
+| Concorrência | kotlinx-coroutines (Flow/StateFlow) | 1.8.1 ✔ |
+| Rede | OkHttp (WebSocket de texto e binário, ping) | 4.12.0 ✔ |
+| Serialização | kotlinx-serialization-json com serializadores próprios para o enum do Rust | 1.7.3 ✔ |
+| Preferências | DataStore Preferences (rascunhos, categorias recolhidas, tamanho do texto) | já no cache |
+| Segredos | token cifrado com Android Keystore (AES-GCM, ~40 linhas próprias); **não** uso `security-crypto` (alpha e descontinuada) | – |
+| Vídeo | `MediaCodec` + `SurfaceView` (assistir); `MediaProjection` + encoder (transmitir) | API do sistema |
+| Imagens | nenhuma biblioteca por ora (avatares são iniciais desenhadas); Coil só quando houver upload | – |
+| Markdown | parser próprio (spec 10) que gera `AnnotatedString` | – |
+| Testes | JUnit 4, coroutines-test, MockWebServer (OkHttp), **Paparazzi** para PNG das telas | Paparazzi: fixo no A1 |
+
+**Arquitetura:** fluxo de dados em um sentido só. `Gateway` (OkHttp) → `Repository` (um `StateFlow<AppState>` com snapshot, mensagens, não lidos, digitando) → `ViewModel` → telas Compose sem lógica. Navegação por estado próprio (gaveta + tela atual) com `BackHandler`, sem biblioteca de navegação. Injeção de dependência manual num contêiner do `Application` (sem Hilt, sem KSP/kapt, porque processadores de anotação pesam na RAM e no tempo de build).
+
+**Por que não Rust/egui no Android:** o egui não tem campo de texto nativo (teclado, IME, sugestões, acessibilidade), e `MediaCodec`/`MediaProjection`/notificações exigiriam JNI em tudo. O ganho de reaproveitar código não paga isso. O que se reaproveita de verdade é o **protocolo** (via fixtures) e as **especificações de UI**.
 
 ## 2. O que NÃO faço sozinho
 
