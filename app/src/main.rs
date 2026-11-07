@@ -73,6 +73,7 @@ enum Act {
     Copy(String),
     Reply(i64, p::Reply),
     CancelReply,
+    JumpTo(i64),
     StartEdit(i64, String),
     CancelEdit,
     SaveEdit(i64, String),
@@ -108,6 +109,14 @@ struct Session {
     typing: HashMap<(i64, i64), Instant>,
     last_typing: Instant,
     focus_composer: bool,
+    jump: Option<Jump>,
+}
+
+/// Destaque temporário de uma mensagem para a qual o usuário saltou.
+struct Jump {
+    id: i64,
+    since: Instant,
+    scrolled: bool,
 }
 
 impl Session {
@@ -135,6 +144,7 @@ impl Session {
             typing: HashMap::new(),
             last_typing: Instant::now() - Duration::from_secs(60),
             focus_composer: false,
+            jump: None,
         }
     }
 
@@ -619,6 +629,17 @@ impl App {
                     s.focus_composer = true;
                 }
                 Act::CancelReply => s.replying = None,
+                Act::JumpTo(id) => {
+                    let found = s
+                        .current_channel()
+                        .and_then(|c| s.msgs.get(&c))
+                        .is_some_and(|v| v.iter().any(|m| m.id == id));
+                    if found {
+                        s.jump = Some(Jump { id, since: Instant::now(), scrolled: false });
+                    } else {
+                        s.toast = Some(("A mensagem original é antiga e ainda não foi carregada".into(), Instant::now()));
+                    }
+                }
                 Act::StartEdit(id, text) => s.editing = Some((id, text)),
                 Act::CancelEdit => s.editing = None,
                 Act::SaveEdit(id, text) => {
@@ -1132,13 +1153,23 @@ impl App {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             if let Some(r) = &m.reply {
-                                ui.horizontal(|ui| {
+                                let hr = ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
                                     ui.label(RichText::new("↳").size(13.0).color(MUTED));
                                     ui.label(RichText::new(&r.author).size(13.0).strong().color(TEXT2));
                                     let snip: String = r.content.chars().take(90).map(|c| if c == '\n' { ' ' } else { c }).collect();
                                     ui.label(RichText::new(snip).size(13.0).color(MUTED));
-                                });
+                                })
+                                .response;
+                                // clicar na resposta leva até a mensagem original
+                                let hit = ui.interact(hr.rect, egui::Id::new(("replyjump", m.id)), egui::Sense::click());
+                                if hit.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    ui.painter().hline(hr.rect.x_range(), hr.rect.bottom(), egui::Stroke::new(1.0, MUTED));
+                                }
+                                if hit.clicked() {
+                                    acts.push(Act::JumpTo(r.id));
+                                }
                             }
                             if !grouped {
                                 ui.horizontal(|ui| {
@@ -1188,6 +1219,17 @@ impl App {
                         egui::pos2(ui.max_rect().left() - 28.0, rc.top()),
                         egui::pos2(ui.max_rect().right() + 28.0, rc.bottom() + 0.5),
                     );
+                    if let Some(j) = &mut s.jump {
+                        if j.id == m.id {
+                            if !j.scrolled {
+                                j.scrolled = true;
+                                ui.scroll_to_rect(full, Some(Align::Center));
+                            }
+                            let a = (1.0 - j.since.elapsed().as_secs_f32() / 1.8).clamp(0.0, 1.0);
+                            ui.painter().set(bg, egui::Shape::rect_filled(full, 0.0, alpha(AMBER, 0.16 * a)));
+                            ui.ctx().request_repaint();
+                        }
+                    }
                     if !editing_this && ui.rect_contains_pointer(full) {
                         ui.painter().set(bg, egui::Shape::rect_filled(full, 0.0, Color32::from_white_alpha(6)));
                         if grouped {
@@ -1247,6 +1289,10 @@ impl App {
                     ui.add_space(if grouped { 1.0 } else { 8.0 });
                 }
             });
+
+        if s.jump.as_ref().is_some_and(|j| j.since.elapsed() > Duration::from_millis(1800)) {
+            s.jump = None;
+        }
 
         // "fulano está digitando…" (a linha reserva a altura mesmo vazia)
         let now = Instant::now();
