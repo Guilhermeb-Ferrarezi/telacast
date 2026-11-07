@@ -6,9 +6,9 @@ cd "$(dirname "$0")/.."
 scripts/gradle.sh recordPaparazziDebug
 mkdir -p docs/telas
 rm -f docs/telas/*.png
-for f in app/src/test/snapshots/images/app.telacast_TelasSnapshotTest_*.png app/src/test/snapshots/images/app.telacast_ConversaSnapshotTest_*.png; do
+for f in app/src/test/snapshots/images/app.telacast_TelasSnapshotTest_*.png app/src/test/snapshots/images/app.telacast_ConversaSnapshotTest_*.png app/src/test/snapshots/images/app.telacast_PerfilBuscaSnapshotTest_*.png; do
   nome="$(basename "$f" .png)"
-  nome="${nome#app.telacast_}"; nome="${nome#TelasSnapshotTest_}"; nome="${nome#ConversaSnapshotTest_}"   # o Paparazzi repete o nome: <teste>_<nome>
+  nome="${nome#app.telacast_}"; nome="${nome#TelasSnapshotTest_}"; nome="${nome#ConversaSnapshotTest_}"; nome="${nome#PerfilBuscaSnapshotTest_}"   # o Paparazzi repete o nome: <teste>_<nome>
   metade=$(( (${#nome} - 1) / 2 ))
   cp "$f" "docs/telas/${nome:0:$metade}.png"
 done

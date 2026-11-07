@@ -79,4 +79,15 @@ object Formatacao {
         val num = if (n == 1L && unidade == "hora") "uma" else if (n == 1L && unidade == "minuto") "um" else n.toString()
         return if (futuro) "em $num $unidade" else "há $num $unidade"
     }
+
+    /** "agora", "há 5 min", "há 3 h", "há 2 dias" (como `ago` do desktop). */
+    fun ha(agoraMs: Long, antesMs: Long): String {
+        val m = maxOf(0L, agoraMs - antesMs) / 60_000
+        return when {
+            m == 0L -> "agora"
+            m < 60 -> "há $m min"
+            m < 1440 -> "há ${m / 60} h"
+            else -> "há ${m / 1440} dias"
+        }
+    }
 }

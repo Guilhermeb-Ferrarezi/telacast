@@ -78,7 +78,7 @@ fun MenuDoServidor(dono: Boolean, aoConvidar: () -> Unit, aoCriarCanal: () -> Un
 }
 
 @Composable
-fun MenuDeStatus(atual: Status, aoEscolher: (Status) -> Unit, aoSair: () -> Unit, modifier: Modifier = Modifier) {
+fun MenuDeStatus(atual: Status, aoEscolher: (Status) -> Unit, aoAjustes: () -> Unit, aoSair: () -> Unit, modifier: Modifier = Modifier) {
     CaixaDeMenu(modifier) {
         for (st in listOf(Status.Online, Status.Idle, Status.Dnd, Status.Invisible)) {
             ItemDeMenu(
@@ -87,6 +87,7 @@ fun MenuDeStatus(atual: Status, aoEscolher: (Status) -> Unit, aoSair: () -> Unit
             )
         }
         SeparadorDeMenu()
+        ItemDeMenu("Ajustes", aoAjustes)
         ItemDeMenu("Sair da conta", aoSair, cor = Grafite.Vermelho)
     }
 }
@@ -129,6 +130,8 @@ class AcoesDialogo(
     val aoConfirmarSaida: () -> Unit = {},
     val aoApagarMensagem: (Long) -> Unit = {},
     val aoBaixarAnexo: (app.telacast.proto.Attachment) -> Unit = {},
+    val aoBloquear: (Long) -> Unit = {},
+    val aoRemoverAmigo: (Long) -> Unit = {},
 )
 
 @Composable
@@ -137,6 +140,24 @@ fun DialogoAtual(d: Dialogo, a: AcoesDialogo) {
         is Dialogo.AdicionarServidor -> DialogoAdicionarServidor(d.criar, a)
         is Dialogo.CriarCanal -> DialogoCriarCanal(d, a)
         is Dialogo.Convidar -> DialogoConvidar(d.codigo, a.aoFechar)
+        is Dialogo.ConfirmarBloquear -> Janela("Bloquear ${d.nome}?", a.aoFechar) {
+            Text("Vocês deixam de ser amigos, ninguém abre conversa privada com o outro e as mensagens dessa pessoa nos servidores ficam escondidas para você.", style = Tipos.CorpoApagado)
+            Spacer(Modifier.height(18.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Botao("Cancelar", TipoBotao.Quieto, Modifier.weight(1f), aoClicar = a.aoFechar)
+                Botao("Bloquear", TipoBotao.Perigo, Modifier.weight(1f), aoClicar = { a.aoBloquear(d.usuario) })
+            }
+        }
+        is Dialogo.ConfirmarRemoverAmigo -> Janela("Remover “${d.nome}”", a.aoFechar) {
+            Text("Você tem certeza de que deseja remover ${d.nome} dos seus amigos?", style = Tipos.CorpoApagado)
+            Spacer(Modifier.height(18.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Botao("Cancelar", TipoBotao.Quieto, Modifier.weight(1f), aoClicar = a.aoFechar)
+                Botao("Desfazer amizade", TipoBotao.Perigo, Modifier.weight(1f), aoClicar = { a.aoRemoverAmigo(d.usuario) })
+            }
+        }
+        // telas cheias com dados próprios: desenhadas em TelaPrincipal
+        Dialogo.Fixadas, Dialogo.Busca, Dialogo.Ajustes -> Unit
         is Dialogo.Imagem -> VisualizadorDeImagem(d.anexo, a.aoFechar) { a.aoBaixarAnexo(d.anexo) }
         is Dialogo.Texto -> VisualizadorDeTexto(d.anexo, a.aoFechar) { a.aoBaixarAnexo(d.anexo) }
         is Dialogo.ConfirmarApagar -> Janela("Apagar mensagem?", a.aoFechar) {

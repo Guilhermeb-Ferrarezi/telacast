@@ -87,6 +87,7 @@ class AcoesDaLista(
     val aoSpoiler: (mensagem: Long, spoiler: Int) -> Unit = { _, _ -> },
     val aoLink: (String) -> Unit = {},
     val aoUsuario: (Long) -> Unit = {},
+    val aoAbrirPerfil: (usuario: Long, nome: String) -> Unit = { _, _ -> },
     val aoVerFixadas: () -> Unit = {},
     val anexos: AcoesDeAnexo = AcoesDeAnexo(),
     val aoCarregarAnteriores: () -> Unit = {},
@@ -254,7 +255,10 @@ fun MensagemView(item: ItemDaLista.Mensagem, ctx: ContextoDaLista, acoes: AcoesD
             .combinedClickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = {}, onLongClick = { if (!item.pendente) acoes.aoPressionar(m) })
             .padding(start = 12.dp, end = 12.dp, top = if (item.agrupada) 1.dp else 8.dp, bottom = 1.dp),
     ) {
-        if (item.agrupada) Spacer(Modifier.width(52.dp)) else { Avatar(m.author, m.authorId, 40.dp, null, Grafite.L2); Spacer(Modifier.width(12.dp)) }
+        if (item.agrupada) Spacer(Modifier.width(52.dp)) else {
+            Toque({ acoes.aoAbrirPerfil(m.authorId, m.author) }, Modifier.size(40.dp), androidx.compose.foundation.shape.CircleShape, fundoPressionado = Color.Transparent) { Avatar(m.author, m.authorId, 40.dp, null, Grafite.L2) }
+            Spacer(Modifier.width(12.dp))
+        }
         Column(Modifier.weight(1f)) {
             Column(Modifier.alpha(if (item.pendente) 0.55f else 1f)) {
                 m.reply?.let { r ->
@@ -274,7 +278,8 @@ fun MensagemView(item: ItemDaLista.Mensagem, ctx: ContextoDaLista, acoes: AcoesD
                 }
                 if (!item.agrupada) {
                     Row(verticalAlignment = Alignment.Bottom) {
-                        Text(m.author, style = Tipos.Corpo.copy(fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold, color = Grafite.Texto), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                        Text(m.author, style = Tipos.Corpo.copy(fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold, color = Grafite.Texto), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false).clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) { acoes.aoAbrirPerfil(m.authorId, m.author) })
                         Spacer(Modifier.width(8.dp))
                         Text(Formatacao.hora(m.ts, ctx.zona), style = Tipos.Pequeno.copy(fontSize = 12.sp, color = Grafite.Apagado))
                         if (m.pinned) { Spacer(Modifier.width(8.dp)); Text("Fixada", style = Tipos.Pequeno.copy(fontSize = 11.5.sp, color = Grafite.Ambar)) }

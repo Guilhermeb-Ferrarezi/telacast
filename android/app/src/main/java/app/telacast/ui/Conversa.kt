@@ -34,11 +34,17 @@ class DadosDaConversa(
     val agoraMs: Long = System.currentTimeMillis(),
     val zona: ZoneId = ZoneId.systemDefault(),
     val compositorComFoco: Boolean = false,
+    val consultaDaBusca: String = "",
+    val buscaNoCanal: Boolean = false,
+    val tamanhoDoTexto: Int = 1,
+    val senhaTrocada: Int = 0,
 )
 
 class AcoesDaConversa(
     val lista: AcoesDaLista = AcoesDaLista(),
     val compositor: AcoesDoCompositor = AcoesDoCompositor(),
+    val aoAbrirBusca: () -> Unit = {},
+    val aoAbrirFixadas: () -> Unit = {},
 )
 
 /** Todos os usuários que o app conhece pelo snapshot (para resolver `<@id>` com o nome atual). */

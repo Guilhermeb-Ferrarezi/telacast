@@ -24,6 +24,7 @@ import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -172,5 +173,99 @@ class ConversaVmTest {
     @Test fun urlDoAnexoUsaOServidorEOToken() = runTest {
         val a = amb()
         assertEquals("http://h:1/files/9/a%20b.png?token=tok", a.vm.urlDoAnexo(Attachment(9, "a b.png", "image/png", 1, 1, 1)))
+    }
+
+    // ---------------------------------------------------------------- B7/B8
+
+    @Test fun perfilAbreFechaEVoltaFechaPrimeiro() = runTest {
+        val a = amb()
+        a.vm.abrirGaveta(); a.vm.abrirPerfil(marina, "marina.souza")
+        assertEquals(marina, a.vm.nav.value.perfil?.usuario)
+        a.vm.voltar()
+        assertNull(a.vm.nav.value.perfil); assertTrue(a.vm.nav.value.gavetaAberta)
+        a.vm.abrirPerfilDe(marina); assertEquals("marina.souza", a.vm.nav.value.perfil?.nome)
+    }
+
+    @Test fun conversarFechaOPerfilEPedeADm() = runTest {
+        val a = amb()
+        a.vm.abrirPerfil(marina, "m"); a.vm.conversarCom(marina)
+        assertNull(a.vm.nav.value.perfil)
+        assertEquals(C2S.OpenDm(marina), a.enviados.last())
+    }
+
+    @Test fun bloquearPedeConfirmacaoDesbloquearVaiDireto() = runTest {
+        val a = amb()
+        a.vm.abrirPerfil(marina, "marina.souza"); a.vm.pedirBloquear(marina, "marina.souza")
+        assertNull("o perfil dá lugar ao diálogo", a.vm.nav.value.perfil)
+        assertEquals(Dialogo.ConfirmarBloquear(marina, "marina.souza"), a.vm.nav.value.dialogo)
+        assertTrue(a.enviados.none { it is C2S.Block })
+        a.vm.bloquear(marina)
+        assertEquals(C2S.Block(marina), a.enviados.last()); assertNull(a.vm.nav.value.dialogo)
+        a.vm.desbloquear(marina); assertEquals(C2S.Unblock(marina), a.enviados.last())
+    }
+
+    @Test fun desfazerAmizadePedeConfirmacao() = runTest {
+        val a = amb()
+        a.vm.pedirDesfazerAmizade(marina, "marina.souza")
+        assertEquals(Dialogo.ConfirmarRemoverAmigo(marina, "marina.souza"), a.vm.nav.value.dialogo)
+        a.vm.desfazerAmizade(marina)
+        assertEquals(C2S.FriendRemove(marina), a.enviados.last())
+    }
+
+    @Test fun adicionarAmigoAvisa() = runTest {
+        val a = amb()
+        a.vm.adicionarAmigo("ana"); a.rodar()
+        assertEquals(C2S.FriendRequest("ana"), a.enviados.last())
+        assertEquals("Pedido de amizade enviado", a.vm.aviso.value)
+    }
+
+    @Test fun fixadasPedeAListaEAbreATela() = runTest {
+        val a = amb()
+        a.vm.abrirFixadas()
+        assertEquals(C2S.Pins(geral), a.enviados.last())
+        assertEquals(Dialogo.Fixadas, a.vm.nav.value.dialogo)
+    }
+
+    @Test fun buscaUsaOEscopoEAsFiltros() = runTest {
+        val a = amb()
+        a.vm.abrirBusca()
+        a.vm.mudarConsultaDaBusca("relatório de:eu")
+        a.vm.buscar()
+        val s1 = a.enviados.last() as C2S.Search
+        assertEquals(eu.id, s1.from); assertEquals("relatório", s1.text); assertEquals(null, s1.channelId); assertEquals(112623700000000001L, s1.serverId)
+        a.vm.mudarEscopoDaBusca(true); a.vm.buscar()
+        assertEquals(geral, (a.enviados.last() as C2S.Search).channelId)
+        a.vm.mudarConsultaDaBusca("   "); val n = a.enviados.size; a.vm.buscar(); assertEquals("vazio não envia", n, a.enviados.size)
+        a.vm.fecharTelaCheia(); assertNull(a.vm.nav.value.dialogo); assertFalse(a.vm.estado.value.busca.buscou)
+    }
+
+    @Test fun irParaMensagemDeOutroCanalAbreOCanal() = runTest {
+        val a = amb()
+        val memes = 112623700000000013L
+        a.vm.abrirBusca()
+        a.vm.irParaMensagem(memes, 4242)
+        assertNull(a.vm.nav.value.dialogo)
+        assertEquals(memes, a.vm.estado.value.canalAberto)
+        assertEquals(memes to 4242L, a.vm.estado.value.saltoAgendado)
+    }
+
+    @Test fun ajustesPedemSessoesESenhaTrocadaAvisa() = runTest {
+        val a = amb()
+        a.vm.abrirAjustes()
+        assertEquals(C2S.ListSessions, a.enviados.last()); assertEquals(Dialogo.Ajustes, a.vm.nav.value.dialogo)
+        a.vm.trocarSenha("velha123", "nova12345"); assertEquals(C2S.ChangePassword("velha123", "nova12345"), a.enviados.last())
+        a.vm.encerrarSessao(7); assertEquals(C2S.RevokeSession(7), a.enviados.last())
+        a.vm.encerrarOutrasSessoes(); assertEquals(C2S.RevokeOtherSessions, a.enviados.last())
+        val antes = a.vm.senhaTrocada.value
+        a.c.envia(S2C.PasswordChanged); a.rodar()
+        assertEquals(antes + 1, a.vm.senhaTrocada.value)
+    }
+
+    @Test fun tamanhoDoTextoFicaSalvo() = runTest {
+        val a = amb()
+        assertEquals(1, a.vm.tamanhoDoTexto.value)
+        a.vm.definirTamanhoDoTexto(2); assertEquals(2, a.prefs.tamanhoDoTexto)
+        a.vm.definirTamanhoDoTexto(9); assertEquals(2, a.vm.tamanhoDoTexto.value)
+        assertEquals(0.9f, app.telacast.ui.escalaDoTexto(0), 0.001f)
     }
 }

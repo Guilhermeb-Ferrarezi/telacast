@@ -28,6 +28,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -58,7 +59,7 @@ class AcoesDaFolha(
 
 /** Folha inferior de uma mensagem (toque longo), desenhada na composição: sem `Dialog`. */
 @Composable
-private fun FolhaBase(aoFechar: () -> Unit, conteudo: @Composable () -> Unit) {
+internal fun FolhaBase(aoFechar: () -> Unit, comAlca: Boolean = true, conteudo: @Composable () -> Unit) {
     Box(Modifier.fillMaxSize()) {
         Box(
             Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f))
@@ -66,11 +67,11 @@ private fun FolhaBase(aoFechar: () -> Unit, conteudo: @Composable () -> Unit) {
         )
         val forma = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp)
         Column(
-            Modifier.align(Alignment.BottomCenter).fillMaxWidth().background(Grafite.L2, forma).border(1.dp, Grafite.Linha2, forma)
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth().clip(forma).background(Grafite.L2).border(1.dp, Grafite.Linha2, forma)
                 .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = {})
                 .windowInsetsPadding(WindowInsets.navigationBars).padding(bottom = 8.dp),
         ) {
-            Box(Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp, bottom = 8.dp).size(width = 36.dp, height = 4.dp).background(Grafite.L4, RoundedCornerShape(2.dp)))
+            if (comAlca) Box(Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp, bottom = 8.dp).size(width = 36.dp, height = 4.dp).background(Grafite.L4, RoundedCornerShape(2.dp)))
             conteudo()
         }
     }

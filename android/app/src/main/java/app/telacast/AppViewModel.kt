@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import app.telacast.arquivos.Arquivos
 import app.telacast.arquivos.FonteDeArquivo
 import app.telacast.data.Aviso
+import app.telacast.data.Busca
 import androidx.compose.ui.text.input.TextFieldValue
 import app.telacast.data.SugestoesDeMencao
 import app.telacast.proto.Attachment
@@ -271,6 +272,76 @@ class AppViewModel(private val c: Container) : ViewModel() {
     fun abrirImagem(a: Attachment) = _nav.update { it.abrirDialogo(Dialogo.Imagem(a)) }
     fun abrirTexto(a: Attachment) = _nav.update { it.abrirDialogo(Dialogo.Texto(a)) }
 
+    // ------------------------------------------------------------------ perfil, amizades e bloqueio
+
+    fun abrirPerfil(usuario: Long, nome: String) = _nav.update { it.abrirPerfil(usuario, nome) }
+    fun fecharPerfil() = _nav.update { it.fecharPerfil() }
+
+    /** Abre (ou cria) a conversa privada; o `DmOpened` do servidor leva a tela até ela. */
+    fun conversarCom(usuario: Long) { fecharPerfil(); repo.abrirDm(usuario) }
+
+    fun adicionarAmigo(nome: String) { repo.pedirAmizade(nome); mostrarAviso("Pedido de amizade enviado") }
+    fun pedirDesfazerAmizade(id: Long, nome: String) = _nav.update { it.abrirDialogo(Dialogo.ConfirmarRemoverAmigo(id, nome)) }
+    fun desfazerAmizade(id: Long) { repo.removerAmigo(id); fecharDialogo() }
+    fun pedirBloquear(id: Long, nome: String) = _nav.update { it.abrirDialogo(Dialogo.ConfirmarBloquear(id, nome)) }
+    fun bloquear(id: Long) { repo.bloquear(id); fecharDialogo() }
+    fun desbloquear(id: Long) { repo.desbloquear(id); fecharPerfil() }
+
+    /** Nome da pessoa tocada numa menção `<@id>` (ou "usuário"), para a folha abrir mesmo sem snapshot dela. */
+    fun abrirPerfilDe(id: Long) = abrirPerfil(id, repo.estado.value.usuario(id)?.name ?: "usuário")
+
+    // ------------------------------------------------------------------ fixadas, busca e ajustes
+
+    fun abrirFixadas() {
+        val canal = repo.estado.value.canalAberto ?: return
+        repo.pedirFixadas(canal)
+        _nav.update { it.abrirDialogo(Dialogo.Fixadas) }
+    }
+
+    /** Leva até uma mensagem (resultado de busca ou fixada): salta se é o canal aberto; senão abre o canal e salta ao carregar. */
+    fun irParaMensagem(canal: Long, mensagem: Long) {
+        fecharDialogo()
+        val s = repo.estado.value
+        repo.irParaMensagem(canal, mensagem)
+        if (s.canalAberto == canal) return
+        val sv = s.snapshot?.servers?.firstOrNull { sv -> sv.channels.any { it.id == canal } }
+        if (sv != null) abrirCanal(sv.id, canal) else if (s.snapshot?.dms?.any { it.channelId == canal } == true) abrirDm(canal)
+    }
+
+    private val _consultaBusca = MutableStateFlow("")
+    val consultaDaBusca: StateFlow<String> = _consultaBusca.asStateFlow()
+    private val _buscaNoCanal = MutableStateFlow(false)
+    val buscaNoCanal: StateFlow<Boolean> = _buscaNoCanal.asStateFlow()
+
+    fun abrirBusca() {
+        repo.limparBusca(); _consultaBusca.value = ""
+        _nav.update { it.abrirDialogo(Dialogo.Busca) }
+    }
+    fun fecharTelaCheia() { repo.limparBusca(); fecharDialogo() }
+    fun mudarConsultaDaBusca(t: String) { _consultaBusca.value = t }
+    fun mudarEscopoDaBusca(noCanal: Boolean) { _buscaNoCanal.value = noCanal }
+
+    fun buscar(mais: Boolean = false) {
+        val s = repo.estado.value
+        val sn = s.snapshot ?: return
+        val eu = s.eu ?: return
+        val pedido = Busca.pedido(_consultaBusca.value, sn, s.canalAberto, eu.id, _buscaNoCanal.value) ?: return
+        repo.buscar(pedido, mais)
+    }
+
+    fun abrirAjustes() { repo.pedirSessoes(); _nav.update { it.abrirDialogo(Dialogo.Ajustes) } }
+    fun trocarSenha(atual: String, nova: String) = repo.trocarSenha(atual, nova)
+    fun encerrarSessao(id: Long) = repo.encerrarSessao(id)
+    fun encerrarOutrasSessoes() = repo.encerrarOutrasSessoes()
+
+    private val _tamanhoDoTexto = MutableStateFlow(c.preferencias.tamanhoDoTexto)
+    val tamanhoDoTexto: StateFlow<Int> = _tamanhoDoTexto.asStateFlow()
+    fun definirTamanhoDoTexto(n: Int) { c.preferencias.tamanhoDoTexto = n.coerceIn(0, 2); _tamanhoDoTexto.value = c.preferencias.tamanhoDoTexto }
+
+    /** Sobe quando o servidor confirma a troca de senha (a tela limpa os campos). */
+    private val _senhaTrocada = MutableStateFlow(0)
+    val senhaTrocada: StateFlow<Int> = _senhaTrocada.asStateFlow()
+
     // ------------------------------------------------------------------ ações de servidor e conta
 
     fun criarServidor(nome: String) {
@@ -315,7 +386,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
                 val canal = sv?.channels?.filter { it.kind == Channel.TEXTO }?.minByOrNull { it.position }
                 if (sv != null && canal != null) abrirCanal(sv.id, canal.id) else _nav.update { it.selecionarServidor(a.servidor) }
             }
-            Aviso.SenhaTrocada -> mostrarAviso("Senha alterada.")
+            Aviso.SenhaTrocada -> { _senhaTrocada.update { it + 1 }; mostrarAviso("Senha alterada. As outras sessões foram encerradas.") }
             is Aviso.Texto -> mostrarAviso(a.msg)
         }
     }

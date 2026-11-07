@@ -8,20 +8,18 @@ Plano: `docs/MOBILE-PLAN.md` (raiz do repositório). Este arquivo é o estado da
 
 ## Passo atual
 
-A1 a A3 e B1 a B3 estão commitados. **B4 (mensagens), B5 (compositor e ações) e B6 (histórico) feitos, aguardando revisão e commit.** Próximo: **B7 (Início completo: amigos e DMs), B8 (membros e perfil), B9 (ajustes)**; depois a fase C (vídeo).
+A1 a A3 e B1 a B6 estão commitados. **B7 (Início completo) e B8 (perfil, fixadas, busca, ajustes) feitos, aguardando revisão e commit.** Próximo: **fase C (vídeo: assistir e transmitir)** e **D (notificações, acabamento)**; B9 do plano original foi cumprido aqui (ajustes).
 
 ## Feito
 
-- A1 a A3: projeto, tema Grafite, protocolo (fixtures), Gateway, Repository, integração contra o servidor real.
-- B1 a B3: login/cadastro, gaveta com trilho e canais, menus, diálogos, Início mínimo (ver `docs/telas/`).
-- **Markdown** (`md/Markdown.kt`): porte fiel de `md/src/lib.rs` (blocos e inlines), com os mesmos casos de `md/src/tests.rs` em `MarkdownTest`. O desenho (`ui/MarkdownView.kt`) gera `AnnotatedString` com `LinkAnnotation.Clickable`: negrito, itálico, sublinhado, tachado, código em linha e em bloco (JetBrains Mono, `res/font/jetbrainsmono.ttf`), citação, listas, título, subtexto, spoiler que revela ao toque, links, menções `<@id>` com o nome atual, `<#id>`, `@everyone`/`@here` e carimbos `<t:..>`.
-- **Lista de mensagens B4** (`ui/Mensagens.kt`, `data/ItensDaLista.kt`): `LazyColumn(reverseLayout = true)`; as regras do desktop estão em `ItensDaLista.montar` (puro, testado): agrupamento (mesmo autor, menos de 5 min, sem resposta, sem quebra de dia/novas/sistema), divisor de dia (hoje, ontem, data), "NOVAS MENSAGENS" (marcador = último lido ao abrir o canal; `AppState.marcadores`), avisos de sistema (kind 2 e 3), mensagens de bloqueado recolhidas ("Mostrar mensagem"), pendentes em opacidade reduzida com "Enviando…", "Sem conexão. Será enviada ao reconectar." ou "Não foi enviada." com Tentar de novo e Descartar, reações em chips (âmbar quando eu reagi; toque alterna; "+" abre o seletor), "Fixada", "(editado)", cabeçalho de resposta que salta até a original.
-- **Anexos** (`arquivos/`, `ui/Anexos.kt`): imagem inline até 400x300 dp (cache LRU em memória por bytes, um download por anexo, `BitmapFactory` com `inSampleSize`), tela cheia com zoom (pinça e toque duplo), cartão de arquivo, prévia de texto/código (6 linhas, Expandir, Abrir em tela cheia, Baixar), download pelo `DownloadManager`. Sem Coil.
-- **Compositor B5** (`ui/Compositor.kt`, `data/Compositor.kt`): campo multilinha até 6 linhas, Enviar (âmbar com texto), "+" com `GetMultipleContents`, bandeja de miniaturas 120 dp com progresso, falha e remover, fila de 3 uploads por vez e no máximo 10 anexos por mensagem (`arquivos/Envios.kt`), "Respondendo a", "Editando mensagem" com Salvar/Cancelar, "fulano está digitando…", `Typing` no máximo a cada 4 s, rascunho por canal (SharedPreferences), autocompletar de `@` (membros, `@everyone`, `@here`).
-- **Folha de ações** (`ui/Folha.kt`): toque longo abre folha inferior desenhada na composição: prévia selecionável, reações rápidas, Responder, Editar (minhas), Copiar texto, Fixar/Desafixar (dono do servidor ou DM), Apagar (minhas ou dono; com confirmação); seletor de emojis.
-- **Histórico B6**: perto do topo chama `carregarAnteriores` (indicador "Carregando mensagens antigas…"; a posição não pula); salto até resposta antiga (`Repository.saltarPara`, no máximo 10 páginas, realce âmbar por ~1,5 s em `AppState.destaque`); `Ack` ao abrir o canal, ao chegar o histórico e ao chegar mensagem com o canal aberto.
-- Imagens: `docs/telas/*.png` (48), geradas por `TelasSnapshotTest` e `ConversaSnapshotTest` com `AppState` falso e bitmaps gerados em código.
-- Verificado: 213 testes unitários (24 `TelasSnapshotTest` + 24 `ConversaSnapshotTest` + paleta incluídos; markdown 15, itens da lista 11, compositor 13, arquivos 14, repository 30, ViewModel 15 + 13 da conversa) e 11 de integração (inclui upload/download de anexo por HTTP e salto até mensagem antiga); `verifyPaparazziDebug` verde.
+- A1 a A3, B1 a B6: ver os commits (login, gaveta, canais, mensagens, markdown, anexos, compositor, folha de ações, histórico).
+- **B7 Início completo** (`ui/Amigos.kt`, `data/ItensDeAmigos.kt`): abas Disponível, Todos, Pendente, Bloqueados e Adicionar amigo; busca local por nome; seções "ONLINE — N", "TODOS OS AMIGOS — N", "RECEBIDOS — N", "ENVIADOS — N", "BLOQUEADOS — N"; linha de pessoa com avatar de 40 (toque abre o perfil), botões redondos (Mensagem e Mais; Aceitar e Recusar; Cancelar), toque na linha abre a DM; Desbloquear; estados vazios com os textos do `docs/ui-spec/07`; Adicionar amigo tira o `@` e só envia com texto; confirmações para desfazer amizade e bloquear.
+- **B8 Perfil** (`ui/Perfil.kt`): folha inferior (a mesma `FolhaBase`), aberta ao tocar em avatar ou nome da mensagem, em menção `<@id>`, em membro do painel da direita e no avatar da lista de amigos. Faixa lisa na cor da pessoa, avatar de 80 com presença, nome, `@usuário`, status, "No Telacast desde" (data do snowflake), Mensagem, Adicionar/Desfazer amizade/Aceitar/Cancelar pedido, Bloquear/Desbloquear (com confirmação), Copiar ID, e "Ajustes e conta" no próprio perfil.
+- **B8 Fixadas** (`ui/Fixadas.kt`): botão de alfinete na barra do canal e o link "Ver todas as mensagens fixadas" abrem a lista; tocar leva até a mensagem (`Repository.irParaMensagem`, que abre o canal e salta quando o histórico chega). A lista se atualiza sozinha quando alguém fixa ou desafixa.
+- **B8 Busca** (`ui/Busca.kt`, `data/Busca.kt`): lupa na barra do canal ou da DM; campo, escopo (No servidor, Neste canal; DM sempre a própria conversa), filtros `de:nome`, `de:eu` e `em:#canal` (o mesmo `parse_search` do desktop), contagem, cartões de resultado (`# canal`, avatar, autor, dia e hora, markdown), "Mostrar mais" (paginação por `before`), estados Buscando, sem resultados e inicial. `AppState.busca` guarda o resultado; resposta de nonce antigo é ignorada.
+- **B8 Ajustes** (`ui/Ajustes.kt`): menu do cartão do usuário ganhou "Ajustes". Conta, trocar senha (valida 8 a 128 e igualdade; limpa os campos quando o servidor confirma), sessões abertas (Encerrar, Encerrar todas as outras), aparência mínima (tamanho do texto pequeno/normal/grande, salvo em `Preferencias.tamanhoDoTexto` e aplicado ao Markdown por `LocalEscalaDoTexto`; tema só Grafite escuro) e Sair da conta.
+- Imagens: `docs/telas/*.png` (69), geradas por `TelasSnapshotTest`, `ConversaSnapshotTest` e `PerfilBuscaSnapshotTest` com `AppState` falso.
+- Verificado: 258 testes unitários (imagens: 24 + 24 + 21 + paleta; busca/amigos 9; ViewModel 15 + 23; repository 35; demais como antes) e 14 de integração (novos: amizade, DM e bloqueio; fixadas e busca; senha errada e trocada, sessões); `verifyPaparazziDebug` verde.
 
 ## Bloqueado
 
@@ -68,7 +66,7 @@ AGP 8.5.2, Kotlin 2.0.21 (plugins do compilador Compose e de serialização), Gr
 - **O `History` não devolve `nonce`** (vem 0). Depois de reconectar, uma pendente cuja primeira cópia chegou e cujo eco se perdeu apareceria duas vezes (o desktop só compara `nonce`). O Kotlin concilia: mensagem do próprio usuário, mais nova que o maior id conhecido ao enviar (`depoisDe`) e com o mesmo texto, casa com a pendente.
 - **Possível bug do desktop:** `ack` ao abrir um canal usa `last_message_id` do `Snapshot`, que fica velho (o `Snapshot` não é reenviado a cada mensagem), e o `History` carregado não confirma nada. Mensagens que chegaram depois do último `Snapshot` ficam não lidas no servidor até outra mensagem chegar com o canal aberto. O Kotlin confirma (`Ack`) o id mais novo do histórico logo que ele chega no canal aberto (teste de integração `naoLidoEAckViajamPeloServidor`).
 - Limite de `Send` (12 por 10 s) estoura fácil em teste: uma `Send` recusada vira `Error RateLimited` e a pendente fica na fila; a tela do B-passos precisa de "reenviar/descartar" (o `Repository` já tem `reenviar` e `descartarPendente`).
-- Cadastro/login: 10 por 5 min por IP; a suíte de integração usa 8.
+- Cadastro/login: 10 por 5 min por IP; a suíte de integração usa 9.
 
 ## Decisões do B4 a B6
 
@@ -80,11 +78,14 @@ AGP 8.5.2, Kotlin 2.0.21 (plugins do compilador Compose e de serialização), Gr
 - Compartilhar anexo não foi feito (compartilharia o endereço com o token); há Baixar (DownloadManager) e abrir em tela cheia.
 - Moldura de sistema: a lista usa `windowInsetsPadding(navigationBars union ime)` no compositor; a barra de status é tratada na raiz da tela principal.
 
-## Pendências e fora do escopo (B7 em diante)
+## Pendências e fora do escopo (depois do B8)
 
-- Fixadas do canal (`Pins`) tem estado no Repository mas não tem tela; "Ver todas as mensagens fixadas" ainda não faz nada.
-- Perfil ao tocar no avatar ou na menção (B8), busca (`Search`), bloquear/desbloquear pela interface, ajustes (trocar senha, sessões) e voz.
-- Prova em aparelho: nada foi instalado; só imagens na JVM e integração contra o servidor real. Falta conferir na prática: teclado e `imePadding`, `GetMultipleContents`, `DownloadManager`, gestos de zoom e a rolagem do salto (o deslocamento do centro usa um valor negativo em `animateScrollToItem` com `reverseLayout`; está certo na teoria, mas só o aparelho confirma).
+- Busca: sem destaque dos termos nos resultados (o spec pede, o desktop não faz), sem histórico de busca, sem os filtros `tem:`, `antes:`, `depois:`, `fixadas:` (o protocolo só tem `de` e escopo) e sem ordenar; sem busca em todas as DMs.
+- Perfil: sem "amigos e servidores em comum" nem cargos (o protocolo não traz); sem bloquear por menu de contexto; "dono" só aparece quando a pessoa é dona do servidor do canal aberto.
+- Amigos: sem "Sugestões", sem nota no pedido, sem "Limpar tudo" e sem chamadas (voz ainda não existe). Remover a amizade de dentro da lista passa pelo perfil (o botão redondo "Mais" abre o perfil).
+- Ajustes: sem trocar nome ou avatar (o servidor não tem), sem notificações (fase D), sem tema claro (só Grafite), sem reduzir movimento.
+- Voz, vídeo e notificações (fases C e D). Prova em aparelho: nada foi instalado; só imagens na JVM e integração contra o servidor real.
+- Fixadas que o servidor traz em `Pins` ordenadas da mais recente; a tela não reordena.
 
 ## Decisões do B1 a B3
 
@@ -95,15 +96,8 @@ AGP 8.5.2, Kotlin 2.0.21 (plugins do compilador Compose e de serialização), Gr
 - Início na gaveta: o botão "DM" do trilho troca o painel para Amigos + DMs sem mudar o centro; tocar num servidor do trilho troca o painel sem mudar o centro (como no Discord mobile).
 - Primeira tela depois do login: último canal aberto (salvo), senão o primeiro canal de texto do primeiro servidor, senão Amigos.
 
-## Pendências e fora do escopo (B4 em diante)
+## Sugestões para a fase C e D
 
-- Lista de mensagens, compositor, ações de mensagem, markdown, perfil em folha inferior, painel de membros por cargo, ajustes (trocar senha, sessões) e voz.
-- Busca (`Search`) não tem estado nem tela.
-- Sem prova em aparelho: nada foi instalado; só imagens na JVM.
-
-## Sugestões para B7 em diante
-
-- B7: amigos e DMs completos reaproveitam `Repository.abrirDm`, `pedirAmizade`, `aceitarAmigo`, `removerAmigo`; falta bloquear (`C2S.Block`) e a lista "Bloqueados" (o `Snapshot.blocked` já alimenta a lista de mensagens).
-- B8: o perfil em folha inferior pode reusar `FolhaBase` de `ui/Folha.kt`; `AcoesMd.aoUsuario` e o avatar da mensagem já têm o gancho.
-- Fixadas: `Repository.pedirFixadas` e `AppState.fixadas` prontos; falta a tela (lista com `MensagemView`) e ligar o link de `LinhaDeSistema`.
-- C1: o `Gateway` já entrega quadros binários (`EventoGateway.Binario`); a transmissão usa conexão própria `/watch/{canal}?token=` (OkHttp) e `Snapshot.live` diz quem transmite.
+- C1 (assistir transmissão): `Snapshot.live` diz quem transmite e em qual canal; o vídeo usa conexão própria `/watch/{canal}?token=` (OkHttp, quadros `[flag][H.264 Annex B]`); começar a decodificar só em quadro-chave. O `Gateway` já entrega quadros binários do `/ws` (áudio), ainda sem uso.
+- D1 (notificações): `Repository` já separa `naoLidos` e `mencoes`; falta o serviço em primeiro plano e o canal de notificação por servidor.
+- Perfil e amigos reaproveitam `FolhaBase` e `EstadoVazio`; o "mais" de cada amigo pode virar menu de contexto no futuro.

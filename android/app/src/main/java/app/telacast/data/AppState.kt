@@ -67,6 +67,10 @@ data class AppState(
     val salto: Salto? = null,
     /** Mensagem a rolar até e realçar em âmbar por ~1,5 s. */
     val destaque: Destaque? = null,
+    /** Busca de mensagens (painel de busca). */
+    val busca: EstadoBusca = EstadoBusca(),
+    /** Salto pedido para um canal que ainda não estava aberto: sai quando o histórico dele chegar. */
+    val saltoAgendado: Pair<Long, Long>? = null,
 ) {
     /** O que a tela mostra no canal: as reais em ordem e, no fim, as provisórias na ordem de envio. */
     fun lista(canal: Long): List<Message> {
@@ -74,6 +78,16 @@ data class AppState(
         val eu = eu ?: return reais
         val prov = pendentes.filter { it.canal == canal }.map { it.provisoria(eu) }
         return if (prov.isEmpty()) reais else reais + prov
+    }
+
+    /** Procura a pessoa em tudo o que o snapshot traz (eu, membros, amigos, DMs, bloqueados). */
+    fun usuario(id: Long): User? {
+        val sn = snapshot ?: return eu?.takeIf { it.id == id }
+        if (sn.me.id == id) return sn.me
+        return sn.servers.firstNotNullOfOrNull { s -> s.members.firstOrNull { it.id == id } }
+            ?: sn.friends.firstOrNull { it.user.id == id }?.user
+            ?: sn.dms.firstOrNull { it.user.id == id }?.user
+            ?: sn.blocked.firstOrNull { it.id == id }
     }
 
     fun canal(id: Long): Channel? = snapshot?.servers?.firstNotNullOfOrNull { s -> s.channels.firstOrNull { it.id == id } }
@@ -91,6 +105,18 @@ data class Salto(val canal: Long, val id: Long, val paginas: Int)
 
 data class Destaque(val canal: Long, val id: Long, val desde: Long)
 
+/** Resultado da busca de mensagens (do desktop: `SearchState`). `mais` = há outra página. */
+data class EstadoBusca(
+    val consulta: String = "",
+    val nonce: Long = 0,
+    val hits: List<app.telacast.proto.SearchHit> = emptyList(),
+    val mais: Boolean = false,
+    val carregando: Boolean = false,
+    val anexando: Boolean = false,
+    /** Já buscou ao menos uma vez (distingue "sem resultados" de "ainda não buscou"). */
+    val buscou: Boolean = false,
+)
+
 /** Avisos de uma vez só (a tela reage e esquece): navegação e erros. */
 sealed interface Aviso {
     data class Erro(val codigo: app.telacast.proto.ErrorCode, val msg: String) : Aviso
@@ -100,3 +126,6 @@ sealed interface Aviso {
     /** Mensagem informativa curta (por exemplo, "A mensagem não está mais disponível"). */
     data class Texto(val msg: String) : Aviso
 }
+
+/** O id é um snowflake: carrega a data de criação da conta (época do servidor: 2026-01-01). Em milissegundos. */
+fun contaCriadaEm(id: Long): Long = (id shr 22) + 1_767_225_600_000L

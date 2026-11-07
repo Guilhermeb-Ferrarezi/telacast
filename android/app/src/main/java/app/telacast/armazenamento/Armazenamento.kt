@@ -11,6 +11,8 @@ interface Preferencias {
     /** Último canal aberto (para reabrir o app onde parou); 0 = nenhum. */
     var ultimoCanal: Long
     var ultimoServidor: Long
+    /** Tamanho do texto das mensagens: 0 pequeno, 1 normal, 2 grande. */
+    var tamanhoDoTexto: Int
     /** Rascunho do compositor por canal (some ao enviar). */
     fun rascunho(canal: Long): String
     fun salvarRascunho(canal: Long, texto: String)
@@ -29,6 +31,7 @@ class PreferenciasEmMemoria(
     override var categoriasRecolhidas: Set<Long> = emptySet(),
     override var ultimoCanal: Long = 0,
     override var ultimoServidor: Long = 0,
+    override var tamanhoDoTexto: Int = 1,
 ) : Preferencias {
     private val rascunhos = HashMap<Long, String>()
     override fun rascunho(canal: Long) = rascunhos[canal].orEmpty()

@@ -284,6 +284,66 @@ class IntegracaoTest {
         assertEquals(null, runBlocking { api.baixar(app.telacast.arquivos.Arquivos.url(app.telacast.arquivos.Arquivos.urlHttp(url!!), anexo, "invalido"), 1L shl 20) })
     }
 
+    // ------------------------------------------------------------------ amizade, bloqueio, fixadas, busca e conta (B7/B8)
+
+    @Test fun amizadeDmEBloqueio() {
+        val bobNome = bob.estado.eu!!.name
+        ana.repo.pedirAmizade(bobNome)
+        esperar("bob vê o pedido recebido") { bob.estado.snapshot?.friends?.firstOrNull { it.user.name == ana.estado.eu!!.name && it.status == app.telacast.proto.FriendStatus.Incoming } }
+        esperar("ana vê o pedido enviado") { ana.estado.snapshot?.friends?.firstOrNull { it.user.name == bobNome && it.status == app.telacast.proto.FriendStatus.Outgoing } }
+        bob.repo.aceitarAmigo(ana.estado.eu!!.id)
+        esperar("são amigos") { ana.estado.snapshot?.friends?.firstOrNull { it.user.name == bobNome && it.status == app.telacast.proto.FriendStatus.Friend } }
+
+        val antes = ana.avisos.size
+        ana.repo.abrirDm(bob.estado.eu!!.id)
+        val dm = esperar("DM aberta") { ana.avisos.drop(antes).filterIsInstance<Aviso.DmAberta>().firstOrNull() }
+        assertTrue(ana.estado.snapshot!!.dms.any { it.channelId == dm.canal })
+
+        ana.repo.bloquear(bob.estado.eu!!.id)
+        esperar("bob na lista de bloqueados") { ana.estado.snapshot?.blocked?.firstOrNull { it.name == bobNome } }
+        assertTrue("bloquear desfaz a amizade", ana.estado.snapshot!!.friends.none { it.user.name == bobNome })
+        ana.repo.desbloquear(bob.estado.eu!!.id)
+        esperar("desbloqueado") { if (ana.estado.snapshot?.blocked?.isEmpty() == true) true else null }
+    }
+
+    @Test fun fixadasEBusca() {
+        val canal = novoCanal()
+        ana.repo.abrirCanal(canal)
+        esperar("histórico") { if (ana.estado.mensagens.containsKey(canal)) true else null }
+        ana.repo.enviarMensagem(canal, "tesouro unico qwzx7788 enterrado aqui")
+        val m = esperar("mensagem") { ana.estado.mensagens[canal]?.firstOrNull { it.content.contains("qwzx7788") } }
+
+        ana.repo.fixar(m.id, true)
+        ana.repo.pedirFixadas(canal)
+        esperar("lista de fixadas") { ana.estado.fixadas[canal]?.firstOrNull { it.id == m.id } }
+        ana.repo.fixar(m.id, false) // o Repository pede a lista de novo sozinho
+        esperar("fixadas atualizada sem a mensagem") { if (ana.estado.fixadas[canal]?.none { it.id == m.id } == true) true else null }
+
+        val snap = ana.estado.snapshot!!
+        val pedido = app.telacast.data.Busca.pedido("qwzx7788 de:eu", snap, canal, ana.estado.eu!!.id, escopoCanal = true)!!
+        ana.repo.buscar(pedido)
+        val achou = esperar("resultado da busca") { ana.estado.busca.hits.firstOrNull { it.message.id == m.id } }
+        assertTrue(achou.channelName.isNotEmpty())
+        assertTrue(ana.estado.busca.buscou)
+        ana.repo.buscar(app.telacast.data.PedidoDeBusca("zzzinexistentezzz", "zzzinexistentezzz", canal, null, null))
+        esperar("busca sem resultados") { if (ana.estado.busca.buscou && ana.estado.busca.hits.isEmpty() && !ana.estado.busca.carregando) true else null }
+    }
+
+    @Test fun senhaESessoes() {
+        val eva = Cliente("eva_$sufixo").also { it.cadastrar() }
+        eva.repo.pedirSessoes()
+        val sessao = esperar("sessões") { eva.estado.sessoes.firstOrNull { it.current } }
+        assertEquals(1, eva.estado.sessoes.size)
+        assertTrue(sessao.id != 0L)
+        eva.repo.trocarSenha("senha-errada-xx", "outra-senha-123")
+        val erro = esperar("erro de senha atual") { eva.avisos.filterIsInstance<Aviso.Erro>().firstOrNull() }
+        assertEquals(ErrorCode.WrongPassword, erro.codigo)
+        eva.repo.trocarSenha("senha-eva_$sufixo", "outra-senha-123")
+        esperar("senha trocada") { eva.avisos.filterIsInstance<Aviso.SenhaTrocada>().firstOrNull() }
+        eva.repo.encerrarOutrasSessoes()
+        eva.gateway.desconectar()
+    }
+
     // ------------------------------------------------------------------ rede caindo e Resume
 
     @Test fun quedaDeRedeReconectaComResumeERecuperaMensagens() {
@@ -342,7 +402,7 @@ class IntegracaoTest {
     }
 
     @Test fun cadastroComConviteInvalidoEhRecusado() {
-        // conta como 1 tentativa de cadastro (o arquivo todo usa 8 das 10 permitidas por 5 min)
+        // conta como 1 tentativa de cadastro (o arquivo todo usa 9 das 10 permitidas por 5 min)
         val c = Cliente("fulano_$sufixo")
         c.repo.entrar(url!!, Credencial.Registro("fulano_$sufixo", "senha-fulano", "XXXX-0000"))
         val e = esperar("convite recusado") { c.estado.erroDeEntrada }

@@ -65,6 +65,11 @@ class AcoesPrincipais(
     val aoPedirSaida: () -> Unit = {},
     val conversa: AcoesDaConversa = AcoesDaConversa(),
     val folha: AcoesDaFolha = AcoesDaFolha(),
+    val perfil: AcoesDoPerfil = AcoesDoPerfil(),
+    val busca: AcoesDaBusca = AcoesDaBusca(),
+    val ajustes: AcoesDeAjustes = AcoesDeAjustes(),
+    val aoAbrirAjustes: () -> Unit = {},
+    val aoAbrirPerfil: (Long, String) -> Unit = { _, _ -> },
 )
 
 /**
@@ -123,11 +128,16 @@ fun TelaPrincipal(
             }
             CamadaLateral(pDir, aEsquerda = false, largura = larguraMembros, aoFechar = acoes.aoFecharMembros) {
                 val sv = (nav.destino as? Destino.Canal)?.let { d -> estado.snapshot?.servers?.firstOrNull { it.id == d.servidor } }
-                Box(Modifier.windowInsetsPadding(WindowInsets.statusBars)) { PainelDeMembros(sv) }
+                Box(Modifier.windowInsetsPadding(WindowInsets.statusBars)) { PainelDeMembros(sv, aoAbrirPerfil = acoes.aoAbrirPerfil) }
             }
 
             nav.folha?.let { f -> FolhaDaMensagem(estado, f.mensagem, f.emojis, acoes.folha) }
-            nav.dialogo?.let { DialogoAtual(it, acoes.dialogo) }
+            when (val d = nav.dialogo) {
+                null -> Unit
+                Dialogo.Fixadas, Dialogo.Busca, Dialogo.Ajustes -> TelaCheiaDoDialogo(d, estado, conversa, acoes)
+                else -> DialogoAtual(d, acoes.dialogo)
+            }
+            nav.perfil?.let { PerfilDaPrincipal(estado, it, acoes) }
             if (aviso != null) {
                 AvisoCurto(aviso, Modifier.align(Alignment.BottomCenter).windowInsetsPadding(WindowInsets.navigationBars).padding(bottom = 16.dp))
             }
@@ -196,7 +206,7 @@ private fun Gaveta(estado: AppState, nav: Navegacao, recolhidas: Set<Long>, acoe
             if (nav.menu == MenuAberto.Status) {
                 MenuDeStatus(
                     atual = estado.eu?.status?.takeIf { it != Status.Offline } ?: Status.Online,
-                    aoEscolher = acoes.aoEscolherStatus, aoSair = acoes.aoPedirSaida,
+                    aoEscolher = acoes.aoEscolherStatus, aoAjustes = acoes.aoAbrirAjustes, aoSair = acoes.aoPedirSaida,
                     modifier = Modifier.align(Alignment.BottomStart).padding(start = 8.dp, bottom = 68.dp),
                 )
             }
@@ -230,4 +240,32 @@ private fun FolhaDaMensagem(estado: AppState, id: Long, emojis: Boolean, a: Acoe
     val dm = estado.snapshot?.dms?.any { it.channelId == canal } == true
     if (emojis) FolhaDeEmojis(a.aoReagir, a.aoFechar)
     else FolhaDeAcoes(m, minha = m.authorId == eu.id, podeApagar = m.authorId == eu.id || dono, podeFixar = dono || dm, acoes = a)
+}
+
+/** Fixadas, Busca e Ajustes: telas cheias que precisam do estado do app (por isso não ficam em `DialogoAtual`). */
+@Composable
+private fun TelaCheiaDoDialogo(d: Dialogo, estado: AppState, conversa: DadosDaConversa, acoes: AcoesPrincipais) {
+    val nomes = androidx.compose.runtime.remember(estado.snapshot) { nomesDeUsuarios(estado) }
+    val canais = androidx.compose.runtime.remember(estado.snapshot) { estado.snapshot?.servers?.flatMap { it.channels }?.associate { it.id to it.name } ?: emptyMap() }
+    val amb = AmbienteMd(nomeDoUsuario = { nomes[it] }, nomeDoCanal = { canais[it] }, agoraSeg = conversa.agoraMs / 1000, zona = conversa.zona)
+    val eu = estado.eu
+    when (d) {
+        Dialogo.Fixadas -> TelaDeFixadas(estado.canalAberto?.let { estado.fixadas[it] }.orEmpty(), amb, conversa.agoraMs, conversa.zona, acoes.busca.aoFechar, acoes.busca.aoAbrirResultado)
+        Dialogo.Busca -> {
+            val servidor = estado.snapshot?.servers?.firstOrNull { sv -> sv.channels.any { it.id == estado.canalAberto } }
+            TelaDeBusca(estado.busca, conversa.consultaDaBusca, conversa.buscaNoCanal, servidor != null, servidor?.name.orEmpty(), amb, conversa.agoraMs, conversa.zona, acoes.busca)
+        }
+        Dialogo.Ajustes -> if (eu != null) TelaDeAjustes(eu, estado.sessoes, conversa.agoraMs, conversa.tamanhoDoTexto, conversa.senhaTrocada, acoes.ajustes)
+        else -> Unit
+    }
+}
+
+@Composable
+private fun PerfilDaPrincipal(estado: AppState, p: app.telacast.estado.PerfilAberto, acoes: AcoesPrincipais) {
+    val u = estado.usuario(p.usuario) ?: app.telacast.proto.User(p.usuario, p.nome, false, Status.Offline)
+    val sn = estado.snapshot
+    val relacao = sn?.friends?.firstOrNull { it.user.id == u.id }?.status
+    val bloqueado = sn?.blocked?.any { it.id == u.id } == true
+    val dono = sn?.servers?.any { sv -> sv.owner == u.id && sv.channels.any { it.id == estado.canalAberto } } == true
+    FolhaDePerfil(u, relacao, bloqueado, euMesmo = u.id == estado.eu?.id, dono = dono, a = acoes.perfil)
 }

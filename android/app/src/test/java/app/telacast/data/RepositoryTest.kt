@@ -439,4 +439,65 @@ class RepositoryTest {
         a.repo.saltarPara(geral, 3); a.t.runCurrent()
         assertEquals(listOf<Aviso>(Aviso.Texto("A mensagem não está mais disponível")), avisos)
     }
+
+    // ------------------------------------------------------------------ busca, fixadas e salto agendado (B8)
+
+    private fun hit(id: Long, canal: Long = geral, texto: String = "t$id") =
+        app.telacast.proto.SearchHit(msg(id, canal = canal, texto = texto), "geral")
+
+    @Test fun buscaPedeEGuardaResultadosEPaginaComMostrarMais() = runTest {
+        val a = amb(); a.entrar(); a.novos()
+        val pedido = PedidoDeBusca("relatório", "relatório", geral, null, null)
+        a.repo.buscar(pedido)
+        val envio = a.novos().single() as C2S.Search
+        assertEquals(C2S.Search(1, geral, null, null, "relatório", null), envio)
+        assertTrue(a.estado.busca.carregando)
+        a.servidor(S2C.SearchResults(1, listOf(hit(30), hit(29)), more = true))
+        assertEquals(listOf(30L, 29L), a.estado.busca.hits.map { it.message.id })
+        assertTrue(a.estado.busca.mais && a.estado.busca.buscou && !a.estado.busca.carregando)
+
+        a.repo.buscar(pedido, mais = true)
+        assertEquals("a próxima página começa depois da última listada", 29L, (a.novos().single() as C2S.Search).before)
+        a.servidor(S2C.SearchResults(2, listOf(hit(28)), more = false))
+        assertEquals(listOf(30L, 29L, 28L), a.estado.busca.hits.map { it.message.id })
+        assertFalse(a.estado.busca.mais)
+    }
+
+    @Test fun respostaDeBuscaAntigaEIgnorada() = runTest {
+        val a = amb(); a.entrar()
+        a.repo.buscar(PedidoDeBusca("a", "a", geral, null, null))
+        a.repo.buscar(PedidoDeBusca("b", "b", geral, null, null)) // nonce 2
+        a.servidor(S2C.SearchResults(1, listOf(hit(1)), more = false))
+        assertTrue("o nonce 1 já não vale", a.estado.busca.hits.isEmpty())
+        a.servidor(S2C.SearchResults(2, emptyList(), more = false))
+        assertTrue(a.estado.busca.buscou && a.estado.busca.hits.isEmpty())
+        a.repo.limparBusca()
+        assertFalse(a.estado.busca.buscou)
+    }
+
+    @Test fun fixarOuDesafixarAtualizaAListaDeFixadasJaPedida() = runTest {
+        val a = amb(); a.entrar(); a.repo.abrirCanal(geral); a.servidor(S2C.History(geral, listOf(msg(10))))
+        a.repo.pedirFixadas(geral); a.servidor(S2C.Pins(geral, listOf(msg(10))))
+        a.novos()
+        a.servidor(S2C.Pinned(geral, 10, false))
+        assertEquals(listOf<C2S>(C2S.Pins(geral)), a.novos())
+        a.servidor(S2C.Pinned(memes, 5, true)) // canal sem lista pedida: não pede
+        assertTrue(a.novos().isEmpty())
+    }
+
+    @Test fun saltoAgendadoParaOutroCanalSaiQuandoOHistoricoChega() = runTest {
+        val a = amb(); a.entrar(); a.repo.abrirCanal(geral); a.servidor(S2C.History(geral, listOf(msg(10))))
+        a.repo.irParaMensagem(memes, 777)
+        assertEquals(memes to 777L, a.estado.saltoAgendado)
+        a.repo.abrirCanal(memes)
+        a.servidor(S2C.History(memes, listOf(msg(776, canal = memes), msg(777, canal = memes))))
+        assertEquals(777L, a.estado.destaque?.id)
+        assertNull(a.estado.saltoAgendado)
+    }
+
+    @Test fun irParaMensagemNoCanalAbertoSaltaNaHora() = runTest {
+        val a = amb(); a.entrar(); a.repo.abrirCanal(geral); a.servidor(S2C.History(geral, listOf(msg(10), msg(11))))
+        a.repo.irParaMensagem(geral, 10)
+        assertEquals(10L, a.estado.destaque?.id)
+    }
 }

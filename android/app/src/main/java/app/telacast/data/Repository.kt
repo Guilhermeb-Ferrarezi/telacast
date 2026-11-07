@@ -134,6 +134,27 @@ class Repository(
         }
     }
 
+    /** Pede a busca. `mais` = próxima página (depois da última mensagem já listada). */
+    fun buscar(p: PedidoDeBusca, mais: Boolean = false) = synchronized(lock) {
+        val s = _estado.value
+        val antes = s.busca
+        val nonce = antes.nonce + 1
+        val before = if (mais) antes.hits.lastOrNull()?.message?.id else null
+        val enviado = gateway.enviar(C2S.Search(nonce, p.canal, p.servidor, p.de, p.texto, before))
+        _estado.value = s.copy(busca = antes.copy(
+            nonce = nonce, consulta = p.original, carregando = enviado, anexando = mais && enviado,
+            hits = if (mais) antes.hits else emptyList(), mais = if (mais) antes.mais else false, buscou = antes.buscou && mais,
+        ))
+    }
+
+    fun limparBusca() = modificar { it.copy(busca = EstadoBusca()) }
+
+    /** Vai até uma mensagem de qualquer canal (resultado de busca ou fixada): salta se já está no canal aberto; senão fica agendado. */
+    fun irParaMensagem(canal: Long, id: Long) = synchronized(lock) {
+        if (_estado.value.canalAberto == canal) saltarPara(canal, id)
+        else _estado.value = _estado.value.copy(saltoAgendado = canal to id)
+    }
+
     fun limparDestaque() = modificar { it.copy(destaque = null) }
 
     // ------------------------------------------------------------------ envio otimista
@@ -198,6 +219,11 @@ class Repository(
     fun aceitarAmigo(usuario: Long) { gateway.enviar(C2S.FriendAccept(usuario)) }
     /** Remove amigo, recusa ou cancela pedido. */
     fun removerAmigo(usuario: Long) { gateway.enviar(C2S.FriendRemove(usuario)) }
+    fun bloquear(usuario: Long) { gateway.enviar(C2S.Block(usuario)) }
+    fun desbloquear(usuario: Long) { gateway.enviar(C2S.Unblock(usuario)) }
+    fun trocarSenha(atual: String, nova: String) { gateway.enviar(C2S.ChangePassword(atual, nova)) }
+    fun encerrarSessao(id: Long) { gateway.enviar(C2S.RevokeSession(id)) }
+    fun encerrarOutrasSessoes() { gateway.enviar(C2S.RevokeOtherSessions) }
     fun pedirSessoes() { gateway.enviar(C2S.ListSessions) }
 
     /** Manda `Typing` no máximo a cada [intervaloDigitandoMs] por canal. */
@@ -263,6 +289,8 @@ class Repository(
             )
             is S2C.Pinned -> {
                 _estado.value = s.copy(mensagens = s.mensagens.mapMensagem(m.channelId, m.messageId) { it.copy(pinned = m.pinned) })
+                // a lista de fixadas já pedida fica em dia (igual ao desktop com o painel aberto)
+                if (m.channelId in s.fixadas) gateway.enviar(C2S.Pins(m.channelId))
             }
             is S2C.Pins -> _estado.value = s.copy(fixadas = s.fixadas + (m.channelId to m.messages))
             is S2C.Typing -> digitando(s, m)
@@ -276,7 +304,14 @@ class Repository(
             is S2C.DmOpened -> _avisos.trySend(Aviso.DmAberta(m.channelId))
             is S2C.ServerJoined -> _avisos.trySend(Aviso.ServidorEntrou(m.serverId))
             is S2C.Error -> _avisos.trySend(Aviso.Erro(m.code, m.msg))
-            is S2C.SearchResults -> Unit // a busca ainda não tem tela
+            is S2C.SearchResults -> {
+                val b = s.busca
+                if (m.nonce == b.nonce) {
+                    _estado.value = s.copy(busca = b.copy(
+                        hits = if (b.anexando) b.hits + m.hits else m.hits, mais = m.more, carregando = false, anexando = false, buscou = true,
+                    ))
+                }
+            }
             is S2C.Auth, is S2C.Desconhecida -> Unit // o Gateway já trata
         }
     }
@@ -360,6 +395,11 @@ class Repository(
         // Marca como lido o que acabou de chegar. Sem isto, mensagens que entraram DEPOIS do último `Snapshot` (cujo
         // `last_message_id` fica velho) nunca seriam confirmadas ao servidor ao abrir o canal.
         if (s.canalAberto == ch && ate > 0) gateway.enviar(C2S.Ack(ch, ate))
+        // pedi para ir a uma mensagem deste canal (busca/fixadas) antes de ele estar aberto: agora dá
+        _estado.value.saltoAgendado?.takeIf { it.first == ch }?.let { (c, id) ->
+            _estado.value = _estado.value.copy(saltoAgendado = null)
+            saltarPara(c, id)
+        }
     }
 
     /**
@@ -432,6 +472,9 @@ class Repository(
         const val PAGINAS_DO_SALTO = 10
     }
 }
+
+/** O que enviar numa busca (já interpretado: texto livre, `de:` e escopo). */
+data class PedidoDeBusca(val original: String, val texto: String, val canal: Long?, val servidor: Long?, val de: Long?)
 
 /** Insere por id mantendo a ordem; id repetido não duplica (o eco e o histórico podem trazer a mesma). */
 internal fun inserirOrdenada(lista: List<Message>, m: Message): List<Message> {

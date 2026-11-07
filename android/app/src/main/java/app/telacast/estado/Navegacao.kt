@@ -11,7 +11,7 @@ sealed interface Destino {
 }
 
 enum class AbaInicio(val rotulo: String) {
-    Disponivel("Disponível"), Todos("Todos"), Pendente("Pendente"), Adicionar("Adicionar amigo"),
+    Disponivel("Disponível"), Todos("Todos"), Pendente("Pendente"), Bloqueados("Bloqueados"), Adicionar("Adicionar amigo"),
 }
 
 /** Menus que abrem sobre a gaveta. */
@@ -29,7 +29,18 @@ sealed interface Dialogo {
     data class Imagem(val anexo: Attachment) : Dialogo
     /** Texto de um anexo em tela cheia. */
     data class Texto(val anexo: Attachment) : Dialogo
+    /** Mensagens fixadas do canal aberto. */
+    data object Fixadas : Dialogo
+    /** Busca de mensagens (no servidor ou neste canal). */
+    data object Busca : Dialogo
+    /** Ajustes: conta (senha, sessões), aparência. */
+    data object Ajustes : Dialogo
+    data class ConfirmarBloquear(val usuario: Long, val nome: String) : Dialogo
+    data class ConfirmarRemoverAmigo(val usuario: Long, val nome: String) : Dialogo
 }
+
+/** Perfil em folha inferior; `nome` serve de reserva quando a pessoa não está no snapshot (autor de mensagem antiga). */
+data class PerfilAberto(val usuario: Long, val nome: String)
 
 /** Folha inferior de uma mensagem (toque longo); `emojis` mostra o seletor de reação. */
 data class FolhaDeMensagem(val mensagem: Long, val emojis: Boolean = false)
@@ -47,6 +58,7 @@ data class Navegacao(
     val menu: MenuAberto? = null,
     val dialogo: Dialogo? = null,
     val folha: FolhaDeMensagem? = null,
+    val perfil: PerfilAberto? = null,
     val abaInicio: AbaInicio = AbaInicio.Disponivel,
 ) {
     fun abrirGaveta() = copy(gavetaAberta = true, membrosAbertos = false, menu = null)
@@ -68,17 +80,20 @@ data class Navegacao(
 
     fun abrirMenu(m: MenuAberto) = copy(menu = if (menu == m) null else m)
     fun fecharMenu() = copy(menu = null)
-    fun abrirDialogo(d: Dialogo) = copy(dialogo = d, menu = null, folha = null)
+    fun abrirDialogo(d: Dialogo) = copy(dialogo = d, menu = null, folha = null, perfil = null)
+    fun abrirPerfil(usuario: Long, nome: String) = copy(perfil = PerfilAberto(usuario, nome), menu = null, folha = null)
+    fun fecharPerfil() = copy(perfil = null)
     fun abrirFolha(mensagem: Long, emojis: Boolean = false) = copy(folha = FolhaDeMensagem(mensagem, emojis), menu = null)
     fun fecharFolha() = copy(folha = null)
     fun fecharDialogo() = copy(dialogo = null)
     fun escolherAba(a: AbaInicio) = copy(abaInicio = a)
 
     /** Algo que o botão Voltar do sistema fecha antes de sair do app? */
-    val podeVoltar: Boolean get() = dialogo != null || folha != null || menu != null || membrosAbertos || gavetaAberta
+    val podeVoltar: Boolean get() = perfil != null || dialogo != null || folha != null || menu != null || membrosAbertos || gavetaAberta
 
     /** Voltar do sistema: fecha, nesta ordem, diálogo, folha, menu, painel de membros e gaveta. */
     fun voltar(): Navegacao = when {
+        perfil != null -> fecharPerfil()
         dialogo != null -> fecharDialogo()
         folha != null -> fecharFolha()
         menu != null -> fecharMenu()

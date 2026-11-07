@@ -141,3 +141,70 @@ fun siglaDe(nome: String): String {
     val s = nome.replace("'s ", " ").split(Regex("[^\\p{L}\\p{N}]+")).filter { it.isNotEmpty() }.joinToString("") { it.first().toString() }
     return s.ifEmpty { "?" }
 }
+
+/** Balão de mensagem (botão "Mensagem" dos amigos). */
+@Composable
+fun IconeBalao(cor: Color, modifier: Modifier = Modifier, tamanho: Dp = 20.dp) {
+    Canvas(modifier.size(tamanho)) {
+        val s = size.width
+        val u = density
+        drawRoundRect(cor, Offset(0.14f * s, 0.18f * s), Size(0.72f * s, 0.50f * s), CornerRadius(0.12f * s), style = Stroke(1.7f * u, cap = StrokeCap.Round))
+        val cauda = Path().apply {
+            moveTo(0.30f * s, 0.68f * s); lineTo(0.30f * s, 0.84f * s); lineTo(0.48f * s, 0.68f * s)
+        }
+        drawPath(cauda, cor, style = Stroke(1.7f * u, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+    }
+}
+
+/** Três pontos na vertical (mais ações). */
+@Composable
+fun IconeMais3(cor: Color, modifier: Modifier = Modifier, tamanho: Dp = 20.dp) {
+    Canvas(modifier.size(tamanho)) {
+        val s = size.width
+        for (y in listOf(0.24f, 0.5f, 0.76f)) drawCircle(cor, 1.9f * density, Offset(s / 2, s * y))
+    }
+}
+
+@Composable
+fun IconeConfirmar(cor: Color, modifier: Modifier = Modifier, tamanho: Dp = 20.dp) {
+    Canvas(modifier.size(tamanho)) {
+        val s = size.width
+        val u = density
+        drawLine(cor, Offset(0.22f * s, 0.54f * s), Offset(0.42f * s, 0.72f * s), 2f * u, StrokeCap.Round)
+        drawLine(cor, Offset(0.42f * s, 0.72f * s), Offset(0.78f * s, 0.30f * s), 2f * u, StrokeCap.Round)
+    }
+}
+
+@Composable
+fun IconeLupa(cor: Color, modifier: Modifier = Modifier, tamanho: Dp = 22.dp) {
+    Canvas(modifier.size(tamanho)) {
+        val s = size.width
+        val u = density
+        drawCircle(cor, 0.26f * s, Offset(0.43f * s, 0.43f * s), style = Stroke(1.8f * u))
+        drawLine(cor, Offset(0.62f * s, 0.62f * s), Offset(0.84f * s, 0.84f * s), 1.9f * u, StrokeCap.Round)
+    }
+}
+
+/** Alfinete (mensagens fixadas). */
+@Composable
+fun IconeAlfinete(cor: Color, modifier: Modifier = Modifier, tamanho: Dp = 22.dp) {
+    Canvas(modifier.size(tamanho)) {
+        val s = size.width
+        val u = density
+        drawCircle(cor, 0.17f * s, Offset(0.5f * s, 0.33f * s))
+        drawLine(cor, Offset(0.5f * s, 0.46f * s), Offset(0.5f * s, 0.86f * s), 1.8f * u, StrokeCap.Round)
+        drawLine(cor, Offset(0.32f * s, 0.50f * s), Offset(0.68f * s, 0.50f * s), 1.8f * u, StrokeCap.Round)
+    }
+}
+
+/** Seta para a esquerda (voltar). */
+@Composable
+fun IconeVoltar(cor: Color, modifier: Modifier = Modifier, tamanho: Dp = 22.dp) {
+    Canvas(modifier.size(tamanho)) {
+        val s = size.width
+        val u = density
+        drawLine(cor, Offset(0.78f * s, 0.5f * s), Offset(0.22f * s, 0.5f * s), 1.9f * u, StrokeCap.Round)
+        drawLine(cor, Offset(0.45f * s, 0.27f * s), Offset(0.22f * s, 0.5f * s), 1.9f * u, StrokeCap.Round)
+        drawLine(cor, Offset(0.45f * s, 0.73f * s), Offset(0.22f * s, 0.5f * s), 1.9f * u, StrokeCap.Round)
+    }
+}

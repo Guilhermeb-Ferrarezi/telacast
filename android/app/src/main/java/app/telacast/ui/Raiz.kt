@@ -42,6 +42,10 @@ fun RaizDoApp(vm: AppViewModel) {
             val spoilers by vm.spoilers.collectAsState()
             val textos by vm.textosAbertos.collectAsState()
             val reveladas by vm.reveladas.collectAsState()
+            val consulta by vm.consultaDaBusca.collectAsState()
+            val buscaNoCanal by vm.buscaNoCanal.collectAsState()
+            val tamanhoTexto by vm.tamanhoDoTexto.collectAsState()
+            val senhaTrocada by vm.senhaTrocada.collectAsState()
             val contexto = LocalContext.current
             val area = LocalClipboardManager.current
             val links = LocalUriHandler.current
@@ -66,11 +70,11 @@ fun RaizDoApp(vm: AppViewModel) {
             val baixar: (app.telacast.proto.Attachment) -> Unit = { a -> runCatching { baixador.baixar(vm.urlDoAnexo(a), a.name) }.onFailure { vm.mostrarAviso("Não consegui baixar o arquivo.") } }
             // Voltar do sistema fecha diálogo, folha, menu, painel de membros e gaveta (nessa ordem) antes de sair do app
             BackHandler(enabled = nav.podeVoltar) { vm.voltar() }
-            CompositionLocalProvider(LocalProvedorDeAnexos provides provedor) {
+            CompositionLocalProvider(LocalProvedorDeAnexos provides provedor, LocalEscalaDoTexto provides escalaDoTexto(tamanhoTexto)) {
                 TelaPrincipal(
                     estado, nav, recolhidas, aviso,
                     acoesDe(vm, copiar = { area.setText(AnnotatedString(it)) }, abrirLink = { runCatching { links.openUri(it) } }, anexar = { seletor.launch("*/*") }, baixar = baixar),
-                    conversa = DadosDaConversa(compositor, anexos, spoilers, textos, reveladas, agora),
+                    conversa = DadosDaConversa(compositor, anexos, spoilers, textos, reveladas, agora, consultaDaBusca = consulta, buscaNoCanal = buscaNoCanal, tamanhoDoTexto = tamanhoTexto, senhaTrocada = senhaTrocada),
                 )
             }
         }
@@ -103,13 +107,17 @@ private fun acoesDe(
         aoConfirmarSaida = vm::sair,
         aoApagarMensagem = vm::apagarMensagem,
         aoBaixarAnexo = baixar,
+        aoBloquear = vm::bloquear,
+        aoRemoverAmigo = vm::desfazerAmizade,
     ),
     amigos = AcoesAmigos(
         aoEscolherAba = vm::escolherAba,
         aoPedirAmizade = { vm.pedirAmizade(it); vm.mostrarAviso("Pedido de amizade enviado") },
         aoAceitar = vm::aceitarAmigo,
-        aoRemover = vm::removerAmigo,
+        aoRecusar = vm::removerAmigo,
         aoConversar = vm::abrirDmCom,
+        aoAbrirPerfil = vm::abrirPerfil,
+        aoDesbloquear = vm::desbloquear,
     ),
     aoAbrirGaveta = vm::abrirGaveta,
     aoFecharGaveta = vm::fecharGaveta,
@@ -133,6 +141,9 @@ private fun acoesDe(
             aoMostrarBloqueada = vm::mostrarBloqueada,
             aoSpoiler = vm::alternarSpoiler,
             aoLink = abrirLink,
+            aoUsuario = vm::abrirPerfilDe,
+            aoAbrirPerfil = vm::abrirPerfil,
+            aoVerFixadas = vm::abrirFixadas,
             anexos = AcoesDeAnexo(aoAbrirImagem = vm::abrirImagem, aoBaixar = baixar, aoAbrirTexto = vm::abrirTexto, aoAlternarTexto = vm::alternarTexto),
             aoCarregarAnteriores = { vm.estado.value.canalAberto?.let { vm.carregarAnteriores(it) } },
             aoDestaqueTerminou = vm::limparDestaque,
@@ -142,7 +153,39 @@ private fun acoesDe(
             aoCancelarResposta = vm::cancelarResposta, aoCancelarEdicao = vm::cancelarEdicao,
             aoRemoverAnexo = vm::removerAnexo, aoTentarAnexo = vm::tentarAnexo, aoEscolherSugestao = vm::escolherSugestao,
         ),
+        aoAbrirBusca = vm::abrirBusca,
+        aoAbrirFixadas = vm::abrirFixadas,
     ),
+    perfil = AcoesDoPerfil(
+        aoFechar = vm::fecharPerfil,
+        aoConversar = vm::conversarCom,
+        aoAdicionar = vm::adicionarAmigo,
+        aoAceitar = { vm.aceitarAmigo(it); vm.fecharPerfil() },
+        aoDesfazerAmizade = vm::pedirDesfazerAmizade,
+        aoCancelarPedido = { vm.removerAmigo(it); vm.fecharPerfil() },
+        aoBloquear = vm::pedirBloquear,
+        aoDesbloquear = vm::desbloquear,
+        aoCopiarId = { copiar(it.toString()); vm.fecharPerfil(); vm.mostrarAviso("ID copiado") },
+        aoMinhaConta = vm::abrirAjustes,
+    ),
+    busca = AcoesDaBusca(
+        aoFechar = vm::fecharTelaCheia,
+        aoMudarConsulta = vm::mudarConsultaDaBusca,
+        aoMudarEscopo = vm::mudarEscopoDaBusca,
+        aoBuscar = { vm.buscar() },
+        aoMostrarMais = { vm.buscar(mais = true) },
+        aoAbrirResultado = vm::irParaMensagem,
+    ),
+    ajustes = AcoesDeAjustes(
+        aoFechar = vm::fecharTelaCheia,
+        aoTrocarSenha = vm::trocarSenha,
+        aoEncerrarSessao = vm::encerrarSessao,
+        aoEncerrarOutras = vm::encerrarOutrasSessoes,
+        aoEscolherTamanho = vm::definirTamanhoDoTexto,
+        aoSair = { vm.abrirDialogo(Dialogo.ConfirmarSair) },
+    ),
+    aoAbrirAjustes = vm::abrirAjustes,
+    aoAbrirPerfil = vm::abrirPerfil,
     folha = AcoesDaFolha(
         aoFechar = vm::fecharFolha,
         aoResponder = { vm.nav.value.folha?.let { vm.responderA(it.mensagem) } },

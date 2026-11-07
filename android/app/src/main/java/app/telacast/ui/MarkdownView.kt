@@ -41,6 +41,9 @@ import app.telacast.tema.Mono
 import app.telacast.tema.Tipos
 import java.time.ZoneId
 
+/** Escala do tamanho do texto das mensagens (Ajustes: pequeno, normal, grande). */
+val LocalEscalaDoTexto = androidx.compose.runtime.staticCompositionLocalOf { 1f }
+
 /** O que o desenho do Markdown precisa saber do app: nomes atuais e quais spoilers já foram revelados. */
 class AmbienteMd(
     val nomeDoUsuario: (Long) -> String? = { null },
@@ -109,6 +112,7 @@ fun TextoMarkdown(
     editada: Boolean = false,
 ) {
     val blocos = remember(texto) { Markdown.parse(texto) }
+    val tamanho = tamanho * LocalEscalaDoTexto.current
     Column(modifier) {
         val ultimo = blocos.lastIndex
         blocos.forEachIndexed { i, b ->

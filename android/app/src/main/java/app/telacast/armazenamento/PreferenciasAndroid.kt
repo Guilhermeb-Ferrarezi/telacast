@@ -26,6 +26,10 @@ class PreferenciasAndroid(contexto: Context) : Preferencias {
         get() = p.getLong("ultimo_servidor", 0)
         set(v) { p.edit().putLong("ultimo_servidor", v).apply() }
 
+    override var tamanhoDoTexto: Int
+        get() = p.getInt("tamanho_texto", 1)
+        set(v) { p.edit().putInt("tamanho_texto", v.coerceIn(0, 2)).apply() }
+
     private val rascunhos = contexto.getSharedPreferences("telacast_rascunhos", Context.MODE_PRIVATE)
 
     override fun rascunho(canal: Long): String = rascunhos.getString(canal.toString(), "") ?: ""
