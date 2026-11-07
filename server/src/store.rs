@@ -253,34 +253,35 @@ impl Store {
     }
 
     /// Entra no servidor pelo código. `None` se o convite for inválido, expirado, revogado ou esgotado.
-    pub async fn join_by_invite(&self, code: &str, user: i64) -> R<Option<i64>> {
+    /// Entra no servidor do convite. Devolve `(servidor, entrou_agora)`; quem já é membro recebe
+    /// `entrou_agora = false` (não conta uso do convite nem gera aviso).
+    pub async fn join_by_invite(&self, code: &str, user: i64) -> R<Option<(i64, bool)>> {
         let mut tx = self.pool.begin().await?;
         let sid: Option<(i64,)> = sqlx::query_as(
-            "SELECT server_id FROM server_invites
-             WHERE code = $1 AND revoked_at IS NULL
-               AND (expires_at IS NULL OR expires_at > now())
-               AND (max_uses IS NULL OR uses < max_uses)
-             FOR UPDATE",
+            "SELECT i.server_id FROM server_invites i
+             WHERE i.code = $1 AND i.revoked_at IS NULL
+               AND (i.expires_at IS NULL OR i.expires_at > now())
+               AND (i.max_uses IS NULL OR i.uses < i.max_uses
+                    OR EXISTS (SELECT 1 FROM members m WHERE m.server_id = i.server_id AND m.user_id = $2))
+             FOR UPDATE OF i",
         )
         .bind(code)
+        .bind(user)
         .fetch_optional(&mut *tx)
         .await?;
         let Some((sid,)) = sid else { return Ok(None) };
-        let already: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM members WHERE server_id = $1 AND user_id = $2")
+        let inserted = sqlx::query("INSERT INTO members(server_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
             .bind(sid)
             .bind(user)
-            .fetch_optional(&mut *tx)
-            .await?;
-        if already.is_none() {
-            sqlx::query("INSERT INTO members(server_id, user_id) VALUES ($1, $2)")
-                .bind(sid)
-                .bind(user)
-                .execute(&mut *tx)
-                .await?;
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            > 0;
+        if inserted {
             sqlx::query("UPDATE server_invites SET uses = uses + 1 WHERE code = $1").bind(code).execute(&mut *tx).await?;
         }
         tx.commit().await?;
-        Ok(Some(sid))
+        Ok(Some((sid, inserted)))
     }
 
     pub async fn server_owner(&self, server: i64) -> R<Option<i64>> {

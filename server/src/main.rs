@@ -802,7 +802,11 @@ async fn handle_authed(
                 err(ErrorCode::RateLimited, ERR_BUSY);
             } else {
                 match app.store.join_by_invite(&auth::normalize_code(&code), me).await {
-                    Ok(Some(sid)) => {
+                    Ok(Some((sid, false))) => {
+                        // já era membro: só abre o servidor, sem aviso nem novo uso do convite
+                        let _ = tx.send(S2C::ServerJoined { server_id: sid });
+                    }
+                    Ok(Some((sid, true))) => {
                         let ids = app.store.server_member_ids(sid).await.unwrap_or_default();
                         app.push_many(&ids).await;
                         // aviso "fulano entrou" no primeiro canal de texto

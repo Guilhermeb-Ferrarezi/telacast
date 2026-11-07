@@ -969,3 +969,42 @@ fn trocar_senha_e_encerrar_sessoes() {
     assert_eq!(a5.error_code().0, ErrorCode::SessionExpired);
     let _ = ana_id;
 }
+
+#[test]
+fn entrar_duas_vezes_no_mesmo_servidor() {
+    let env = Env::start();
+    let code = env.invite(2);
+    let mut ana = env.client();
+    ana.register("ana", &code);
+    let mut beto = env.client();
+    beto.register("beto", &code);
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    let invite = snap.servers[0].invite.clone();
+    let channel = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
+
+    beto.send(C2S::JoinServer { code: invite.clone() });
+    beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+    // a 2ª vez só reabre o servidor: sem novo aviso "entrou" e sem duplicar o membro
+    beto.send(C2S::JoinServer { code: invite.clone() });
+    beto.wait("ServerJoined de novo", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+    // o dono também usa o próprio convite sem efeito colateral
+    ana.send(C2S::JoinServer { code: invite });
+    ana.wait("ServerJoined do dono", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+
+    ana.send(C2S::Send { channel_id: channel, content: "marcador".into(), reply_to: None, nonce: 0, attachments: vec![] });
+    // o que chega depois da 2ª entrada tem de ser o marcador (nenhum "beto entrou" repetido no meio)
+    let mut entrou = 0;
+    beto.wait("o marcador", |m| match m {
+        S2C::Message(msg) if msg.kind == 2 => {
+            entrou += 1;
+            None
+        }
+        S2C::Message(msg) if msg.content == "marcador" => Some(()),
+        _ => None,
+    });
+    assert!(entrou <= 1, "o aviso de entrada apareceu {entrou} vezes");
+}
