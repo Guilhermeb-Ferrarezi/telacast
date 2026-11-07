@@ -1291,6 +1291,11 @@ struct App {
     golive: GoLive,
     /// Canal onde a transmissão vai ser feita (o de voz, quando o diálogo abre pela visão de voz).
     golive_target: Option<i64>,
+    /// Prévia da minha própria transmissão (miniatura da fonte, renovada a cada ~0,7 s).
+    publishing_source: Option<capture::Source>,
+    preview_tex: Option<egui::TextureHandle>,
+    preview_rx: Option<std::sync::mpsc::Receiver<Option<capture::Thumb>>>,
+    preview_last: Option<Instant>,
     publishing: Option<(i64, publisher::Handle)>,
     watching: Option<(i64, viewer::Handle)>,
     texture: Option<egui::TextureHandle>,
@@ -1339,6 +1344,10 @@ impl App {
             monitors: publisher::monitor_names(),
             golive: GoLive::new(),
             golive_target: None,
+            publishing_source: None,
+            preview_tex: None,
+            preview_rx: None,
+            preview_last: None,
             monitor: 0,
             publishing: None,
             watching: None,
@@ -1426,6 +1435,9 @@ impl App {
     }
 
     fn stop_publish(&mut self) {
+        self.publishing_source = None;
+        self.preview_tex = None;
+        self.preview_rx = None;
         if let Some((_, h)) = self.publishing.take() {
             h.stop.store(true, Ordering::Relaxed);
         }
@@ -2576,6 +2588,7 @@ impl App {
                         Some(info) => (info.source.clone(), self.golive.quality(info, self.fps)),
                         None => (capture::Source::Monitor(self.monitor), publisher::Quality { height: self.golive.res, fps: self.fps, kbps: self.kbps }),
                     };
+                    self.publishing_source = Some(source.clone());
                     self.publishing = Some((ch, publisher::start_source(url, source, q)));
                 }
                 Act::StopPublish => self.stop_publish(),
@@ -3051,6 +3064,34 @@ impl App {
         }
     }
 
+    /// Atualiza a prévia da minha transmissão em segundo plano (uma captura reduzida a cada ~0,7 s).
+    fn refresh_preview(&mut self, ctx: &egui::Context) {
+        let Some(src) = self.publishing_source.clone() else { return };
+        if let Some(rx) = &self.preview_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.preview_rx = None;
+                if let Some(t) = res {
+                    let img = egui::ColorImage::from_rgba_unmultiplied([t.width as usize, t.height as usize], &t.rgba);
+                    match &mut self.preview_tex {
+                        Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
+                        None => self.preview_tex = Some(ctx.load_texture("my-stream-preview", img, egui::TextureOptions::LINEAR)),
+                    }
+                }
+            }
+        }
+        if self.preview_rx.is_none() && self.preview_last.map_or(true, |t| t.elapsed() > Duration::from_millis(700)) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.preview_rx = Some(rx);
+            self.preview_last = Some(Instant::now());
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(capture::thumbnail(&src, 960));
+                ctx2.request_repaint();
+            });
+        }
+        ctx.request_repaint_after(Duration::from_millis(350));
+    }
+
     /// Visão do canal de voz: grade de participantes (16:9, linha incompleta centralizada) e barra de controles.
     fn voice_view_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &mut Session, acts: &mut Vec<Act>) {
         let Some(mv) = s.my_voice().cloned() else { return };
@@ -3076,7 +3117,11 @@ impl App {
         let watching_here = matches!(&self.watching, Some((c, _)) if *c == mv.channel_id);
         let live_here = s.snap.live.iter().find(|l| l.channel_id == mv.channel_id).cloned();
         let sharing = self.publishing.as_ref().is_some_and(|(c, _)| *c == mv.channel_id);
-        let (stream_rect, stage) = if watching_here {
+        let preview_here = sharing && !watching_here;
+        if preview_here {
+            self.refresh_preview(ctx);
+        }
+        let (stream_rect, stage) = if watching_here || preview_here {
             let strip = 120.0;
             (
                 Some(egui::Rect::from_min_max(stage.min, egui::pos2(stage.max.x, stage.max.y - strip - 8.0))),
@@ -3167,8 +3212,34 @@ impl App {
             }
         }
         if let Some(sr) = stream_rect {
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sr));
-            self.stream_area(&mut child, ctx, &*s, acts, true);
+            if watching_here {
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sr));
+                self.stream_area(&mut child, ctx, &*s, acts, true);
+            } else {
+                // a minha própria tela: prévia ao vivo no palco, como no Discord
+                let pt = ui.painter();
+                pt.rect_filled(sr, 8.0, Color32::BLACK);
+                match &self.preview_tex {
+                    Some(t) => {
+                        let ts = t.size_vec2();
+                        let k = (sr.width() / ts.x).min(sr.height() / ts.y);
+                        egui::Image::new(t).fit_to_exact_size(ts * k).paint_at(ui, egui::Rect::from_center_size(sr.center(), ts * k));
+                    }
+                    None => {
+                        pt.text(sr.center(), Align2::CENTER_CENTER, "Preparando a prévia…", egui::FontId::proportional(15.0), MUTED);
+                    }
+                }
+                let pt = ui.painter();
+                let g = pt.layout_no_wrap("VOCÊ ESTÁ AO VIVO".to_string(), egui::FontId::proportional(12.0), Color32::WHITE);
+                let pill = egui::Rect::from_min_size(sr.min + egui::vec2(10.0, 10.0), g.size() + egui::vec2(26.0, 10.0));
+                pt.rect_filled(pill, 5.0, Color32::from_black_alpha(170));
+                pt.circle_filled(pill.left_center() + egui::vec2(11.0, 0.0), 4.0, AMBER);
+                pt.galley(pill.min + egui::vec2(22.0, 5.0), g, Color32::WHITE);
+                let btn = egui::Rect::from_min_size(sr.right_top() + egui::vec2(-110.0, 8.0), egui::vec2(100.0, 28.0));
+                if ui.put(btn, egui::Button::new("Gerenciar").fill(Color32::from_black_alpha(170))).clicked() {
+                    acts.push(Act::OpenGoLive(Some(mv.channel_id)));
+                }
+            }
         }
         // barra de controles
         let bar = egui::Rect::from_min_max(egui::pos2(total.min.x, total.max.y - controls_h), total.max);
