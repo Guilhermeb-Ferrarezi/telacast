@@ -1394,3 +1394,52 @@ fn atualizacao_publicar_e_baixar() {
     assert_eq!(http(env.port, "GET", "/update/file/XYZ", b"").0, 400);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn transmissao_espectadores() {
+    let env = Env::start();
+    let code = env.invite(2);
+    let mut ana = env.client();
+    let (ana_token, ana_id) = ana.register("ana", &code);
+    let mut beto = env.client();
+    let (beto_token, beto_id) = beto.register("beto", &code);
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    let channel = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
+    beto.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
+    beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+
+    // a ana transmite (um quadro-chave falso basta para o servidor)
+    let (mut pubws, _) = tungstenite::connect(format!("ws://127.0.0.1:{}/publish/{channel}?token={ana_token}", env.port)).unwrap();
+    pubws.send(tungstenite::Message::Binary(vec![1u8, 0, 0, 0, 1].into())).unwrap();
+    beto.wait("a transmissão aparece", |m| match m {
+        S2C::Snapshot(s) if !s.live.is_empty() => Some(()),
+        _ => None,
+    });
+
+    // o beto assiste: a ana e ele recebem a lista com o beto
+    let (mut view, _) = tungstenite::connect(format!("ws://127.0.0.1:{}/watch/{channel}?token={beto_token}", env.port)).unwrap();
+    let users = ana.wait("espectadores da ana", |m| match m {
+        S2C::Viewers { channel_id, users } if *channel_id == channel && !users.is_empty() => Some(users.clone()),
+        _ => None,
+    });
+    assert_eq!(users, vec![beto_id]);
+    beto.wait("espectadores do beto", |m| matches!(m, S2C::Viewers { users, .. } if users == &vec![beto_id]).then_some(()));
+    // o relé funciona: o espectador recebe o quadro-chave
+    let got = loop {
+        match view.read().unwrap() {
+            tungstenite::Message::Binary(b) => break b,
+            _ => continue,
+        }
+    };
+    assert_eq!(got[0], 1);
+
+    // o beto sai: a lista da ana esvazia
+    view.close(None).ok();
+    drop(view);
+    ana.wait("lista vazia", |m| matches!(m, S2C::Viewers { users, .. } if users.is_empty()).then_some(()));
+    let _ = (ana_id, pubws.close(None));
+}

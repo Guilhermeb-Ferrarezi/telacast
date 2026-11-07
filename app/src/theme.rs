@@ -649,3 +649,29 @@ pub fn camera_icon(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) 
     p.rect_stroke(Rect::from_center_size(c + vec2(-0.08 * s, 0.0), vec2(0.58 * s, 0.42 * s)), 0.07 * s, st, StrokeKind::Middle);
     p.add(egui::Shape::convex_polygon(vec![c + vec2(0.26 * s, -0.04 * s), c + vec2(0.44 * s, -0.16 * s), c + vec2(0.44 * s, 0.16 * s), c + vec2(0.26 * s, 0.04 * s)], color, Stroke::NONE));
 }
+
+/// Tela cheia: quatro cantos (para fora) ou, com `exit`, quatro cantos (para dentro).
+pub fn fullscreen_icon(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32, exit: bool) {
+    let st = Stroke::new((size * 0.09).max(1.5), color);
+    let (o, l) = (0.36 * size, 0.2 * size);
+    for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        let corner = if exit { c + vec2(sx * 0.16 * size, sy * 0.16 * size) } else { c + vec2(sx * o, sy * o) };
+        let dx = if exit { sx * l } else { -sx * l };
+        let dy = if exit { sy * l } else { -sy * l };
+        p.line_segment([corner, corner + vec2(dx, 0.0)], st);
+        p.line_segment([corner, corner + vec2(0.0, dy)], st);
+    }
+}
+
+/// Parar (quadrado cheio).
+pub fn stop_icon(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) {
+    p.rect_filled(Rect::from_center_size(c, vec2(size * 0.42, size * 0.42)), size * 0.06, color);
+}
+
+/// X de fechar.
+pub fn close_icon(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) {
+    let st = Stroke::new((size * 0.1).max(1.6), color);
+    let d = size * 0.25;
+    p.line_segment([c + vec2(-d, -d), c + vec2(d, d)], st);
+    p.line_segment([c + vec2(-d, d), c + vec2(d, -d)], st);
+}

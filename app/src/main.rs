@@ -357,6 +357,10 @@ struct Session {
     voice_since: Option<Instant>,
     /// Volume de cada pessoa que ouço (0.0 a 2.0; ausente = 1.0).
     voice_volumes: HashMap<i64, f32>,
+    /// Quem assiste a cada transmissão (o servidor manda; vale para o transmissor e para os espectadores).
+    viewers: HashMap<i64, Vec<i64>>,
+    /// Participante em foco na visão de voz (duplo clique no tile); `None` = grade.
+    voice_focus: Option<i64>,
     /// Atualização do app: estado compartilhado com a thread de consulta/download.
     update: std::sync::Arc<std::sync::Mutex<update::State>>,
     update_dismissed: bool,
@@ -509,6 +513,8 @@ impl Session {
             nav_moving: false,
             voice_since: None,
             voice_volumes: HashMap::new(),
+            viewers: HashMap::new(),
+            voice_focus: None,
             update: std::sync::Arc::new(std::sync::Mutex::new(update::State::Idle)),
             update_dismissed: false,
             engine: None,
@@ -1063,6 +1069,8 @@ impl Session {
             match ev {
                 Event::Closed(why) => {
                     // a conexão caiu: o servidor já tirou a pessoa da voz
+                    self.viewers.clear();
+                    self.voice_focus = None;
                     self.stop_voice_engine();
                     self.voice.clear();
                     self.voice_view = false;
@@ -1282,6 +1290,13 @@ impl Session {
                         }
                         self.toast = Some(("Senha alterada. As outras sessões foram encerradas.".into(), Instant::now()));
                     }
+                    S2C::Viewers { channel_id, users } => {
+                        if users.is_empty() {
+                            self.viewers.remove(&channel_id);
+                        } else {
+                            self.viewers.insert(channel_id, users);
+                        }
+                    }
                     S2C::VoiceUpdate(st) => {
                         self.voice.retain(|v| v.user_id != st.user_id);
                         let mine = st.user_id == self.me.id;
@@ -1337,6 +1352,9 @@ struct App {
     golive: GoLive,
     /// Canal onde a transmissão vai ser feita (o de voz, quando o diálogo abre pela visão de voz).
     golive_target: Option<i64>,
+    /// Controles sobre o vídeo: última atividade do mouse e até quando a lista de espectadores segura a barra.
+    video_active: Instant,
+    viewers_hover_until: Instant,
     /// Prévia da minha própria transmissão (miniatura da fonte, renovada a cada ~0,7 s).
     publishing_source: Option<capture::Source>,
     preview_tex: Option<egui::TextureHandle>,
@@ -1390,6 +1408,8 @@ impl App {
             monitors: publisher::monitor_names(),
             golive: GoLive::new(),
             golive_target: None,
+            video_active: Instant::now(),
+            viewers_hover_until: Instant::now(),
             publishing_source: None,
             preview_tex: None,
             preview_rx: None,
@@ -2161,6 +2181,32 @@ fn mention_job(ui: &egui::Ui, text: &str, known: &HashSet<String>, wrap: f32) ->
     }
     job.append(&text[last..], 0.0, plain);
     job
+}
+
+/// Mensagem do cartão de estado do vídeo que estou assistindo: (título, detalhe, mostrar "Fechar transmissão").
+/// `None` = está tudo bem (vídeo rodando).
+fn stream_state(status: &str, link_up: bool, has_frame: bool) -> Option<(String, String, bool)> {
+    if !link_up {
+        return Some(("Você foi desconectado(a)…".into(), "Segura firme, vamos te jogar de volta!".into(), false));
+    }
+    if status == "desconectado" || status.contains("ninguém está transmitindo") {
+        return Some(("Esta transmissão terminou.".into(), String::new(), true));
+    }
+    if status.contains("máximo de espectadores") {
+        return Some(("Esta transmissão está lotada.".into(), "Desculpe, ela está com o máximo de espectadores.".into(), true));
+    }
+    if let Some(e) = status.strip_prefix("erro: ") {
+        // já tinha vídeo e a conexão caiu: o transmissor parou
+        if has_frame {
+            return Some(("Esta transmissão terminou.".into(), String::new(), true));
+        }
+        let e: String = e.chars().take(90).collect();
+        return Some(("A transmissão não iniciou :(".into(), format!("Erro: {e}"), true));
+    }
+    if !has_frame {
+        return Some(("Aguardando vídeo…".into(), String::new(), false));
+    }
+    None
 }
 
 /// Cartão de prévia de texto (no estilo do Discord): primeiras linhas em fonte monoespaçada e, embaixo,
@@ -3268,7 +3314,18 @@ impl App {
             ui.label(serif(&ch_name, 24.0));
             ui.add_space(8.0);
             ui.label(RichText::new(sv_name).size(13.0).color(MUTED));
+            if s.voice_focus.is_some() {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_space(20.0);
+                    if small_button(ui, "Grade", FIELD) {
+                        s.voice_focus = None;
+                    }
+                });
+            }
         });
+        if s.voice_focus.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            s.voice_focus = None;
+        }
         let y = ui.cursor().top();
         ui.painter().hline(ui.max_rect().x_range(), y, egui::Stroke::new(1.0, LINE));
         let total = ui.available_rect_before_wrap();
@@ -3276,7 +3333,6 @@ impl App {
         let controls_h = 72.0;
         let stage = egui::Rect::from_min_max(total.min + egui::vec2(16.0, 16.0), egui::pos2(total.max.x - 16.0, total.max.y - controls_h - 8.0));
         let members: Vec<p::VoiceState> = s.voice_members(mv.channel_id).into_iter().cloned().collect();
-        let n = members.len().max(1);
         // assistindo a uma transmissão do canal: o vídeo ocupa o palco e a grade vira uma faixa embaixo
         let watching_here = matches!(&self.watching, Some((c, _)) if *c == mv.channel_id);
         let live_here = s.snap.live.iter().find(|l| l.channel_id == mv.channel_id).cloned();
@@ -3285,7 +3341,10 @@ impl App {
         if preview_here {
             self.refresh_preview(ctx);
         }
-        let (stream_rect, stage) = if watching_here || preview_here {
+        // foco: um participante grande no palco e os outros na faixa (duplo clique num tile; "Grade" ou Esc voltam)
+        let focus = s.voice_focus.filter(|u| members.iter().any(|m| m.user_id == *u));
+        let focus_here = focus.is_some() && !watching_here && !preview_here;
+        let (stream_rect, stage) = if watching_here || preview_here || focus_here {
             let strip = 120.0;
             (
                 Some(egui::Rect::from_min_max(stage.min, egui::pos2(stage.max.x, stage.max.y - strip - 8.0))),
@@ -3294,6 +3353,8 @@ impl App {
         } else {
             (None, stage)
         };
+        let list: Vec<p::VoiceState> = if focus_here { members.iter().filter(|m| Some(m.user_id) != focus).cloned().collect() } else { members.clone() };
+        let n = list.len().max(1);
         // grade: o número de colunas que dá o maior tile 16:9
         let (gap, aspect) = (8.0_f32, 16.0 / 9.0);
         let mut best = (1usize, 0.0_f32);
@@ -3309,12 +3370,9 @@ impl App {
         let rows = n.div_ceil(cols);
         let gh = rows as f32 * th + (rows - 1) as f32 * gap;
         let top = stage.center().y - gh / 2.0;
-        for (i, v) in members.iter().enumerate() {
-            let (row, col) = (i / cols, i % cols);
-            let in_row = cols.min(members.len() - row * cols);
-            let rw = in_row as f32 * tw + (in_row - 1) as f32 * gap;
-            let x0 = stage.center().x - rw / 2.0;
-            let rect = egui::Rect::from_min_size(egui::pos2(x0 + col as f32 * (tw + gap), top + row as f32 * (th + gap)), egui::vec2(tw, th));
+        // um tile de participante (grade, faixa ou foco)
+        let draw_tile = |ui: &mut egui::Ui, s: &mut Session, acts: &mut Vec<Act>, rect: egui::Rect, v: &p::VoiceState| {
+            let th = rect.height();
             let name = s.user_name_of(v.user_id);
             let (bg, fg) = user_tint(v.user_id);
             let resp = ui.interact(rect, egui::Id::new(("voice-tile", v.user_id)), egui::Sense::click());
@@ -3348,7 +3406,7 @@ impl App {
                 let pill = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), g.size() + egui::vec2(14.0, 8.0));
                 pt.rect_filled(pill, 5.0, Color32::from_black_alpha(170));
                 pt.galley(pill.min + egui::vec2(7.0, 4.0), g, AMBER);
-                if v.user_id != s.me.id && !watching_here {
+                if v.user_id != s.me.id && !watching_here && rect.height() >= 100.0 {
                     let btn = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.bottom() - 40.0), egui::vec2(110.0, 30.0));
                     if ui.put(btn, egui::Button::new(RichText::new("Assistir").color(L0)).fill(AMBER)).clicked() {
                         acts.push(Act::Watch(mv.channel_id));
@@ -3357,6 +3415,10 @@ impl App {
             }
             if resp.clicked() {
                 acts.push(Act::OpenProfile { user: v.user_id, name: name.clone(), anchor: rect, left: false });
+            }
+            if resp.double_clicked() {
+                s.voice_focus = if s.voice_focus == Some(v.user_id) { None } else { Some(v.user_id) };
+                s.profile = None; // o 1º clique do duplo clique abriu o perfil
             }
             if v.user_id != s.me.id {
                 let uid = v.user_id;
@@ -3374,8 +3436,20 @@ impl App {
                     }
                 });
             }
+        };
+        for (i, v) in list.iter().enumerate() {
+            let (row, col) = (i / cols, i % cols);
+            let in_row = cols.min(list.len() - row * cols);
+            let rw = in_row as f32 * tw + (in_row - 1) as f32 * gap;
+            let x0 = stage.center().x - rw / 2.0;
+            let rect = egui::Rect::from_min_size(egui::pos2(x0 + col as f32 * (tw + gap), top + row as f32 * (th + gap)), egui::vec2(tw, th));
+            draw_tile(ui, s, acts, rect, v);
         }
-        if let Some(sr) = stream_rect {
+        if let (Some(sr), true, Some(f)) = (stream_rect, focus_here, focus) {
+            if let Some(v) = members.iter().find(|m| m.user_id == f) {
+                draw_tile(ui, s, acts, sr, v);
+            }
+        } else if let Some(sr) = stream_rect {
             if watching_here {
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sr));
                 self.stream_area(&mut child, ctx, &*s, acts, true);
@@ -3393,16 +3467,7 @@ impl App {
                         pt.text(sr.center(), Align2::CENTER_CENTER, "Preparando a prévia…", egui::FontId::proportional(15.0), MUTED);
                     }
                 }
-                let pt = ui.painter();
-                let g = pt.layout_no_wrap("VOCÊ ESTÁ AO VIVO".to_string(), egui::FontId::proportional(12.0), Color32::WHITE);
-                let pill = egui::Rect::from_min_size(sr.min + egui::vec2(10.0, 10.0), g.size() + egui::vec2(26.0, 10.0));
-                pt.rect_filled(pill, 5.0, Color32::from_black_alpha(170));
-                pt.circle_filled(pill.left_center() + egui::vec2(11.0, 0.0), 4.0, AMBER);
-                pt.galley(pill.min + egui::vec2(22.0, 5.0), g, Color32::WHITE);
-                let btn = egui::Rect::from_min_size(sr.right_top() + egui::vec2(-110.0, 8.0), egui::vec2(100.0, 28.0));
-                if ui.put(btn, egui::Button::new("Gerenciar").fill(Color32::from_black_alpha(170))).clicked() {
-                    acts.push(Act::OpenGoLive(Some(mv.channel_id)));
-                }
+                self.video_overlay(ui, ctx, &*s, sr, mv.channel_id, true, acts);
             }
         }
         // barra de controles
@@ -4690,6 +4755,131 @@ impl App {
     }
 
     // ---- vídeo da transmissão
+    /// Controles sobre o vídeo (assistindo ou a minha prévia): barras que somem após 1,8 s sem mexer o mouse,
+    /// com título, quem transmite, espectadores, tela cheia, engrenagem (só a minha) e parar.
+    #[allow(clippy::too_many_arguments)]
+    fn video_overlay(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &Session, rect: egui::Rect, ch: i64, mine: bool, acts: &mut Vec<Act>) {
+        let pointer = ctx.input(|i| i.pointer.hover_pos());
+        let inside = pointer.is_some_and(|p| rect.contains(p));
+        if inside && ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_pressed() || i.pointer.any_click()) {
+            self.video_active = Instant::now();
+        }
+        let hold = self.viewers_hover_until > Instant::now();
+        let visible = hold || (inside && self.video_active.elapsed() < Duration::from_millis(1800));
+        let a = ctx.animate_bool_with_time(egui::Id::new(("video-controls", mine)), visible, 0.15);
+        if visible {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        if a <= 0.01 {
+            return;
+        }
+        let fade = |c: Color32| c.gamma_multiply(a);
+        let top = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 44.0));
+        let bottom = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 52.0), rect.max);
+        let pt = ui.painter();
+        let cr = |top_side: bool| if top_side { egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 } } else { egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 } };
+        pt.rect_filled(top, cr(true), fade(Color32::from_black_alpha(150)));
+        pt.rect_filled(bottom, cr(false), fade(Color32::from_black_alpha(150)));
+        // título (canal / servidor) e quem transmite
+        let place = s.voice_place(ch).map(|(c, sv)| format!("{c} / {sv}")).unwrap_or_default();
+        pt.text(top.left_center() + egui::vec2(14.0, 0.0), Align2::LEFT_CENTER, place, egui::FontId::proportional(13.0), fade(TEXT));
+        let who = if mine {
+            "Você está transmitindo".to_string()
+        } else {
+            s.snap.live.iter().find(|l| l.channel_id == ch).map(|l| s.name_of(l.user_id)).unwrap_or_default()
+        };
+        pt.text(bottom.left_center() + egui::vec2(14.0, 0.0), Align2::LEFT_CENTER, who, egui::FontId::proportional(13.0), fade(TEXT));
+
+        // botões, da direita para a esquerda: parar, tela cheia, engrenagem (minha)
+        let mut x = bottom.right() - 12.0 - 32.0;
+        let y = bottom.center().y - 16.0;
+        let mut button = |ui: &mut egui::Ui, id: &str, tip: &str, danger: bool, draw: &dyn Fn(&egui::Painter, egui::Pos2, Color32)| -> bool {
+            let r = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(32.0, 32.0));
+            x -= 36.0;
+            let resp = ui.interact(r, egui::Id::new(("video-btn", id, mine)), egui::Sense::click());
+            let hot = resp.hovered();
+            let pt = ui.painter();
+            if hot {
+                pt.rect_filled(r, 8.0, if danger { fade(alpha(RED, 0.35)) } else { fade(Color32::from_white_alpha(26)) });
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            draw(pt, r.center(), fade(if hot && danger { RED } else { TEXT }));
+            resp.on_hover_text(tip).clicked()
+        };
+        if mine {
+            if button(ui, "stop", "Parar de transmitir", true, &|p, c, col| stop_icon(p, c, 22.0, col)) {
+                acts.push(Act::StopPublish);
+            }
+        } else if button(ui, "stop", "Parar de assistir", true, &|p, c, col| close_icon(p, c, 22.0, col)) {
+            acts.push(Act::StopWatch);
+        }
+        let full = self.fullscreen;
+        if button(ui, "full", if full { "Sair da tela cheia" } else { "Tela cheia" }, false, &|p, c, col| fullscreen_icon(p, c, 22.0, col, full)) {
+            acts.push(Act::Fullscreen);
+        }
+        if mine && button(ui, "gear", "Qualidade da transmissão", false, &|p, c, col| gear_icon(p, c, 22.0, col)) {
+            acts.push(Act::OpenGoLive(Some(ch)));
+        }
+
+        // espectadores: até 3 avatares sobrepostos e "+N"; passar o mouse abre a lista
+        let viewers: Vec<i64> = s.viewers.get(&ch).cloned().unwrap_or_default().into_iter().filter(|u| !mine || *u != s.me.id).collect();
+        if !viewers.is_empty() {
+            let shown = viewers.len().min(3);
+            let extra = viewers.len() - shown;
+            let w = 24.0 + (shown as f32 - 1.0) * 18.0 + if extra > 0 { 30.0 } else { 0.0 };
+            let chip = egui::Rect::from_min_size(egui::pos2(x - w + 36.0 - 8.0, bottom.center().y - 12.0), egui::vec2(w, 24.0));
+            let resp = ui.interact(chip, egui::Id::new(("viewers-chip", mine)), egui::Sense::hover());
+            let pt = ui.painter();
+            for (i, u) in viewers.iter().take(shown).enumerate() {
+                let c = egui::pos2(chip.left() + 12.0 + i as f32 * 18.0, chip.center().y);
+                let (bg, fg) = user_tint(*u);
+                pt.circle_filled(c, 12.5, fade(Color32::from_rgb(0x20, 0x20, 0x24)));
+                pt.circle_filled(c, 11.0, fade(bg));
+                pt.text(c, Align2::CENTER_CENTER, s.user_name_of(*u).chars().next().map(|x| x.to_uppercase().to_string()).unwrap_or_default(), egui::FontId::proportional(10.0), fade(fg));
+            }
+            if extra > 0 {
+                pt.text(egui::pos2(chip.right() - 14.0, chip.center().y), Align2::CENTER_CENTER, format!("+{extra}"), egui::FontId::proportional(12.0), fade(TEXT));
+            }
+            let mut over_list = false;
+            if resp.hovered() || self.viewers_hover_until > Instant::now() {
+                let area = egui::Area::new(egui::Id::new(("viewers-list", mine)))
+                    .order(egui::Order::Foreground)
+                    .pivot(Align2::RIGHT_BOTTOM)
+                    .fixed_pos(egui::pos2(chip.right(), chip.top() - 8.0))
+                    .show(ctx, |ui| {
+                        egui::Frame::new()
+                            .fill(L3)
+                            .stroke(egui::Stroke::new(1.0, LINE2))
+                            .corner_radius(egui::CornerRadius::same(10))
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.set_min_width(190.0);
+                                ui.label(RichText::new(format!("Espectadores - {}", viewers.len())).size(12.0).strong().color(TEXT2));
+                                ui.add_space(4.0);
+                                for u in viewers.iter().take(12) {
+                                    ui.horizontal(|ui| {
+                                        let (r, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                                        let (bg, fg) = user_tint(*u);
+                                        ui.painter().circle_filled(r.center(), 12.0, bg);
+                                        ui.painter().text(r.center(), Align2::CENTER_CENTER, s.user_name_of(*u).chars().next().map(|x| x.to_uppercase().to_string()).unwrap_or_default(), egui::FontId::proportional(11.0), fg);
+                                        ui.label(RichText::new(s.user_name_of(*u)).size(12.5).color(TEXT));
+                                    });
+                                }
+                                if viewers.len() > 12 {
+                                    ui.label(RichText::new(format!("e mais {}", viewers.len() - 12)).size(12.0).color(MUTED));
+                                }
+                            });
+                    });
+                over_list = pointer.is_some_and(|p| area.response.rect.contains(p));
+            }
+            if resp.hovered() || over_list {
+                // fecha 150 ms depois de sair do chip e da lista
+                self.viewers_hover_until = Instant::now() + Duration::from_millis(150);
+                ctx.request_repaint_after(Duration::from_millis(160));
+            }
+        }
+    }
+
     fn stream_area(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &Session, acts: &mut Vec<Act>, full: bool) {
         let Some((ch, h)) = &self.watching else { return };
         if let Some(img) = h.frame.lock().unwrap().take() {
@@ -4719,37 +4909,31 @@ impl App {
                     Color32::WHITE,
                 );
             }
-            None => {
-                p.text(
-                    rect.center(),
-                    Align2::CENTER_CENTER,
-                    if st.starts_with("erro") { st.clone() } else { "Aguardando vídeo…".to_string() },
-                    egui::FontId::proportional(15.0),
-                    MUTED,
-                );
+            None => {}
+        }
+        let ch = *ch;
+        // cartões de estado (aguardando, terminou, falhou, você caiu)
+        let has_frame = self.texture.is_some();
+        if let Some((title, sub, close)) = stream_state(&st, matches!(s.link, Link::Up), has_frame) {
+            let pt = ui.painter();
+            if has_frame {
+                pt.rect_filled(rect, 0.0, Color32::from_black_alpha(150));
+            }
+            pt.text(rect.center() - egui::vec2(0.0, 14.0), Align2::CENTER_CENTER, title, egui::FontId::proportional(18.0), TEXT);
+            if !sub.is_empty() {
+                pt.text(rect.center() + egui::vec2(0.0, 12.0), Align2::CENTER_CENTER, sub, egui::FontId::proportional(13.0), MUTED);
+            }
+            if close {
+                let btn = egui::Rect::from_center_size(rect.center() + egui::vec2(0.0, 52.0), egui::vec2(160.0, 32.0));
+                if ui.put(btn, egui::Button::new("Fechar transmissão")).clicked() {
+                    acts.push(Act::StopWatch);
+                }
             }
         }
-        let who = s
-            .snap
-            .live
-            .iter()
-            .find(|l| l.channel_id == *ch)
-            .map(|l| s.name_of(l.user_id))
-            .unwrap_or_default();
-        let label = format!("AO VIVO · {who}");
-        let galley = p.layout_no_wrap(label, egui::FontId::proportional(12.0), Color32::WHITE);
-        let pill = egui::Rect::from_min_size(rect.min + egui::vec2(10.0, 10.0), galley.size() + egui::vec2(22.0, 10.0));
-        p.rect_filled(pill, egui::CornerRadius::same(5), Color32::from_black_alpha(170));
-        p.circle_filled(pill.left_center() + egui::vec2(10.0, 0.0), 4.0, status_color(&st));
-        p.galley(pill.min + egui::vec2(20.0, 5.0), galley, Color32::WHITE);
-
         if resp.double_clicked() {
             acts.push(Act::Fullscreen);
         }
-        let btn = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-94.0, 8.0), egui::vec2(84.0, 28.0));
-        if ui.put(btn, egui::Button::new("Fechar").fill(Color32::from_black_alpha(170))).clicked() {
-            acts.push(Act::StopWatch);
-        }
+        self.video_overlay(ui, ctx, s, rect, ch, false, acts);
         ui.add_space(6.0);
     }
 

@@ -109,6 +109,23 @@ impl Tx {
 
 // ------------------------------------------------------------------ estado
 
+/// Limite de espectadores por transmissão (como no Discord).
+const MAX_VIEWERS: usize = 50;
+
+/// Tira o espectador da lista quando a conexão de vídeo dele acaba (por qualquer caminho).
+struct ViewerGuard {
+    app: Arc<App>,
+    channel: i64,
+    vid: u64,
+}
+
+impl Drop for ViewerGuard {
+    fn drop(&mut self) {
+        self.app.viewers_remove(self.channel, self.vid);
+        self.app.viewers_notify(self.channel);
+    }
+}
+
 struct Room {
     tx: broadcast::Sender<Bytes>,
     /// Último quadro-chave: novos espectadores começam por ele.
@@ -122,6 +139,8 @@ struct App {
     sf: ids::Snowflake,
     conns: Mutex<HashMap<i64, Vec<(u64, Tx)>>>,
     rooms: Mutex<HashMap<i64, Room>>,
+    /// Espectadores de cada transmissão: (id da conexão de vídeo, usuário).
+    viewers: Mutex<HashMap<i64, Vec<(u64, i64)>>>,
     next: AtomicU64,
     /// Limita quantos hashes de senha rodam ao mesmo tempo (cada um usa ~19 MiB e CPU).
     hash_sem: Semaphore,
@@ -177,6 +196,48 @@ impl App {
     async fn verify_password(&self, pw: String, hash: String) -> bool {
         let Ok(_permit) = self.hash_sem.acquire().await else { return false };
         tokio::task::spawn_blocking(move || auth::verify_password(&pw, &hash)).await.unwrap_or(false)
+    }
+
+    /// Registra um espectador. `false` se a transmissão já está no limite.
+    fn viewers_add(&self, channel: i64, vid: u64, uid: i64) -> bool {
+        let mut m = self.viewers.lock().unwrap_or_else(|e| e.into_inner());
+        let v = m.entry(channel).or_default();
+        if v.len() >= MAX_VIEWERS {
+            return false;
+        }
+        v.push((vid, uid));
+        true
+    }
+
+    fn viewers_remove(&self, channel: i64, vid: u64) {
+        let mut m = self.viewers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = m.get_mut(&channel) {
+            v.retain(|(i, _)| *i != vid);
+            if v.is_empty() {
+                m.remove(&channel);
+            }
+        }
+    }
+
+    /// Manda a lista de espectadores (sem repetir pessoa) ao transmissor e a cada espectador.
+    fn viewers_notify(&self, channel: i64) {
+        let mut users: Vec<i64> = Vec::new();
+        for (_, u) in self.viewers.lock().unwrap_or_else(|e| e.into_inner()).get(&channel).into_iter().flatten() {
+            if !users.contains(u) {
+                users.push(*u);
+            }
+        }
+        let publisher = self.rooms.lock().unwrap_or_else(|e| e.into_inner()).get(&channel).map(|r| r.user);
+        let msg = S2C::Viewers { channel_id: channel, users: users.clone() };
+        let mut targets = users;
+        if let Some(p) = publisher {
+            if !targets.contains(&p) {
+                targets.push(p);
+            }
+        }
+        for t in targets {
+            self.send_to(t, &msg);
+        }
     }
 
     fn send_to(&self, uid: i64, m: &S2C) {
@@ -627,6 +688,7 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         sf,
         conns: Default::default(),
         rooms: Default::default(),
+        viewers: Default::default(),
         next: AtomicU64::new(1),
         conn_tokens: Mutex::new(HashMap::new()),
         hash_sem: Semaphore::new(permits),
@@ -1583,13 +1645,13 @@ async fn watch(
     Query(q): Query<Q>,
     State(app): State<Arc<App>>,
 ) -> Response {
-    if app.auth_stream(&q.token, channel).await.is_none() {
+    let Some(uid) = app.auth_stream(&q.token, channel).await else {
         return StatusCode::FORBIDDEN.into_response();
-    }
-    ws.on_upgrade(move |s| run_viewer(s, channel, app))
+    };
+    ws.on_upgrade(move |s| run_viewer(s, channel, uid, app))
 }
 
-async fn run_viewer(mut socket: WebSocket, channel: i64, app: Arc<App>) {
+async fn run_viewer(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<App>) {
     let found = {
         let rooms = app.rooms.lock().unwrap_or_else(|e| e.into_inner());
         rooms.get(&channel).map(|r| (r.tx.subscribe(), r.key.clone()))
@@ -1598,6 +1660,13 @@ async fn run_viewer(mut socket: WebSocket, channel: i64, app: Arc<App>) {
         let _ = socket.send(Message::Text("ninguém está transmitindo neste canal".into())).await;
         return;
     };
+    let vid = app.next.fetch_add(1, Ordering::Relaxed);
+    if !app.viewers_add(channel, vid, uid) {
+        let _ = socket.send(Message::Text("Esta transmissão está com o máximo de espectadores.".into())).await;
+        return;
+    }
+    let _guard = ViewerGuard { app: app.clone(), channel, vid };
+    app.viewers_notify(channel);
     let mut need_key = key.is_none();
     if let Some(k) = key {
         if socket.send(Message::Binary(k)).await.is_err() {

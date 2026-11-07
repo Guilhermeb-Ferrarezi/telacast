@@ -297,6 +297,8 @@ pub enum C2S {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum S2C {
     Auth { token: String, me: User },
+    /// Quem está assistindo à transmissão do canal (vai ao transmissor e aos espectadores; lista vazia = ninguém).
+    Viewers { channel_id: i64, users: Vec<i64> },
     /// Alguém entrou num canal de voz ou mudou de estado (inclui você).
     VoiceUpdate(VoiceState),
     /// Alguém saiu do canal de voz (ou a conexão dele caiu).
