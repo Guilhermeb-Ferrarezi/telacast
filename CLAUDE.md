@@ -48,6 +48,7 @@ Cadastro é **fechado por convite**. Senha de 8 a 128 caracteres. Não ponha sen
 
 - `interaction.selectable_labels = false` é global (texto de interface não seleciona); o texto das **mensagens** liga `.selectable(true)` e abre o menu de contexto no próprio rótulo. Não crie um alvo de clique por cima da linha: ele rouba a seleção.
 - Barras de hover (ações da mensagem) são desenhadas só com o `painter` e `ui.interact`, **sem** ocupar layout; `scope_builder` empurrava a lista.
+- Modais: use `theme::modal(ctx, título, largura, &mut dismissed, corpo)` (é `egui::Modal`; um `Area` solto deixa o clique vazar para os botões de baixo).
 - `TextEdit::frame` recebe `egui::Frame` (use `Frame::NONE`). `Id::new` está depreciado (só avisa).
 - `consume_key(NONE, Enter)` engole Shift+Enter; use `take_plain_enter` (em `main.rs`).
 - Markdown: o texto cru vai e volta do servidor; `md_view` monta um `LayoutJob` por bloco (negrito = `TextFormat.coords` com o eixo `wght`) e acha spoiler/link pelo cursor do galley. Fundo de pílula não tem raio (limite do `TextFormat.background`).

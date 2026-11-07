@@ -285,21 +285,14 @@ pub fn show(ctx: &egui::Context, q: &mut Qs, s: &Session) -> Out {
     }
 
     let screen = ctx.content_rect();
-    egui::Area::new(egui::Id::new("qs-scrim")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
-        let r = ui.allocate_rect(screen, Sense::click());
-        ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
-        if r.clicked() {
-            out = Out::Close;
-        }
-    });
-
     let pointer_moved = ctx.input(|i| i.pointer.delta() != Vec2::ZERO);
     let mut clicked: Option<Target> = None;
-    egui::Area::new(egui::Id::new("qs-modal"))
-        .order(egui::Order::Foreground)
-        .anchor(Align2::CENTER_TOP, egui::vec2(0.0, (screen.height() * 0.12).max(24.0)))
+    let modal = egui::Modal::new(egui::Id::new("qs-modal"))
+        .backdrop_color(egui::Color32::from_black_alpha(150))
+        .area(egui::Modal::default_area(egui::Id::new("qs-modal")).anchor(Align2::CENTER_TOP, egui::vec2(0.0, (screen.height() * 0.12).max(24.0))))
+        .frame(glass(12).inner_margin(egui::Margin::ZERO))
         .show(ctx, |ui| {
-            glass(12).inner_margin(egui::Margin::ZERO).show(ui, |ui| {
+            {
                 ui.set_width(540.0);
                 egui::Frame::new().inner_margin(egui::Margin::symmetric(18, 8)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -391,8 +384,11 @@ pub fn show(ctx: &egui::Context, q: &mut Qs, s: &Session) -> Out {
                     }
                 });
                 ui.add_space(8.0);
-            });
+            }
         });
+    if modal.backdrop_response.clicked() {
+        return Out::Close;
+    }
     if let Some(t) = clicked {
         return Out::Go(t);
     }

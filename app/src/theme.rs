@@ -416,6 +416,42 @@ pub fn list_row(ui: &mut Ui, selected: bool, add: impl FnOnce(&mut Ui)) -> Respo
     resp
 }
 
+// ---- modais
+
+/// Modal padrão (`egui::Modal`: bloqueia o que está por baixo): fundo escurecido, clique fora e Esc fecham,
+/// título em serifa e botão de fechar. `dismissed` vira `true` ao fechar por Esc, clique fora ou X.
+pub fn modal(ctx: &egui::Context, title: &str, width: f32, dismissed: &mut bool, body: impl FnOnce(&mut Ui)) {
+    let m = egui::Modal::new(egui::Id::new(("modal", title)))
+        .backdrop_color(Color32::from_black_alpha(150))
+        .frame(glass(14).inner_margin(egui::Margin::same(22)))
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            ui.horizontal(|ui| {
+                ui.label(serif(title, 22.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (r, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
+                    let hot = resp.hovered();
+                    if hot {
+                        ui.painter().rect_filled(r, 8.0, L4);
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+                    let c = r.center();
+                    let st = Stroke::new(1.5, if hot { TEXT } else { MUTED });
+                    ui.painter().line_segment([c + vec2(-5.0, -5.0), c + vec2(5.0, 5.0)], st);
+                    ui.painter().line_segment([c + vec2(-5.0, 5.0), c + vec2(5.0, -5.0)], st);
+                    if resp.clicked() {
+                        ui.close();
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            body(ui);
+        });
+    if m.should_close() {
+        *dismissed = true;
+    }
+}
+
 // ---- datas
 
 fn local(ts: i64) -> Option<chrono::DateTime<chrono::Local>> {

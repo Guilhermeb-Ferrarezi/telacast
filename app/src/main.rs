@@ -2078,15 +2078,12 @@ impl App {
     // ---- janelas modais
     fn modals(&mut self, ctx: &egui::Context, s: &mut Session, acts: &mut Vec<Act>) {
         let mut close = false;
+        let mut dismissed = false; // Esc, clique fora ou X
         let cur = s.current_channel();
         match &mut s.modal {
             Modal::None => {}
             Modal::AddServer { create, name, code } => {
-                egui::Window::new("Adicionar um servidor")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
+                modal(ctx, "Adicionar um servidor", 360.0, &mut dismissed, |ui| {
                         ui.set_width(320.0);
                         ui.horizontal(|ui| {
                             ui.selectable_value(create, true, "Criar o meu");
@@ -2108,7 +2105,7 @@ impl App {
                                 close = true;
                             }
                         }
-                        if ui.button("Cancelar").clicked() {
+                        if small_button(ui, "Cancelar", FIELD) {
                             close = true;
                         }
                     });
@@ -2121,11 +2118,7 @@ impl App {
                     .find(|x| x.id == *server)
                     .map(|sv| sv.channels.iter().filter(|c| c.kind == 4).map(|c| (c.id, c.name.clone())).collect())
                     .unwrap_or_default();
-                egui::Window::new(if *kind == 4 { "Criar categoria" } else { "Criar canal" })
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
+                modal(ctx, if *kind == 4 { "Criar categoria" } else { "Criar canal" }, 360.0, &mut dismissed, |ui| {
                         ui.set_width(320.0);
                         ui.horizontal(|ui| {
                             ui.selectable_value(kind, 0, "Canal de texto");
@@ -2156,17 +2149,13 @@ impl App {
                             }));
                             close = true;
                         }
-                        if ui.button("Cancelar").clicked() {
+                        if small_button(ui, "Cancelar", FIELD) {
                             close = true;
                         }
                     });
             }
             Modal::DeleteMsg { id, preview } => {
-                egui::Window::new("Apagar mensagem")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
+                modal(ctx, "Apagar mensagem", 360.0, &mut dismissed, |ui| {
                         ui.set_width(340.0);
                         ui.label("Tem certeza de que quer apagar esta mensagem?");
                         ui.add_space(6.0);
@@ -2184,36 +2173,28 @@ impl App {
                             acts.push(Act::Send(C2S::Delete { message_id: *id }));
                             close = true;
                         }
-                        if ui.button("Cancelar").clicked() {
+                        if small_button(ui, "Cancelar", FIELD) {
                             close = true;
                         }
                     });
             }
             Modal::Invite(code) => {
-                egui::Window::new("Convidar amigos")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
+                modal(ctx, "Convidar amigos", 360.0, &mut dismissed, |ui| {
                         ui.set_width(300.0);
                         ui.label("Mande este código para quem você quer convidar:");
                         ui.label(RichText::new(code.as_str()).size(22.0).strong().monospace());
                         ui.horizontal(|ui| {
-                            if ui.button("Copiar").clicked() {
+                            if small_button(ui, "Copiar", BLURPLE) {
                                 ctx.copy_text(code.clone());
                             }
-                            if ui.button("Fechar").clicked() {
+                            if small_button(ui, "Fechar", FIELD) {
                                 close = true;
                             }
                         });
                     });
             }
             Modal::GoLive => {
-                egui::Window::new("Transmitir tela")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
+                modal(ctx, "Transmitir tela", 360.0, &mut dismissed, |ui| {
                         ui.set_width(320.0);
                         ui.label(caps(&"TELA"));
                         egui::ComboBox::from_id_salt("mon")
@@ -2245,13 +2226,13 @@ impl App {
                         } else {
                             ui.label(RichText::new("Abra um canal ou conversa para transmitir.").color(MUTED));
                         }
-                        if ui.button("Cancelar").clicked() {
+                        if small_button(ui, "Cancelar", FIELD) {
                             close = true;
                         }
                     });
             }
         }
-        if close {
+        if close || dismissed {
             s.modal = Modal::None;
         }
     }
