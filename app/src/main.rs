@@ -236,6 +236,9 @@ struct Session {
     upload_key: u64,
     armed: Vec<Armed>,
     profile: Option<Profile>,
+    /// Autocompletar de `@`: linha escolhida e posição do `@` dispensado com Esc.
+    ac_sel: usize,
+    ac_off: Option<usize>,
     /// Rolagem horizontal da bandeja de anexos e onde ela ficou na tela (para a roda do mouse).
     tray_x: f32,
     tray_rect: egui::Rect,
@@ -364,6 +367,8 @@ impl Session {
             upload_key: 0,
             armed: Vec::new(),
             profile: None,
+            ac_sel: 0,
+            ac_off: None,
             tray_x: 0.0,
             tray_rect: egui::Rect::NOTHING,
             upload_tx,
@@ -1479,6 +1484,86 @@ fn upload_tile(ui: &mut egui::Ui, u: &files::Upload, images: &mut files::Images,
         };
         ui.add_sized([120.0, 14.0], egui::Label::new(RichText::new(cap).size(12.0).color(if failed { RED } else { MUTED })).truncate()).on_hover_text(tip);
     });
+}
+
+/// O `@consulta` que termina no cursor: (índice do `@` em caracteres, consulta). O `@` precisa estar
+/// no começo ou depois de espaço; a consulta só tem letras, números e `_ . -`.
+fn mention_token(text: &str, cursor: usize) -> Option<(usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let cur = cursor.min(chars.len());
+    let mut i = cur;
+    while i > 0 {
+        let c = chars[i - 1];
+        if c == '@' {
+            if i - 1 > 0 && !chars[i - 2].is_whitespace() {
+                return None;
+            }
+            return Some((i - 1, chars[i..cur].iter().collect()));
+        }
+        if !(c.is_alphanumeric() || matches!(c, '_' | '.' | '-')) {
+            return None;
+        }
+        i -= 1;
+    }
+    None
+}
+
+/// Uma sugestão do autocompletar de `@`.
+struct MentionCand {
+    /// Texto inserido depois do `@`.
+    name: String,
+    /// Texto à direita da linha.
+    note: String,
+    /// `None` = menção especial (`@everyone`, `@here`).
+    user: Option<(i64, p::Status)>,
+}
+
+/// Membros do canal (ou a pessoa da conversa) que combinam com a consulta: quem começa com ela primeiro,
+/// depois quem contém; online antes de offline. No máximo 8. `@everyone` e `@here` só em servidores.
+fn mention_candidates(s: &Session, ch: i64, q: &str) -> Vec<MentionCand> {
+    let ql = q.to_lowercase();
+    let (users, owner, in_server): (Vec<&p::User>, i64, bool) = match s.snap.servers.iter().find(|sv| sv.channels.iter().any(|c| c.id == ch)) {
+        Some(sv) => (sv.members.iter().collect(), sv.owner, true),
+        None => (s.snap.dms.iter().filter(|d| d.channel_id == ch).map(|d| &d.user).chain(std::iter::once(&s.me)).collect(), 0, false),
+    };
+    let mut hits: Vec<(u8, &p::User)> = users
+        .into_iter()
+        .filter_map(|u| {
+            let n = u.name.to_lowercase();
+            if n.starts_with(&ql) {
+                Some((0, u))
+            } else if n.contains(&ql) {
+                Some((1, u))
+            } else {
+                None
+            }
+        })
+        .collect();
+    hits.sort_by_key(|(rank, u)| (*rank, !u.online, u.name.to_lowercase()));
+    let mut out: Vec<MentionCand> = Vec::new();
+    if in_server {
+        for (name, note) in [("everyone", "Notifique todos neste canal"), ("here", "Notifique quem está online")] {
+            if name.starts_with(&ql) {
+                out.push(MentionCand { name: name.into(), note: note.into(), user: None });
+            }
+        }
+    }
+    for (_, u) in hits {
+        out.push(MentionCand { name: u.name.clone(), note: if u.id == owner { "dono".into() } else { String::new() }, user: Some((u.id, u.status)) });
+    }
+    out.truncate(8);
+    out
+}
+
+/// Troca o `@consulta` (de `start` até `cursor`) por `@nome ` e devolve onde o cursor deve ficar.
+fn apply_mention(text: &mut String, start: usize, cursor: usize, name: &str) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let cur = cursor.min(chars.len());
+    let before: String = chars[..start].iter().collect();
+    let after: String = chars[cur..].iter().collect();
+    let gap = if after.starts_with(' ') { "" } else { " " };
+    *text = format!("{before}@{name}{gap}{after}");
+    start + 1 + name.chars().count() + 1
 }
 
 /// Cartão de prévia de texto (no estilo do Discord): primeiras linhas em fonte monoespaçada e, embaixo,
@@ -3081,7 +3166,55 @@ impl App {
         // entrada
         let input_id = egui::Id::new(("compose", ch));
         let focused = ctx.memory(|mem| mem.has_focus(input_id));
-        egui::Frame::new()
+        // autocompletar de "@": sugestões enquanto você digita um nome depois do @
+        let cursor = egui::TextEdit::load_state(ctx, input_id)
+            .and_then(|st| st.cursor.char_range())
+            .map(|r| usize::from(r.primary.index))
+            .unwrap_or_else(|| s.input.chars().count());
+        let token = if focused { mention_token(&s.input, cursor) } else { None };
+        if token.is_none() {
+            s.ac_off = None;
+        }
+        let cands = match &token {
+            Some((start, q)) if s.ac_off != Some(*start) => mention_candidates(s, ch, q),
+            _ => Vec::new(),
+        };
+        let ac_open = !cands.is_empty();
+        let mut ac_pick: Option<usize> = None;
+        if ac_open {
+            s.ac_sel = s.ac_sel.min(cands.len() - 1);
+            // as setas, Tab, Enter e Esc são do autocompletar enquanto ele está aberto
+            let n = cands.len();
+            ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    s.ac_sel = (s.ac_sel + 1) % n;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    s.ac_sel = (s.ac_sel + n - 1) % n;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                    ac_pick = Some(s.ac_sel);
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                    s.ac_off = token.as_ref().map(|t| t.0);
+                }
+            });
+        }
+        let mut ac_applied = |s: &mut Session, idx: usize| {
+            if let Some((start, _)) = &token {
+                let new_cursor = apply_mention(&mut s.input, *start, cursor, &cands[idx].name);
+                if let Some(mut st) = egui::TextEdit::load_state(ctx, input_id) {
+                    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(new_cursor))));
+                    st.store(ctx, input_id);
+                }
+                s.ac_sel = 0;
+                s.focus_composer = true;
+            }
+        };
+        if let Some(i) = ac_pick {
+            ac_applied(s, i);
+        }
+        let comp = egui::Frame::new()
             .fill(L3)
             .stroke(egui::Stroke::new(1.0, if focused { AMBER } else { LINE2 }))
             .corner_radius(egui::CornerRadius::same(12))
@@ -3191,6 +3324,73 @@ impl App {
                     }
                 });
             });
+        if ac_open {
+            // Tab, Esc e as setas verticais ficam com o campo (senão o egui move o foco e o Tab não completa)
+            ctx.memory_mut(|m| {
+                m.set_focus_lock_filter(input_id, egui::EventFilter { tab: true, horizontal_arrows: false, vertical_arrows: true, escape: true })
+            });
+            let rect = comp.response.rect;
+            let q = token.as_ref().map(|t| t.1.clone()).unwrap_or_default();
+            let mut clicked_row: Option<usize> = None;
+            egui::Area::new(egui::Id::new("mention-ac"))
+                .order(egui::Order::Foreground)
+                .pivot(Align2::LEFT_BOTTOM)
+                .fixed_pos(egui::pos2(rect.left(), rect.top() - 8.0))
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(L3)
+                        .stroke(egui::Stroke::new(1.0, LINE2))
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .shadow(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(100) })
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.set_width(rect.width() - 18.0);
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
+                            let head = if q.is_empty() { "Membros".to_string() } else { format!("Resultados de membros para @{q}") };
+                            ui.label(RichText::new(head).size(12.5).color(TEXT2));
+                            ui.add_space(4.0);
+                            for (i, c) in cands.iter().enumerate() {
+                                let (row, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+                                if resp.hovered() && ctx.input(|inp| inp.pointer.delta() != egui::Vec2::ZERO) {
+                                    s.ac_sel = i;
+                                }
+                                let sel = s.ac_sel == i;
+                                let pt = ui.painter();
+                                if sel {
+                                    pt.rect_filled(row, 6.0, L4);
+                                }
+                                let ac = egui::pos2(row.left() + 20.0, row.center().y);
+                                match c.user {
+                                    Some((uid, st)) => {
+                                        let (bg, fg) = user_tint(uid);
+                                        pt.circle_filled(ac, 12.0, bg);
+                                        let ch0 = c.name.chars().next().map(|x| x.to_uppercase().to_string()).unwrap_or_default();
+                                        pt.text(ac, Align2::CENTER_CENTER, ch0, egui::FontId::proportional(12.0), fg);
+                                        presence_dot(pt, ac + egui::vec2(9.0, 9.0), 4.5, st, if sel { L4 } else { L3 });
+                                    }
+                                    None => {
+                                        pt.circle_filled(ac, 12.0, alpha(AMBER, 0.2));
+                                        pt.text(ac, Align2::CENTER_CENTER, "@", egui::FontId::proportional(14.0), AMBER);
+                                    }
+                                }
+                                pt.text(egui::pos2(row.left() + 42.0, row.center().y), Align2::LEFT_CENTER, &c.name, egui::FontId::proportional(14.5), TEXT);
+                                if !c.note.is_empty() {
+                                    pt.text(egui::pos2(row.right() - 10.0, row.center().y), Align2::RIGHT_CENTER, &c.note, egui::FontId::proportional(12.0), MUTED);
+                                }
+                                if resp.hovered() {
+                                    ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if resp.clicked() {
+                                    clicked_row = Some(i);
+                                }
+                            }
+                        });
+                });
+            if let Some(i) = clicked_row {
+                ac_applied(s, i);
+                ctx.request_repaint();
+            }
+        }
         ui.add_space(22.0);
     }
 
