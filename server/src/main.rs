@@ -22,7 +22,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -31,7 +31,7 @@ use store::{RegisterError, Store};
 use telacast_proto as p;
 use tokio::sync::{
     broadcast,
-    mpsc::{unbounded_channel, UnboundedSender},
+    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     Semaphore,
 };
 use tracing::{error, info};
@@ -61,6 +61,51 @@ impl Limiter {
     }
 }
 
+// ------------------------------------------------------------------ saída das conexões
+
+/// O que o servidor manda por uma conexão do gateway: um evento JSON do protocolo ou um quadro
+/// binário de áudio (já montado). O JSON do protocolo não muda; este tipo é só interno.
+enum Out {
+    Msg(S2C),
+    Bin(Bytes),
+}
+
+/// Quadros de áudio na fila de uma conexão (~2 s a 50 quadros/s). Acima disso, descarta: quem não
+/// consegue ouvir em tempo real não deve fazer o servidor acumular memória.
+const MAX_BIN_QUEUE: usize = 100;
+
+/// Ponta de envio de uma conexão. `send` manda JSON (mesma assinatura de antes); `send_bin` manda
+/// áudio com a fila limitada.
+#[derive(Clone)]
+struct Tx {
+    inner: UnboundedSender<Out>,
+    bin_pending: Arc<AtomicUsize>,
+}
+
+impl Tx {
+    fn new() -> (Tx, UnboundedReceiver<Out>) {
+        let (inner, rx) = unbounded_channel();
+        (Tx { inner, bin_pending: Arc::new(AtomicUsize::new(0)) }, rx)
+    }
+
+    fn send(&self, m: S2C) -> Result<(), ()> {
+        self.inner.send(Out::Msg(m)).map_err(|_| ())
+    }
+
+    fn send_bin(&self, b: Bytes) {
+        if self.bin_pending.fetch_add(1, Ordering::Relaxed) >= MAX_BIN_QUEUE
+            || self.inner.send(Out::Bin(b)).is_err()
+        {
+            self.bin_pending.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Chamado pela conexão ao tirar um quadro binário da fila.
+    fn bin_taken(&self) {
+        self.bin_pending.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 // ------------------------------------------------------------------ estado
 
 struct Room {
@@ -74,7 +119,7 @@ struct Room {
 struct App {
     store: Store,
     sf: ids::Snowflake,
-    conns: Mutex<HashMap<i64, Vec<(u64, UnboundedSender<S2C>)>>>,
+    conns: Mutex<HashMap<i64, Vec<(u64, Tx)>>>,
     rooms: Mutex<HashMap<i64, Room>>,
     next: AtomicU64,
     /// Limita quantos hashes de senha rodam ao mesmo tempo (cada um usa ~19 MiB e CPU).
@@ -92,7 +137,31 @@ struct App {
     nonces: Mutex<(std::collections::HashSet<(i64, u64)>, std::collections::VecDeque<(i64, u64)>)>,
     /// Hash de uma senha qualquer, usado para gastar o mesmo tempo quando o usuário não existe.
     dummy_hash: String,
+    /// Quem está em canal de voz (só em memória): usuário -> estado.
+    voice: Mutex<HashMap<i64, VoiceEntry>>,
 }
+
+/// Estado de voz de um usuário no servidor, mais o balde de fichas que limita os quadros dele.
+struct VoiceEntry {
+    /// Conexão que entrou na voz (se a sessão dela for revogada, a pessoa sai da voz).
+    cid: u64,
+    channel: i64,
+    server: i64,
+    muted: bool,
+    deafened: bool,
+    tokens: f64,
+    last: Instant,
+}
+
+impl VoiceEntry {
+    fn state(&self, user_id: i64) -> p::VoiceState {
+        p::VoiceState { user_id, channel_id: self.channel, muted: self.muted, deafened: self.deafened }
+    }
+}
+
+/// Limite de quadros por usuário: 100/s sustentados, rajada de até 100 (20 ms = 50/s no uso normal).
+const VOICE_RATE: f64 = 100.0;
+const VOICE_BURST: f64 = 100.0;
 
 const ERR_BUSY: &str = "Muitas ações em pouco tempo. Aguarde um instante.";
 const ERR_INTERNAL: &str = "Erro interno do servidor.";
@@ -113,6 +182,75 @@ impl App {
         if let Some(v) = self.conns.lock().unwrap_or_else(|e| e.into_inner()).get(&uid) {
             for (_, tx) in v {
                 let _ = tx.send(m.clone());
+            }
+        }
+    }
+
+    /// Quem está em voz nos servidores dados, ordenado por canal e usuário.
+    fn voice_in(&self, servers: &HashSet<i64>) -> Vec<p::VoiceState> {
+        let v = self.voice.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<p::VoiceState> =
+            v.iter().filter(|(_, e)| servers.contains(&e.server)).map(|(u, e)| e.state(*u)).collect();
+        out.sort_by_key(|s| (s.channel_id, s.user_id));
+        out
+    }
+
+    /// Manda a todos os membros online de um servidor.
+    async fn broadcast_server(&self, server: i64, m: &S2C) {
+        match self.store.server_member_ids(server).await {
+            Ok(ids) => {
+                for u in ids {
+                    self.send_to(u, m);
+                }
+            }
+            Err(e) => error!("server_member_ids: {e}"),
+        }
+    }
+
+    /// Tira da voz (síncrono, para a saída ficar valendo já) e devolve onde estava.
+    fn voice_take(&self, uid: i64) -> Option<VoiceEntry> {
+        self.voice.lock().unwrap_or_else(|e| e.into_inner()).remove(&uid)
+    }
+
+    async fn voice_left(&self, uid: i64, old: &VoiceEntry) {
+        self.broadcast_server(old.server, &S2C::VoiceLeft { user_id: uid, channel_id: old.channel }).await;
+    }
+
+    /// Repassa um quadro de áudio de `uid` aos outros participantes do canal dele.
+    /// Descarta em silêncio o que for inválido, fora de voz, de quem está mudo ou acima do limite.
+    fn voice_relay(&self, uid: i64, data: &[u8]) {
+        // [VOICE_FRAME][seq u32][opus]: pelo menos 1 byte de áudio, no máximo VOICE_MAX_PACKET
+        if data.len() < 6 || data[0] != p::VOICE_FRAME || data.len() - 5 > p::VOICE_MAX_PACKET {
+            return;
+        }
+        let targets: Vec<i64> = {
+            let mut v = self.voice.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(me) = v.get_mut(&uid) else { return };
+            if me.muted || me.deafened {
+                return;
+            }
+            let now = Instant::now();
+            me.tokens = (me.tokens + now.duration_since(me.last).as_secs_f64() * VOICE_RATE).min(VOICE_BURST);
+            me.last = now;
+            if me.tokens < 1.0 {
+                return;
+            }
+            me.tokens -= 1.0;
+            let channel = me.channel;
+            v.iter().filter(|(u, e)| **u != uid && e.channel == channel && !e.deafened).map(|(u, _)| *u).collect()
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let mut frame = Vec::with_capacity(data.len() + 8);
+        frame.push(p::VOICE_FRAME);
+        frame.extend_from_slice(&uid.to_be_bytes());
+        frame.extend_from_slice(&data[1..]);
+        let frame = Bytes::from(frame);
+        let conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        for t in targets {
+            for (_, tx) in conns.get(&t).into_iter().flatten() {
+                tx.send_bin(frame.clone());
             }
         }
     }
@@ -222,7 +360,8 @@ impl App {
 
         let me_name = self.store.display_name(me).await?.unwrap_or_default();
         let blocked = self.store.blocked_by(me).await?.into_iter().map(|(id, name)| user(id, name)).collect();
-        Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live, blocked, voice: vec![] })
+        let voice = self.voice_in(&ids.iter().copied().collect());
+        Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live, blocked, voice })
     }
 
     async fn push_snapshot(&self, uid: i64) {
@@ -245,7 +384,7 @@ impl App {
         }
     }
 
-    fn connect(self: &Arc<Self>, uid: i64, cid: u64, tx: UnboundedSender<S2C>) {
+    fn connect(self: &Arc<Self>, uid: i64, cid: u64, tx: Tx) {
         let first = {
             let mut c = self.conns.lock().unwrap_or_else(|e| e.into_inner());
             let v = c.entry(uid).or_default();
@@ -259,17 +398,37 @@ impl App {
     }
 
     /// Avisa as conexões que usam estas sessões (já apagadas) que elas expiraram.
-    fn expire_connections(&self, uid: i64, hashes: &[Vec<u8>]) {
+    fn expire_connections(self: &Arc<Self>, uid: i64, hashes: &[Vec<u8>]) {
         let cids: Vec<u64> = {
             let t = self.conn_tokens.lock().unwrap_or_else(|e| e.into_inner());
             t.iter().filter(|(_, h)| hashes.contains(h)).map(|(c, _)| *c).collect()
         };
-        if let Some(v) = self.conns.lock().unwrap_or_else(|e| e.into_inner()).get(&uid) {
-            for (cid, tx) in v {
-                if cids.contains(cid) {
-                    let _ = tx.send(S2C::Error { code: ErrorCode::SessionExpired, msg: "Essa sessão foi encerrada".into() });
+        let all_expired = {
+            let conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+            match conns.get(&uid) {
+                Some(v) => {
+                    for (cid, tx) in v {
+                        if cids.contains(cid) {
+                            let _ = tx.send(S2C::Error { code: ErrorCode::SessionExpired, msg: "Essa sessão foi encerrada".into() });
+                        }
+                    }
+                    v.iter().all(|(cid, _)| cids.contains(cid))
                 }
+                None => false,
             }
+        };
+        // sem nenhuma conexão válida sobrando, ou se a que entrou na voz foi expirada, a pessoa sai da voz
+        let old = {
+            let mut v = self.voice.lock().unwrap_or_else(|e| e.into_inner());
+            if all_expired || v.get(&uid).is_some_and(|e| cids.contains(&e.cid)) {
+                v.remove(&uid)
+            } else {
+                None
+            }
+        };
+        if let Some(old) = old {
+            let app = self.clone();
+            tokio::spawn(async move { app.voice_left(uid, &old).await });
         }
     }
 
@@ -292,8 +451,14 @@ impl App {
             }
         };
         if last {
+            let old = self.voice_take(uid);
             let app = self.clone();
-            tokio::spawn(async move { app.presence_changed(uid).await });
+            tokio::spawn(async move {
+                if let Some(old) = old {
+                    app.voice_left(uid, &old).await;
+                }
+                app.presence_changed(uid).await;
+            });
         }
     }
 
@@ -410,6 +575,7 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         idle: Mutex::new(HashSet::new()),
         nonces: Mutex::new(Default::default()),
         dummy_hash,
+        voice: Mutex::new(HashMap::new()),
     });
     let router = Router::new()
         .route("/ws", get(gateway))
@@ -474,7 +640,7 @@ struct Session {
 }
 
 async fn run_conn(mut socket: WebSocket, app: Arc<App>, ip: String) {
-    let (tx, mut rx) = unbounded_channel::<S2C>();
+    let (tx, mut rx) = Tx::new();
     let cid = app.next.fetch_add(1, Ordering::Relaxed);
     let mut session: Option<Session> = None;
     // Heartbeat: ping a cada 20 s; qualquer quadro recebido (inclusive o pong) conta como vivo.
@@ -490,9 +656,17 @@ async fn run_conn(mut socket: WebSocket, app: Arc<App>, ip: String) {
                 if socket.send(Message::Ping(Default::default())).await.is_err() { break }
             }
             out = rx.recv() => {
-                let Some(m) = out else { break };
-                let Ok(json) = serde_json::to_string(&m) else { continue };
-                if socket.send(Message::Text(json.into())).await.is_err() { break }
+                match out {
+                    None => break,
+                    Some(Out::Msg(m)) => {
+                        let Ok(json) = serde_json::to_string(&m) else { continue };
+                        if socket.send(Message::Text(json.into())).await.is_err() { break }
+                    }
+                    Some(Out::Bin(b)) => {
+                        tx.bin_taken();
+                        if socket.send(Message::Binary(b)).await.is_err() { break }
+                    }
+                }
             }
             inc = socket.recv() => {
                 last_seen = tokio::time::Instant::now();
@@ -502,6 +676,12 @@ async fn run_conn(mut socket: WebSocket, app: Arc<App>, ip: String) {
                             if !handle(&app, &tx, &mut session, cid, &ip, m).await { break }
                         }
                     }
+                    // áudio: nunca derruba a conexão; o que for inválido é descartado em silêncio
+                    Some(Ok(Message::Binary(b))) => {
+                        if let Some(s) = session.as_ref() {
+                            app.voice_relay(s.uid, &b);
+                        }
+                    }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                     _ => {}
                 }
@@ -509,9 +689,11 @@ async fn run_conn(mut socket: WebSocket, app: Arc<App>, ip: String) {
         }
     }
     // Entrega o que ficou na fila (por exemplo, a resposta de um Logout).
-    while let Ok(m) = rx.try_recv() {
-        if let Ok(json) = serde_json::to_string(&m) {
-            let _ = socket.send(Message::Text(json.into())).await;
+    while let Ok(out) = rx.try_recv() {
+        if let Out::Msg(m) = out {
+            if let Ok(json) = serde_json::to_string(&m) {
+                let _ = socket.send(Message::Text(json.into())).await;
+            }
         }
     }
     if let Some(s) = session {
@@ -521,7 +703,7 @@ async fn run_conn(mut socket: WebSocket, app: Arc<App>, ip: String) {
 
 async fn finish_login(
     app: &Arc<App>,
-    tx: &UnboundedSender<S2C>,
+    tx: &Tx,
     session: &mut Option<Session>,
     cid: u64,
     ip: &str,
@@ -555,7 +737,7 @@ async fn finish_login(
 /// Devolve `false` quando a conexão deve ser encerrada.
 async fn handle(
     app: &Arc<App>,
-    tx: &UnboundedSender<S2C>,
+    tx: &Tx,
     session: &mut Option<Session>,
     cid: u64,
     ip: &str,
@@ -681,12 +863,12 @@ async fn handle(
                 return true;
             };
             let (me, token_hash) = (s.uid, s.token_hash.clone());
-            handle_authed(app, tx, me, &token_hash, other).await
+            handle_authed(app, tx, me, cid, &token_hash, other).await
         }
     }
 }
 
-async fn send_sessions(app: &Arc<App>, tx: &UnboundedSender<S2C>, me: i64, token_hash: &[u8]) {
+async fn send_sessions(app: &Arc<App>, tx: &Tx, me: i64, token_hash: &[u8]) {
     match app.store.list_sessions(me, token_hash).await {
         Ok(rows) => {
             let list = rows
@@ -704,8 +886,9 @@ async fn send_sessions(app: &Arc<App>, tx: &UnboundedSender<S2C>, me: i64, token
 
 async fn handle_authed(
     app: &Arc<App>,
-    tx: &UnboundedSender<S2C>,
+    tx: &Tx,
     me: i64,
+    cid: u64,
     token_hash: &[u8],
     m: C2S,
 ) -> bool {
@@ -720,10 +903,85 @@ async fn handle_authed(
     match m {
         C2S::Logout => {
             let _ = app.store.revoke_session(token_hash).await;
+            if let Some(old) = app.voice_take(me) {
+                app.voice_left(me, &old).await;
+            }
             return false;
         }
-        // TODO(voz): servidor de voz (agente A)
-        C2S::VoiceJoin { .. } | C2S::VoiceLeave | C2S::VoiceSet { .. } => {}
+        C2S::VoiceJoin { channel_id } => {
+            if busy("voice", 30, 10) {
+                err(ErrorCode::RateLimited, ERR_BUSY);
+                return true;
+            }
+            let (server, kind) = match app.store.channel_server_kind(channel_id).await {
+                Ok(Some(x)) => x,
+                Ok(None) => {
+                    err(ErrorCode::NotFound, "Canal de voz não encontrado");
+                    return true;
+                }
+                Err(e) => {
+                    db_err("channel_server_kind", e);
+                    return true;
+                }
+            };
+            match app.store.is_member(server, me).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    err(ErrorCode::Forbidden, "Você não é membro deste servidor");
+                    return true;
+                }
+                Err(e) => {
+                    db_err("is_member", e);
+                    return true;
+                }
+            }
+            if kind != 1 {
+                err(ErrorCode::InvalidInput, "Este canal não é de voz");
+                return true;
+            }
+            // um canal por vez: entrar noutro move (mantém mudo/surdo). Entrar no mesmo só reenvia o estado.
+            let (old, state) = {
+                let mut v = app.voice.lock().unwrap_or_else(|e| e.into_inner());
+                let old = v.get(&me).map(|e| (e.channel, e.server));
+                if old.is_none_or(|(c, _)| c != channel_id) {
+                    let (muted, deafened) = v.get(&me).map(|e| (e.muted, e.deafened)).unwrap_or((false, false));
+                    v.insert(me, VoiceEntry { cid, channel: channel_id, server, muted, deafened, tokens: VOICE_BURST, last: Instant::now() });
+                }
+                (old, v.get(&me).map(|e| e.state(me)))
+            };
+            let Some(state) = state else { return true };
+            if let Some((old_channel, old_server)) = old.filter(|(c, _)| *c != channel_id) {
+                app.broadcast_server(old_server, &S2C::VoiceLeft { user_id: me, channel_id: old_channel }).await;
+            }
+            app.broadcast_server(server, &S2C::VoiceUpdate(state)).await;
+        }
+        C2S::VoiceLeave => {
+            if let Some(old) = app.voice_take(me) {
+                app.voice_left(me, &old).await;
+            }
+        }
+        C2S::VoiceSet { muted, deafened } => {
+            if busy("voice", 30, 10) {
+                err(ErrorCode::RateLimited, ERR_BUSY);
+                return true;
+            }
+            // surdo implica mudo
+            let muted = muted || deafened;
+            let changed = {
+                let mut v = app.voice.lock().unwrap_or_else(|e| e.into_inner());
+                match v.get_mut(&me) {
+                    Some(e) if (e.muted, e.deafened) != (muted, deafened) => {
+                        e.muted = muted;
+                        e.deafened = deafened;
+                        Some((e.server, e.state(me)))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((server, state)) = changed {
+                app.broadcast_server(server, &S2C::VoiceUpdate(state)).await;
+            }
+        }
         C2S::ListSessions => send_sessions(app, tx, me, token_hash).await,
         C2S::RevokeSession { id } => {
             match app.store.revoke_session_by_id(me, id).await {
@@ -834,7 +1092,7 @@ async fn handle_authed(
                 .chars()
                 .map(|c| if c.is_whitespace() { '-' } else { c })
                 .collect();
-            if kind != 0 && kind != 4 {
+            if !matches!(kind, 0 | 1 | 4) {
                 err(ErrorCode::InvalidInput, "Tipo de canal inválido");
             } else if name.is_empty() || name.chars().count() > 32 {
                 err(ErrorCode::InvalidInput, "Nome do canal: 1 a 32 caracteres");

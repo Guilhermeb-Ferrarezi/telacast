@@ -77,7 +77,7 @@ impl Env {
         if let MaybeTlsStream::Plain(s) = ws.get_ref() {
             s.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
         }
-        Client { ws }
+        Client { ws, bins: Default::default() }
     }
 }
 
@@ -99,6 +99,8 @@ impl Drop for Env {
 
 struct Client {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
+    /// Quadros binários (áudio) recebidos e ainda não consumidos.
+    bins: std::collections::VecDeque<Vec<u8>>,
 }
 
 impl Client {
@@ -117,12 +119,58 @@ impl Client {
                         return v;
                     }
                 }
+                Ok(Message::Binary(b)) => self.bins.push_back(b.to_vec()),
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(e))
                     if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
                 Err(e) => panic!("conexão caiu esperando {what}: {e}"),
             }
         }
+    }
+
+    fn send_bin(&mut self, data: Vec<u8>) {
+        self.ws.send(Message::Binary(data.into())).unwrap();
+    }
+
+    /// Lê por `dur` e devolve os eventos de texto vistos; os quadros binários ficam na fila.
+    fn collect(&mut self, dur: Duration) -> Vec<S2C> {
+        let start = Instant::now();
+        let mut out = Vec::new();
+        while start.elapsed() < dur {
+            match self.ws.read() {
+                Ok(Message::Text(t)) => out.push(serde_json::from_str::<S2C>(&t).unwrap()),
+                Ok(Message::Binary(b)) => self.bins.push_back(b.to_vec()),
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(e) => panic!("conexão caiu durante a coleta: {e}"),
+            }
+        }
+        out
+    }
+
+    /// Próximo quadro binário (espera até 10 s).
+    fn recv_bin(&mut self) -> Vec<u8> {
+        let start = Instant::now();
+        loop {
+            if let Some(b) = self.bins.pop_front() {
+                return b;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "tempo esgotado esperando um quadro de áudio");
+            self.collect(Duration::from_millis(100));
+        }
+    }
+
+    /// Todos os quadros binários que chegarem em `dur`.
+    fn bins_in(&mut self, dur: Duration) -> Vec<Vec<u8>> {
+        self.collect(dur);
+        self.bins.drain(..).collect()
+    }
+
+    /// Volta a uma sessão já existente (outra conexão da mesma pessoa).
+    fn resume(&mut self, token: &str) {
+        self.send(C2S::Resume { token: token.into(), proto: telacast_proto::PROTO_VERSION });
+        self.wait("Auth do Resume", |m| matches!(m, S2C::Auth { .. }).then_some(()));
     }
 
     fn error_code(&mut self) -> (telacast_proto::ErrorCode, String) {
@@ -1007,4 +1055,296 @@ fn entrar_duas_vezes_no_mesmo_servidor() {
         _ => None,
     });
     assert!(entrou <= 1, "o aviso de entrada apareceu {entrou} vezes");
+}
+
+// ------------------------------------------------------------------ voz
+
+use telacast_proto::{ErrorCode, VoiceState, VOICE_FRAME, VOICE_MAX_PACKET};
+
+/// Servidor "Casa" do dono com o canal de texto padrão e dois canais de voz.
+struct Casa {
+    server_id: i64,
+    categoria: i64,
+    geral: i64,
+    sala: i64,
+    sala2: i64,
+}
+
+/// O dono cria o servidor e os canais de voz; `membros` entram pelo convite.
+fn montar_casa(dono: &mut Client, membros: &mut [&mut Client]) -> Casa {
+    dono.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = dono.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    let server_id = snap.servers[0].id;
+    let geral = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
+    let categoria = snap.servers[0].channels.iter().find(|c| c.kind == 4).unwrap().id;
+    for nome in ["sala", "sala 2"] {
+        dono.send(C2S::CreateChannel { server_id, name: nome.into(), kind: 1, parent_id: None });
+    }
+    let snap = dono.wait("snapshot com os canais de voz", |m| match m {
+        S2C::Snapshot(s) if s.servers[0].channels.iter().filter(|c| c.kind == 1).count() == 2 => Some(s.clone()),
+        _ => None,
+    });
+    let voz = |nome: &str| snap.servers[0].channels.iter().find(|c| c.kind == 1 && c.name == nome).unwrap().id;
+    let (sala, sala2) = (voz("sala"), voz("sala-2"));
+    for m in membros.iter_mut() {
+        m.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
+        m.wait("ServerJoined", |e| matches!(e, S2C::ServerJoined { .. }).then_some(()));
+    }
+    Casa { server_id, categoria, geral, sala, sala2 }
+}
+
+fn estado(user_id: i64, channel_id: i64, muted: bool, deafened: bool) -> VoiceState {
+    VoiceState { user_id, channel_id, muted, deafened }
+}
+
+fn voice_update(c: &mut Client, user: i64) -> VoiceState {
+    c.wait("VoiceUpdate", |m| match m {
+        S2C::VoiceUpdate(v) if v.user_id == user => Some(v.clone()),
+        _ => None,
+    })
+}
+
+fn voice_left(c: &mut Client, user: i64) -> i64 {
+    c.wait("VoiceLeft", |m| match m {
+        S2C::VoiceLeft { user_id, channel_id } if *user_id == user => Some(*channel_id),
+        _ => None,
+    })
+}
+
+fn nenhum_evento_de_voz(eventos: &[S2C]) -> bool {
+    !eventos.iter().any(|e| matches!(e, S2C::VoiceUpdate(_) | S2C::VoiceLeft { .. }))
+}
+
+#[test]
+fn voz_entrar_mover_sair_e_cair() {
+    let env = Env::start();
+    let code = env.invite(3);
+    let mut ana = env.client();
+    let (_, ana_id) = ana.register("ana", &code);
+    let mut beto = env.client();
+    let (beto_tok, beto_id) = beto.register("beto", &code);
+    let mut fora = env.client();
+    fora.register("fora", &code);
+    let casa = montar_casa(&mut ana, &mut [&mut beto]);
+    // quem está fora do servidor não vê nada: precisa de um servidor próprio para ser "online" em outro lugar
+    fora.send(C2S::CreateServer { name: "Outra".into() });
+    fora.wait("snapshot próprio", |m| matches!(m, S2C::Snapshot(s) if !s.servers.is_empty()).then_some(()));
+
+    // recusas: canal de texto, canal inexistente e não-membro
+    beto.send(C2S::VoiceJoin { channel_id: casa.geral });
+    assert_eq!(beto.error_code().0, ErrorCode::InvalidInput);
+    beto.send(C2S::VoiceJoin { channel_id: 12345 });
+    assert_eq!(beto.error_code().0, ErrorCode::NotFound);
+    fora.send(C2S::VoiceJoin { channel_id: casa.sala });
+    assert_eq!(fora.error_code().0, ErrorCode::Forbidden);
+    let _ = ana.collect(Duration::from_millis(200));
+
+    // entrar: o próprio beto e a ana (que está no servidor, mas fora do canal) recebem; quem é de fora, não
+    beto.send(C2S::VoiceJoin { channel_id: casa.sala });
+    assert_eq!(voice_update(&mut beto, beto_id), estado(beto_id, casa.sala, false, false));
+    assert_eq!(voice_update(&mut ana, beto_id), estado(beto_id, casa.sala, false, false));
+    assert!(nenhum_evento_de_voz(&fora.collect(Duration::from_millis(300))), "quem não é do servidor não pode ver a voz");
+
+    // o snapshot de uma conexão nova já traz quem está na voz
+    let mut ana2 = env.client();
+    ana2.send(C2S::Login { username: "ana".into(), password: "segredo-forte-1".into(), proto: telacast_proto::PROTO_VERSION });
+    let snap = ana2.wait("snapshot com voz", |m| match m {
+        S2C::Snapshot(s) => Some(s.clone()),
+        _ => None,
+    });
+    assert_eq!(snap.voice, vec![estado(beto_id, casa.sala, false, false)]);
+
+    // surdo implica mudo
+    beto.send(C2S::VoiceSet { muted: false, deafened: true });
+    assert_eq!(voice_update(&mut ana, beto_id), estado(beto_id, casa.sala, true, true));
+    // mover de canal: avisa a saída do antigo e a entrada no novo, mantendo mudo/surdo
+    beto.send(C2S::VoiceJoin { channel_id: casa.sala2 });
+    assert_eq!(voice_left(&mut ana, beto_id), casa.sala);
+    assert_eq!(voice_update(&mut ana, beto_id), estado(beto_id, casa.sala2, true, true));
+    beto.send(C2S::VoiceSet { muted: false, deafened: false });
+    assert_eq!(voice_update(&mut ana, beto_id), estado(beto_id, casa.sala2, false, false));
+
+    // a ana também entra: o estado completo tem os dois, em ordem
+    ana.send(C2S::VoiceJoin { channel_id: casa.sala });
+    assert_eq!(voice_update(&mut ana, ana_id), estado(ana_id, casa.sala, false, false));
+    ana2.collect(Duration::from_millis(100));
+    let mut ana3 = env.client();
+    ana3.send(C2S::Login { username: "ana".into(), password: "segredo-forte-1".into(), proto: telacast_proto::PROTO_VERSION });
+    let snap = ana3.wait("snapshot com os dois na voz", |m| match m {
+        S2C::Snapshot(s) => Some(s.clone()),
+        _ => None,
+    });
+    assert_eq!(snap.voice, vec![estado(ana_id, casa.sala, false, false), estado(beto_id, casa.sala2, false, false)]);
+
+    // sair avisa todos (inclusive quem saiu); sair sem estar na voz não faz nada
+    beto.send(C2S::VoiceLeave);
+    // (o beto ainda tem na fila o VoiceLeft da sala antiga, da mudança de canal)
+    beto.wait("VoiceLeft da sala 2", |m| matches!(m, S2C::VoiceLeft { user_id, channel_id } if *user_id == beto_id && *channel_id == casa.sala2).then_some(()));
+    assert_eq!(voice_left(&mut ana, beto_id), casa.sala2);
+    beto.send(C2S::VoiceLeave);
+    assert!(nenhum_evento_de_voz(&beto.collect(Duration::from_millis(300))));
+
+    // cair a conexão: só some da voz quando cai a ÚLTIMA conexão da pessoa
+    let mut beto2 = env.client();
+    beto2.resume(&beto_tok);
+    beto.send(C2S::VoiceJoin { channel_id: casa.sala });
+    voice_update(&mut ana, beto_id);
+    drop(beto);
+    assert!(nenhum_evento_de_voz(&ana.collect(Duration::from_millis(400))), "ainda há outra conexão do beto");
+    drop(beto2);
+    assert_eq!(voice_left(&mut ana, beto_id), casa.sala);
+}
+
+#[test]
+fn voz_logout_e_sessao_revogada() {
+    let env = Env::start();
+    let code = env.invite(3);
+    let mut ana = env.client();
+    ana.register("ana", &code);
+    let mut beto = env.client();
+    let (_, beto_id) = beto.register("beto", &code);
+    let mut carla = env.client();
+    let (_, carla_id) = carla.register("carla", &code);
+    let casa = montar_casa(&mut ana, &mut [&mut beto, &mut carla]);
+
+    // Logout tira da voz
+    beto.send(C2S::VoiceJoin { channel_id: casa.sala });
+    voice_update(&mut ana, beto_id);
+    beto.send(C2S::Logout);
+    assert_eq!(voice_left(&mut ana, beto_id), casa.sala);
+
+    // sessão revogada por outra sessão da mesma pessoa: a conexão em voz é expirada e some da voz
+    let mut c2 = env.client();
+    c2.send(C2S::Login { username: "carla".into(), password: "segredo-forte-1".into(), proto: telacast_proto::PROTO_VERSION });
+    c2.wait("Auth da 2ª sessão", |m| matches!(m, S2C::Auth { .. }).then_some(()));
+    c2.send(C2S::VoiceJoin { channel_id: casa.sala2 });
+    assert_eq!(voice_update(&mut ana, carla_id).channel_id, casa.sala2);
+    carla.send(C2S::RevokeOtherSessions);
+    assert_eq!(c2.error_code().0, ErrorCode::SessionExpired);
+    assert_eq!(voice_left(&mut ana, carla_id), casa.sala2);
+}
+
+#[test]
+fn voz_criar_canal_de_voz() {
+    let env = Env::start();
+    let code = env.invite(2);
+    let mut ana = env.client();
+    ana.register("ana", &code);
+    let mut beto = env.client();
+    let (_, beto_id) = beto.register("beto", &code);
+    let casa = montar_casa(&mut ana, &mut [&mut beto]);
+
+    // só o dono cria; o tipo 2 (anúncio) ainda não existe
+    beto.send(C2S::CreateChannel { server_id: casa.server_id, name: "intruso".into(), kind: 1, parent_id: None });
+    assert_eq!(beto.error_code().0, ErrorCode::Forbidden);
+    ana.send(C2S::CreateChannel { server_id: casa.server_id, name: "anuncios".into(), kind: 2, parent_id: None });
+    assert_eq!(ana.error_code().0, ErrorCode::InvalidInput);
+
+    // voz pode ficar dentro de uma categoria; um canal de texto não serve de pai
+    ana.send(C2S::CreateChannel { server_id: casa.server_id, name: "Sala Na Categoria".into(), kind: 1, parent_id: Some(casa.geral) });
+    assert_eq!(ana.error_code().0, ErrorCode::NotFound);
+    ana.send(C2S::CreateChannel { server_id: casa.server_id, name: "Sala Na Categoria".into(), kind: 1, parent_id: Some(casa.categoria) });
+    let snap = beto.wait("snapshot do membro com o canal novo", |m| match m {
+        S2C::Snapshot(s) if s.servers[0].channels.iter().any(|c| c.name == "sala-na-categoria") => Some(s.clone()),
+        _ => None,
+    });
+    let nova = snap.servers[0].channels.iter().find(|c| c.name == "sala-na-categoria").unwrap();
+    assert_eq!((nova.kind, nova.parent), (1, Some(casa.categoria)));
+    // e dá para entrar nela
+    beto.send(C2S::VoiceJoin { channel_id: nova.id });
+    assert_eq!(voice_update(&mut ana, beto_id).channel_id, nova.id);
+}
+
+#[test]
+fn voz_rele_de_quadros() {
+    let env = Env::start();
+    let code = env.invite(4);
+    let mut ana = env.client();
+    let (_, ana_id) = ana.register("ana", &code);
+    let mut beto = env.client();
+    let (beto_tok, beto_id) = beto.register("beto", &code);
+    let mut carla = env.client();
+    let (_, carla_id) = carla.register("carla", &code);
+    let mut dora = env.client();
+    dora.register("dora", &code);
+    let casa = montar_casa(&mut ana, &mut [&mut beto, &mut carla, &mut dora]);
+    let mut beto2 = env.client();
+    beto2.resume(&beto_tok);
+
+    for (c, id) in [(&mut ana, ana_id), (&mut beto, beto_id), (&mut carla, carla_id)] {
+        c.send(C2S::VoiceJoin { channel_id: casa.sala });
+        voice_update(c, id);
+    }
+    // a dora não entra na voz; espera todos assentarem
+    let frame = |seq: u32, opus: &[u8]| {
+        let mut f = vec![VOICE_FRAME];
+        f.extend_from_slice(&seq.to_be_bytes());
+        f.extend_from_slice(opus);
+        f
+    };
+    let esperado = |de: i64, seq: u32, opus: &[u8]| {
+        let mut f = vec![VOICE_FRAME];
+        f.extend_from_slice(&de.to_be_bytes());
+        f.extend_from_slice(&seq.to_be_bytes());
+        f.extend_from_slice(opus);
+        f
+    };
+    let dre = Duration::from_millis(300);
+
+    // a ana fala: beto (nas duas conexões) e carla recebem o conteúdo certo; ela e a dora, nada
+    ana.send_bin(frame(7, b"ola-opus"));
+    assert_eq!(beto.recv_bin(), esperado(ana_id, 7, b"ola-opus"));
+    assert_eq!(beto2.recv_bin(), esperado(ana_id, 7, b"ola-opus"));
+    assert_eq!(carla.recv_bin(), esperado(ana_id, 7, b"ola-opus"));
+    assert!(ana.bins_in(dre).is_empty(), "o remetente não recebe o próprio áudio");
+    assert!(dora.bins_in(Duration::from_millis(50)).is_empty());
+
+    // quem não está em voz não é repassado
+    dora.send_bin(frame(1, b"intruso"));
+    assert!(ana.bins_in(dre).is_empty() && beto.bins_in(Duration::from_millis(50)).is_empty());
+
+    // mudo não repassa
+    ana.send(C2S::VoiceSet { muted: true, deafened: false });
+    voice_update(&mut ana, ana_id);
+    ana.send_bin(frame(8, b"mudo"));
+    assert!(beto.bins_in(dre).is_empty() && carla.bins_in(Duration::from_millis(50)).is_empty());
+    ana.send(C2S::VoiceSet { muted: false, deafened: false });
+    voice_update(&mut ana, ana_id);
+
+    // surdo não recebe e também não é ouvido; os outros continuam recebendo
+    carla.send(C2S::VoiceSet { muted: false, deafened: true });
+    voice_update(&mut carla, carla_id);
+    ana.send_bin(frame(9, b"para-beto"));
+    assert_eq!(beto.recv_bin(), esperado(ana_id, 9, b"para-beto"));
+    assert!(carla.bins_in(dre).is_empty(), "surdo não recebe");
+    carla.send_bin(frame(1, b"surdo-fala"));
+    assert!(ana.bins_in(dre).is_empty() && beto.bins_in(Duration::from_millis(50)).is_empty(), "surdo também fica mudo");
+    carla.send(C2S::VoiceSet { muted: false, deafened: false });
+    voice_update(&mut carla, carla_id);
+
+    // inválidos são descartados sem derrubar a conexão: curto, tipo errado, pacote grande e quadro enorme
+    ana.send_bin(vec![VOICE_FRAME, 0, 0, 0, 1]); // só o cabeçalho, sem Opus
+    ana.send_bin(vec![]);
+    ana.send_bin(vec![VOICE_FRAME]);
+    let mut errado = frame(10, b"x");
+    errado[0] = 99;
+    ana.send_bin(errado);
+    ana.send_bin(frame(11, &vec![1u8; VOICE_MAX_PACKET + 1]));
+    ana.send_bin(frame(12, &vec![1u8; 5000]));
+    assert!(beto.bins_in(dre).is_empty(), "nada disso deveria ser repassado");
+    // no limite exato passa, e a conexão continua viva (texto e áudio)
+    ana.send_bin(frame(13, &vec![2u8; VOICE_MAX_PACKET]));
+    assert_eq!(beto.recv_bin(), esperado(ana_id, 13, &vec![2u8; VOICE_MAX_PACKET]));
+    ana.send(C2S::Send { channel_id: casa.geral, content: "ainda aqui".into(), reply_to: None, nonce: 0, attachments: vec![] });
+    ana.wait("a própria mensagem", |m| matches!(m, S2C::Message(x) if x.content == "ainda aqui").then_some(()));
+
+    // limite de taxa: uma rajada de 400 quadros não passa inteira (rajada de ~100 + 100/s)
+    for i in 0..400u32 {
+        ana.send_bin(frame(100 + i, b"rajada"));
+    }
+    let recebidos = beto.bins_in(Duration::from_secs(1)).len();
+    assert!((50..=250).contains(&recebidos), "a rajada de 400 deveria ser limitada, chegaram {recebidos}");
 }

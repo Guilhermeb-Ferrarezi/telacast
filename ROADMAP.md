@@ -112,7 +112,7 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 
 Proposta do [R04]: começar simples, trocar o transporte depois.
 
-- [ ] **Canal de voz**: modelo, entrar/sair, lista de participantes, `voice_state` no servidor. P0 **M**
+- [~] **Canal de voz**: servidor pronto (estado em memória, `VoiceJoin/Leave/Set`, `VoiceUpdate/Left`, `Snapshot.voice`, relé de quadros binários com limites, 4 e2e) e interface pronta (lista com participantes, painel "Voz conectada", mudo/surdo, grade); falta ligar o motor de áudio (ver `docs/VOICE.md`). P0 **M**
 - [ ] **Áudio Opus pelo WebSocket atual** (`cpal` + Opus + jitter buffer + mixagem), com o mesmo formato de quadro que um UDP futuro usaria. P0 **M**
 - [ ] **Mudo, ensurdecer, indicador de fala** (VAD por energia). P0 **S**
 - [ ] **Volume por usuário**, seleção de dispositivos, push-to-talk dentro da janela. P1 **S**

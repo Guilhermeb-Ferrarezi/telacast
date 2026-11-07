@@ -292,7 +292,7 @@ impl Store {
         Ok(r.map(|x| x.0))
     }
 
-    /// Cria canal de texto (kind 0) ou categoria (kind 4). Devolve false se a categoria-pai
+    /// Cria canal de texto (kind 0), de voz (kind 1) ou categoria (kind 4). Devolve false se a categoria-pai
     /// não existe neste servidor.
     pub async fn create_channel(&self, id: i64, server: i64, name: &str, kind: i16, parent: Option<i64>) -> R<bool> {
         let r = sqlx::query(
@@ -309,6 +309,14 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(r.rows_affected() == 1)
+    }
+
+    /// (servidor, tipo) de um canal de servidor; `None` se não existe.
+    pub async fn channel_server_kind(&self, channel: i64) -> R<Option<(i64, i16)>> {
+        sqlx::query_as("SELECT server_id, kind FROM channels WHERE id = $1 AND server_id IS NOT NULL")
+            .bind(channel)
+            .fetch_optional(&self.pool)
+            .await
     }
 
     pub async fn server_member_ids(&self, server: i64) -> R<Vec<i64>> {
@@ -1042,7 +1050,7 @@ impl Store {
         .await
     }
 
-    /// (servidor, canal, nome, tipo, categoria, posição) dos canais de texto e categorias.
+    /// (servidor, canal, nome, tipo, categoria, posição...) dos canais de texto, de voz e categorias.
     pub async fn channels_in(&self, servers: &[i64], me: i64) -> R<Vec<(i64, i64, String, i16, Option<i64>, i32, i64, i64, i32)>> {
         sqlx::query_as(
             "SELECT c.server_id, c.id, c.name, c.kind, c.parent_id, c.position,
@@ -1050,7 +1058,7 @@ impl Store {
                     COALESCE((SELECT rs.last_read_id FROM read_state rs WHERE rs.user_id = $2 AND rs.channel_id = c.id), 0),
                     COALESCE((SELECT rs.mention_count FROM read_state rs WHERE rs.user_id = $2 AND rs.channel_id = c.id), 0)
              FROM channels c
-             WHERE c.server_id = ANY($1) AND c.kind IN (0, 4) ORDER BY c.server_id, c.position, c.id",
+             WHERE c.server_id = ANY($1) AND c.kind IN (0, 1, 4) ORDER BY c.server_id, c.position, c.id",
         )
         .bind(servers)
         .bind(me)
