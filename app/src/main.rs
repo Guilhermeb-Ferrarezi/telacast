@@ -87,6 +87,20 @@ enum HomeTab {
     Add,
 }
 
+/// Cartão de perfil aberto (popout) ao clicar no nome, avatar, menção ou membro.
+struct Profile {
+    user: i64,
+    name: String,
+    /// Onde o clique aconteceu; o cartão abre ao lado.
+    anchor: egui::Rect,
+    /// Abre à esquerda do ponto (painel de membros, na borda direita).
+    left: bool,
+    /// Passada do egui em que abriu (o clique que abre não pode fechar).
+    opened: u64,
+    /// Lista "mais ações" aberta.
+    more: bool,
+}
+
 /// Anexos por mensagem e envios simultâneos.
 const MAX_ATTACH: usize = 10;
 const MAX_PARALLEL: usize = 3;
@@ -121,6 +135,7 @@ enum Act {
     ToggleCategory(i64),
     Copy(String),
     Toast(String),
+    OpenProfile { user: i64, name: String, anchor: egui::Rect, left: bool },
     Reply(i64, p::Reply),
     CancelReply,
     JumpTo(i64),
@@ -214,6 +229,7 @@ struct Session {
     uploads: Vec<files::Upload>,
     upload_key: u64,
     armed: Vec<Armed>,
+    profile: Option<Profile>,
     /// Rolagem horizontal da bandeja de anexos e onde ela ficou na tela (para a roda do mouse).
     tray_x: f32,
     tray_rect: egui::Rect,
@@ -339,6 +355,7 @@ impl Session {
             uploads: Vec::new(),
             upload_key: 0,
             armed: Vec::new(),
+            profile: None,
             tray_x: 0.0,
             tray_rect: egui::Rect::NOTHING,
             upload_tx,
@@ -459,6 +476,22 @@ impl Session {
             self.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce, attachments: ids });
         }
         self.pending.push(pend);
+    }
+
+    /// Dados de um usuário conhecido (você, membros dos servidores, amigos, DMs, bloqueados).
+    fn user_info(&self, id: i64) -> Option<p::User> {
+        if self.me.id == id {
+            return Some(self.me.clone());
+        }
+        self.snap
+            .servers
+            .iter()
+            .flat_map(|sv| sv.members.iter())
+            .chain(self.snap.friends.iter().map(|f| &f.user))
+            .chain(self.snap.dms.iter().map(|d| &d.user))
+            .chain(self.snap.blocked.iter())
+            .find(|u| u.id == id)
+            .cloned()
     }
 
     /// Ctrl+V com uma imagem na área de transferência: grava um PNG temporário e envia como anexo.
@@ -1664,6 +1697,7 @@ impl App {
             }
         }
         self.modals(ctx, s, &mut acts);
+        self.profile_popout(ctx, s, &mut acts);
         self.toast(ctx, s);
 
         let mut keep = true;
@@ -1794,6 +1828,9 @@ impl App {
                 }
                 Act::AskDelete(id, preview) => s.modal = Modal::DeleteMsg { id, preview },
                 Act::Toast(msg) => s.toast = Some((msg, Instant::now())),
+                Act::OpenProfile { user, name, anchor, left } => {
+                    s.profile = Some(Profile { user, name, anchor, left, opened: ctx.cumulative_pass_nr(), more: false });
+                }
                 Act::Copy(text) => {
                     ctx.copy_text(text);
                     s.toast = Some(("Texto copiado".into(), Instant::now()));
@@ -2388,8 +2425,8 @@ impl App {
                                     ui.label(RichText::new("dono").size(10.0).color(YELLOW));
                                 }
                             });
-                            if r.clicked() && m.id != s.me.id {
-                                acts.push(Act::Send(C2S::OpenDm { user_id: m.id }));
+                            if r.clicked() {
+                                acts.push(Act::OpenProfile { user: m.id, name: m.name.clone(), anchor: r.rect, left: true });
                             }
                             if m.id != s.me.id {
                                 let is_blocked = s.snap.blocked.iter().any(|b| b.id == m.id);
@@ -2663,7 +2700,13 @@ impl App {
                         if grouped {
                             ui.add_space(54.0);
                         } else {
-                            avatar(ui, &m.author, m.author_id, 40.0, None, BG);
+                            let ar = avatar(ui, &m.author, m.author_id, 40.0, None, BG);
+                            if ar.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if ar.clicked() && m.kind == 0 {
+                                acts.push(Act::OpenProfile { user: m.author_id, name: m.author.clone(), anchor: ar.rect, left: false });
+                            }
                             ui.add_space(6.0);
                         }
                         ui.vertical(|ui| {
@@ -2689,7 +2732,14 @@ impl App {
                             }
                             if !grouped {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&m.author).size(15.5).strong().color(TEXT));
+                                    let nr = ui.add(egui::Label::new(RichText::new(&m.author).size(15.5).strong().color(TEXT)).sense(egui::Sense::click()));
+                                    if nr.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        ui.painter().hline(nr.rect.x_range(), nr.rect.bottom() - 1.0, egui::Stroke::new(1.0, TEXT));
+                                    }
+                                    if nr.clicked() && m.kind == 0 {
+                                        acts.push(Act::OpenProfile { user: m.author_id, name: m.author.clone(), anchor: nr.rect, left: false });
+                                    }
                                     ui.label(RichText::new(fmt_clock(m.ts)).size(12.0).color(MUTED));
                                     if m.pinned {
                                         ui.label(RichText::new("Fixada").size(11.5).color(AMBER));
@@ -2733,6 +2783,10 @@ impl App {
                                 for c in clicks {
                                     match c {
                                         md_view::Click::Spoiler(id) => acts.push(Act::ToggleSpoiler(m.id, id)),
+                                        md_view::Click::User(uid, pos) => {
+                                            let name = md_view::user_name(&s.snap, uid).unwrap_or_default();
+                                            acts.push(Act::OpenProfile { user: uid, name, anchor: egui::Rect::from_min_size(pos, egui::vec2(0.0, 18.0)), left: false });
+                                        }
                                     }
                                 }
                             }
@@ -3508,6 +3562,146 @@ impl App {
         }
         if close || dismissed {
             s.modal = Modal::None;
+        }
+    }
+
+    /// Cartão de perfil: banner liso, avatar sobreposto, nome, presença, "membro desde" e ações.
+    fn profile_popout(&mut self, ctx: &egui::Context, s: &mut Session, acts: &mut Vec<Act>) {
+        let Some(pf) = s.profile.as_ref() else { return };
+        let (uid, anchor, left, opened, more) = (pf.user, pf.anchor, pf.left, pf.opened, pf.more);
+        let user = s.user_info(uid).unwrap_or(p::User { id: uid, name: pf.name.clone(), online: false, status: p::Status::Offline });
+        let me = s.me.id;
+        let is_me = uid == me;
+        let is_owner = s.snap.servers.iter().any(|sv| sv.owner == uid && matches!(&s.view, View::Chan { server, .. } if *server == sv.id));
+        let friend = s.snap.friends.iter().find(|f| f.user.id == uid).map(|f| f.status);
+        let blocked = s.snap.blocked.iter().any(|b| b.id == uid);
+        let since = (uid >> 22) + 1_767_225_600_000; // o id é um snowflake: carrega a data de criação da conta
+        const W: f32 = 300.0;
+        let screen = ctx.content_rect();
+        let x = if left { anchor.left() - 16.0 - W } else { anchor.right() + 12.0 };
+        let x = x.clamp(8.0, (screen.right() - W - 8.0).max(8.0));
+        let y = anchor.top().clamp(8.0, (screen.bottom() - 340.0).max(8.0));
+        let mut close = false;
+        let mut toggle_more = false;
+        let area = egui::Area::new(egui::Id::new("profile-popout"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(x, y))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(L3)
+                    .stroke(egui::Stroke::new(1.0, LINE2))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(120) })
+                    .show(ui, |ui| {
+                        ui.set_width(W);
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                        // banner liso (sem imagem) e avatar com anel de recorte
+                        let (banner, _) = ui.allocate_exact_size(egui::vec2(W, 105.0), egui::Sense::hover());
+                        ui.painter().rect_filled(banner, egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 }, banner_color(uid));
+                        let c = egui::pos2(banner.left() + 10.0 + 40.0 + 6.0, banner.bottom() - 4.0);
+                        let (bg, fg) = user_tint(uid);
+                        let pt = ui.painter();
+                        pt.circle_filled(c, 46.0, L3);
+                        pt.circle_filled(c, 40.0, bg);
+                        let ch = user.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into());
+                        pt.text(c, Align2::CENTER_CENTER, ch, egui::FontId::proportional(32.0), fg);
+                        presence_dot(pt, c + egui::vec2(29.0, 29.0), 8.0, user.status, L3);
+                        ui.add_space(44.0);
+                        egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 0, bottom: 16 }).show(ui, |ui| {
+                            ui.set_width(W - 32.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&user.name).size(20.0).strong().color(TEXT));
+                                if is_owner {
+                                    ui.add_space(6.0);
+                                    ui.label(RichText::new("dono").size(11.0).color(YELLOW));
+                                }
+                            });
+                            ui.add_space(2.0);
+                            ui.label(RichText::new(format!("@{}", user.name)).size(13.5).color(TEXT2));
+                            ui.add_space(2.0);
+                            ui.label(RichText::new(status_label(user.status)).size(13.0).color(MUTED));
+                            ui.add_space(12.0);
+                            egui::Frame::new().fill(L2).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(caps("NO TELACAST DESDE"));
+                                ui.add_space(4.0);
+                                ui.label(RichText::new(fmt_date(since)).size(14.0).color(TEXT));
+                            });
+                            ui.add_space(12.0);
+                            if is_me {
+                                if big_button(ui, "Minha conta", BLURPLE) {
+                                    acts.push(Act::OpenAccount);
+                                    close = true;
+                                }
+                            } else {
+                                if big_button(ui, "Mensagem", BLURPLE) {
+                                    acts.push(Act::Send(C2S::OpenDm { user_id: uid }));
+                                    close = true;
+                                }
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    match friend {
+                                        None => {
+                                            if small_button(ui, "Adicionar amigo", FIELD) {
+                                                acts.push(Act::Send(C2S::FriendRequest { username: user.name.clone() }));
+                                                acts.push(Act::Toast("Pedido de amizade enviado".into()));
+                                            }
+                                        }
+                                        Some(p::FriendStatus::Friend) => {
+                                            if small_button(ui, "Desfazer amizade", FIELD) {
+                                                acts.push(Act::Send(C2S::FriendRemove { user_id: uid }));
+                                            }
+                                        }
+                                        Some(p::FriendStatus::Incoming) => {
+                                            if small_button(ui, "Aceitar pedido", FIELD) {
+                                                acts.push(Act::Send(C2S::FriendAccept { user_id: uid }));
+                                            }
+                                        }
+                                        Some(p::FriendStatus::Outgoing) => {
+                                            if small_button(ui, "Cancelar pedido", FIELD) {
+                                                acts.push(Act::Send(C2S::FriendRemove { user_id: uid }));
+                                            }
+                                        }
+                                    }
+                                    if small_button(ui, if more { "Menos" } else { "Mais" }, FIELD) {
+                                        toggle_more = true;
+                                    }
+                                });
+                                if more {
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        if small_button(ui, "Copiar ID", FIELD) {
+                                            ctx.copy_text(uid.to_string());
+                                            acts.push(Act::Toast("ID copiado".into()));
+                                        }
+                                        if blocked {
+                                            if small_button(ui, "Desbloquear", FIELD) {
+                                                acts.push(Act::Send(C2S::Unblock { user_id: uid }));
+                                                close = true;
+                                            }
+                                        } else if small_button(ui, "Bloquear", RED) {
+                                            acts.push(Act::Modal(Modal::ConfirmBlock { user_id: uid, name: user.name.clone() }));
+                                            close = true;
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                    });
+            });
+        if toggle_more {
+            if let Some(pf) = s.profile.as_mut() {
+                pf.more = !pf.more;
+            }
+        }
+        // fecha com Esc ou clique fora (o clique que abriu não conta)
+        let outside = ctx.input(|i| i.pointer.any_pressed())
+            && ctx.pointer_interact_pos().is_some_and(|p| !area.response.rect.contains(p))
+            && ctx.cumulative_pass_nr() != opened;
+        if close || outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            s.profile = None;
         }
     }
 

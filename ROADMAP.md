@@ -145,12 +145,12 @@ Prioridade máxima do [R02]; moderação do [R07].
 
 **Perfil ([R01])**
 - [ ] P0: **upload de avatar** (usa o armazenamento da Fase 1), lista de sessões (feita na 0.2, "Minha conta"). **M**
-- [ ] P1: bio, pronomes, banner, cor de destaque e **cartão de perfil**; troca de senha; recuperação de senha por e-mail (exige SMTP). **S–M**
+- [~] P1: **cartão de perfil (popout) feito**: clicar no nome, no avatar, numa menção `@nome` ou num membro abre o cartão (banner liso, avatar 80 com presença, nome, @usuário, status, "no Telacast desde" tirado do snowflake, Mensagem, amizade, Mais: Copiar ID / Bloquear; o seu mostra "Minha conta"); troca de senha feita; **faltam** bio, pronomes, imagem de banner, cor de destaque, "membro desde" do servidor, cargos, nota privada, modal de perfil completo e recuperação de senha por e-mail (exige SMTP; por ora `reset-password` no servidor). **S–M**
 - [ ] P2: **2FA TOTP**, apelido por servidor, **exportar dados e excluir conta** (LGPD), nota privada. **S–M**
 
 **Interface ([R10])**
 - [ ] P0: **tela de Configurações** (Minha conta, Aparência, Notificações, Voz, Sair). **M**
-- [~] P1: **Ctrl+K (Quick Switcher)** feito (crate `telacast-qs`, 6 testes: prefixos `@ # *`, nota 10/7/5/3/1 × reforço de uso, setas/Enter/Esc, menções e não lidos, canais anteriores); faltam popout de perfil, **temas claro e AMOLED**, zoom e tamanho de fonte, atalhos básicos. **S–M**
+- [~] P1: **Ctrl+K (Quick Switcher)** feito (crate `telacast-qs`, 6 testes: prefixos `@ # *`, nota 10/7/5/3/1 × reforço de uso, setas/Enter/Esc, menções e não lidos, canais anteriores); faltam **temas claro e AMOLED**, zoom e tamanho de fonte, atalhos básicos. **S–M**
 - [ ] P2: busca com filtros na UI, modo compacto, pastas de servidores e arrastar para reordenar, onboarding e estados vazios, acessibilidade (AccessKit, alto contraste). **S–L**
 - [ ] P3: i18n, atalhos remapeáveis, "modo desenvolvedor".
 

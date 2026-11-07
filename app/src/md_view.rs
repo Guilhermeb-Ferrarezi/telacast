@@ -20,6 +20,8 @@ pub struct Env<'a> {
 /// Pedido que o desenho devolve ao app.
 pub enum Click {
     Spoiler(u32),
+    /// Clicou numa menção `@nome`: usuário e ponto do clique.
+    User(i64, egui::Pos2),
 }
 
 pub struct Base {
@@ -30,6 +32,7 @@ pub struct Base {
 enum Hit {
     Spoiler(u32, bool),
     Link(String),
+    User(i64),
 }
 struct Span {
     a: usize,
@@ -119,7 +122,9 @@ fn push(job: &mut LayoutJob, cx: &mut Cx, st: &St, nodes: &[Inline]) {
             }
             Inline::User(id) => {
                 let name = user_name(cx.env.snap, *id).unwrap_or_else(|| "usuário-desconhecido".into());
+                let a = cx.chars;
                 add(job, cx, &format!("@{name}"), &St { w: 600.0, color: AMBER_HOT, bg: alpha(AMBER, 0.14), ..st.clone() });
+                cx.spans.push(Span { a, b: cx.chars, hit: Hit::User(*id) });
             }
             Inline::Channel(id) => {
                 let name = channel_name(cx.env.snap, *id).unwrap_or_else(|| "canal-desconhecido".into());
@@ -211,6 +216,7 @@ fn text_block(ui: &mut egui::Ui, mut job: LayoutJob, spans: Vec<Span>, clicks: &
         if let Some(pos) = r.interact_pointer_pos() {
             match at(pos).map(|s| &s.hit) {
                 Some(Hit::Spoiler(id, _)) => clicks.push(Click::Spoiler(*id)),
+                Some(Hit::User(id)) => clicks.push(Click::User(*id, pos)),
                 Some(Hit::Link(url)) => {
                     // link dentro de spoiler fechado não abre
                     let hidden = spans.iter().any(|s| matches!(s.hit, Hit::Spoiler(_, false)) && at(pos).is_some_and(|h| h.a >= s.a && h.b <= s.b));

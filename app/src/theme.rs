@@ -221,7 +221,7 @@ pub fn status_label(st: telacast_proto::Status) -> &'static str {
     }
 }
 
-fn user_tint(id: i64) -> (Color32, Color32) {
+pub fn user_tint(id: i64) -> (Color32, Color32) {
     const P: [(Color32, Color32); 5] = [
         (Color32::from_rgb(0x3b, 0x35, 0x48), Color32::from_rgb(0xcf, 0xc6, 0xe6)),
         (Color32::from_rgb(0x2f, 0x45, 0x40), Color32::from_rgb(0xbf, 0xe0, 0xd6)),
@@ -486,6 +486,17 @@ fn local(ts: i64) -> Option<chrono::DateTime<chrono::Local>> {
 /// Hora do dia, "14:05".
 pub fn fmt_clock(ts: i64) -> String {
     local(ts).map(|t| t.format("%H:%M").to_string()).unwrap_or_default()
+}
+
+/// Data completa, "07/11/2026".
+pub fn fmt_date(ts: i64) -> String {
+    local(ts).map(|t| t.format("%d/%m/%Y").to_string()).unwrap_or_default()
+}
+
+/// Cor lisa do banner do perfil (sem imagem): o tom do avatar, um pouco mais claro.
+pub fn banner_color(id: i64) -> Color32 {
+    let (bg, fg) = user_tint(id);
+    lerp(bg, fg, 0.18)
 }
 
 /// Rótulo do dia para o divisor do chat: "hoje", "ontem" ou "07/11/2026".
