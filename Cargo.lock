@@ -4338,10 +4338,15 @@ dependencies = [
  "nvidia-video-codec-sdk",
  "openh264",
  "serde_json",
+ "telacast-md",
  "telacast-proto",
  "tungstenite 0.30.0",
  "x11rb 0.14.0",
 ]
+
+[[package]]
+name = "telacast-md"
+version = "0.1.0"
 
 [[package]]
 name = "telacast-proto"

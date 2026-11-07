@@ -11,6 +11,7 @@ Planos: `ROADMAP.md` (fases 0 a 5, decisões, ordem), `docs/MOBILE-PLAN.md` (And
 | `proto/` | protocolo JSON do gateway (`C2S`, `S2C`, `Snapshot`...). Mudou aqui, mudam servidor e app |
 | `server/` | axum 0.8 + sqlx 0.9. `main.rs` (gateway, limites, CLI), `store.rs` (todas as consultas), `auth.rs` (argon2, tokens), `ids.rs` (snowflake). Migrações em `server/migrations/` (embutidas) |
 | `app/` | cliente egui/eframe 0.37. `main.rs` (telas), `theme.rs` (tema Grafite e widgets), `gateway.rs`, `publisher.rs` (captura + NVENC), `viewer.rs` (decodifica transmissão) |
+| `md/` | `telacast-md`: parser de Markdown do chat, sem dependências, com testes (`cargo test -p telacast-md`). O desenho fica em `app/src/md_view.rs` |
 | `vendor/` | cópia ajustada do `nvidia-video-codec-sdk` |
 | `server/tests/e2e.rs` | sobe o servidor de verdade num banco novo e testa o fluxo completo |
 
@@ -48,6 +49,7 @@ Cadastro é **fechado por convite**. Senha de 8 a 128 caracteres. Não ponha sen
 - Barras de hover (ações da mensagem) são desenhadas só com o `painter` e `ui.interact`, **sem** ocupar layout; `scope_builder` empurrava a lista.
 - `TextEdit::frame` recebe `egui::Frame` (use `Frame::NONE`). `Id::new` está depreciado (só avisa).
 - `consume_key(NONE, Enter)` engole Shift+Enter; use `take_plain_enter` (em `main.rs`).
+- Markdown: o texto cru vai e volta do servidor; `md_view` monta um `LayoutJob` por bloco (negrito = `TextFormat.coords` com o eixo `wght`) e acha spoiler/link pelo cursor do galley. Fundo de pílula não tem raio (limite do `TextFormat.background`).
 - Sem emoji colorido por padrão; negrito de verdade só por `TextFormat.coords` com o Inter variável.
 - Lista de mensagens: `ScrollArea` com `stick_to_bottom`; o servidor devolve 50 por página (`History{before}`). Ao prepender páginas antigas a rolagem é mantida por uma âncora (id e posição da primeira mensagem) + `scroll_with_delta_animation(.., ScrollAnimation::none())`; durante um salto (`jump`/`jump_wanted`) a âncora é desligada.
 

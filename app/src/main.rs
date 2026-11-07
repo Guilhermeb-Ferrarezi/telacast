@@ -1,5 +1,6 @@
 mod gateway;
 mod gpu;
+mod md_view;
 mod net;
 mod publisher;
 mod theme;
@@ -77,6 +78,7 @@ enum Act {
     SendMsg { ch: i64, content: String, reply: Option<p::Reply> },
     Resend(u64),
     Discard(u64),
+    ToggleSpoiler(i64, u32),
     StartEdit(i64, String),
     CancelEdit,
     SaveEdit(i64, String),
@@ -127,6 +129,8 @@ struct Session {
     jump: Option<Jump>,
     pending: Vec<Pending>,
     nonce_seq: u64,
+    /// Spoilers que o usuário abriu (mensagem, número do spoiler); só em memória, como no Discord.
+    revealed: HashSet<(i64, u32)>,
     /// Canais com uma página de mensagens antigas a caminho.
     older: HashSet<i64>,
     /// Canais que ainda têm mensagens mais antigas no servidor (a última página veio cheia).
@@ -202,6 +206,7 @@ impl Session {
             jump: None,
             pending: Vec::new(),
             nonce_seq: 0,
+            revealed: HashSet::new(),
             older: HashSet::new(),
             has_more: HashMap::new(),
             jump_wanted: None,
@@ -860,6 +865,11 @@ impl App {
                         s.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce });
                     }
                 }
+                Act::ToggleSpoiler(msg, id) => {
+                    if !s.revealed.remove(&(msg, id)) {
+                        s.revealed.insert((msg, id));
+                    }
+                }
                 Act::Discard(nonce) => {
                     s.pending.retain(|p| p.nonce != nonce);
                     for v in s.msgs.values_mut() {
@@ -1327,6 +1337,7 @@ impl App {
         let replying_here = matches!(&s.replying, Some((c, _)) if *c == ch);
         let input_h = 82.0 + 22.0 + if replying_here { 38.0 } else { 0.0 };
         let h = (ui.available_height() - input_h).max(60.0);
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         let prev_anchor = s.anchor.take().filter(|a| a.0 == ch);
         let scroll = egui::ScrollArea::vertical()
             .id_salt(("chat", ch))
@@ -1455,19 +1466,20 @@ impl App {
                                         acts.push(Act::CancelEdit);
                                     }
                                 }
-                            } else if m.edited {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 0.0;
-                                    let r = ui.add(egui::Label::new(RichText::new(&m.content).size(15.5).color(TEXT2)).selectable(true));
-                                    if !is_pending {
-                                        show_menu(&r, acts);
-                                    }
-                                    ui.label(RichText::new(" (editado)").size(11.5).color(MUTED));
-                                });
                             } else {
-                                let r = ui.add(egui::Label::new(RichText::new(&m.content).size(15.5).color(TEXT2)).wrap().selectable(true));
+                                let blocks = telacast_md::parse(&m.content);
+                                let env = md_view::Env { snap: &s.snap, revealed: &s.revealed, msg: m.id, now: now_secs };
+                                let mut clicks = Vec::new();
+                                let resps = md_view::show(ui, &blocks, &env, &md_view::Base { size: 15.5, color: TEXT2 }, m.edited, &mut clicks);
                                 if !is_pending {
-                                    show_menu(&r, acts);
+                                    for r in &resps {
+                                        show_menu(r, acts);
+                                    }
+                                }
+                                for c in clicks {
+                                    match c {
+                                        md_view::Click::Spoiler(id) => acts.push(Act::ToggleSpoiler(m.id, id)),
+                                    }
                                 }
                             }
                             if let Some((nonce, waited)) = pend {

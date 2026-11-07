@@ -98,7 +98,7 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 - [x] **Editar e excluir** as próprias mensagens, com "(editado)". P0 **S** ([R03])
 - [~] **Paginação ao rolar** (`before`): feita no app (chega perto do topo e busca 50 mensagens mais antigas, mantendo a rolagem no lugar) e o salto até uma resposta antiga busca páginas (até 500 mensagens) até achar. **Falta** `after`/`around` e rolar para baixo depois de um salto. P0 **S**
 - [~] **Não lidos de verdade** (feito: `read_state` + `Ack` + barra e pílula; **falta** contagem de menções e o divisor "novas mensagens"): `last_read` no servidor, contagem de menções, divisor "novas mensagens". P0 **M** ([R03][R05][R10])
-- [ ] **Markdown básico** (negrito, itálico, código, bloco, citação, link, spoiler). P0 **M–L** (parser + layout rico em egui)
+- [x] **Markdown** (crate `telacast-md`, 14 testes; renderizado em `app/src/md_view.rs`): negrito, itálico, sublinhado, tachado, código em linha e em bloco, citação (`>` e `>>>`), listas (aninhadas e numeradas), títulos 1–3, subtexto, spoiler (clique revela), link (`[texto](url)` e solto), menções `<@id>`/`<#id>`/`@everyone` e carimbo `<t:unix:estilo>` em português. **Faltam** realce de sintaxe nos blocos, emoji colorido e o composer trocar `@nome` por `<@id>`. P0 **M–L**
 - [~] **Base de UI** (feitos: tokens, menu de contexto, barra de ações no hover, confirmação ao apagar; **falta** padronizar modais com Esc/clique fora): tokens de tema, modal padronizado (Esc/clique fora/confirmação destrutiva), **menus de contexto**, **barra de ações ao passar o mouse**. P0 **M** ([R10])
 - [ ] **Menções** `@usuário`/`#canal` com autocomplete e destaque. P1 **M**
 - [x] **Respostas** com prévia e pular para a mensagem. P1 **M**
