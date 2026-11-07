@@ -140,6 +140,13 @@ pub struct Message {
     pub nonce: u64,
 }
 
+/// Um resultado de busca: a mensagem e onde ela está.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SearchHit {
+    pub message: Message,
+    pub channel_name: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum C2S {
     /// `invite`: código de convite da instância (cadastro fechado).
@@ -162,6 +169,17 @@ pub enum C2S {
     SetStatus { status: Status },
     /// O app avisa que ficou parado (ou voltou): "ausente" automático. Vale só para esta conexão.
     SetIdle { idle: bool },
+    /// Busca mensagens. Escopo: `channel_id` (um canal ou DM) ou `server_id` (todos os canais de texto do
+    /// servidor). `from`: só deste autor. `text` vazio + `from` lista as mensagens da pessoa.
+    /// `before`: id da última mensagem da página anterior (paginação). `nonce` volta na resposta.
+    Search {
+        nonce: u64,
+        channel_id: Option<i64>,
+        server_id: Option<i64>,
+        from: Option<i64>,
+        text: String,
+        before: Option<i64>,
+    },
     /// Marca o canal como lido até `message_id`.
     Ack { channel_id: i64, message_id: i64 },
     /// "Está digitando…" (reenviar a cada poucos segundos).
@@ -186,6 +204,8 @@ pub enum S2C {
     Message(Message),
     /// Mensagens em ordem cronológica.
     History { channel_id: i64, messages: Vec<Message> },
+    /// Resultado de `Search` (mais novos primeiro); `more` indica que há outra página.
+    SearchResults { nonce: u64, hits: Vec<SearchHit>, more: bool },
     MessageEdited { channel_id: i64, message_id: i64, content: String },
     MessageDeleted { channel_id: i64, message_id: i64 },
     Typing { channel_id: i64, user_id: i64 },

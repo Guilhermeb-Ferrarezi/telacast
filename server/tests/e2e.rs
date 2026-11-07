@@ -514,3 +514,68 @@ fn mencoes_contam_ate_ler() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(mencoes(&env, "beto"), 0);
 }
+
+#[test]
+fn busca_de_mensagens() {
+    let env = Env::start();
+    let code = env.invite(2);
+    let mut ana = env.client();
+    let (_, ana_id) = ana.register("ana", &code);
+    let mut beto = env.client();
+    beto.register("beto", &code);
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    let server_id = snap.servers[0].id;
+    let geral = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
+    beto.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
+    beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+    for (quem, t) in [
+        (0, "vamos jogar futebol amanhã"),
+        (1, "eu adoro jogar futebol"),
+        (0, "e depois um cinema"),
+        (1, "a transmissão do jogo começa às nove"),
+    ] {
+        let c = if quem == 0 { &mut ana } else { &mut beto };
+        c.send(C2S::Send { channel_id: geral, content: t.into(), reply_to: None, nonce: 0 });
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let buscar = |c: &mut Client, nonce: u64, text: &str, from: Option<i64>, before: Option<i64>| {
+        c.send(C2S::Search { nonce, channel_id: None, server_id: Some(server_id), from, text: text.into(), before });
+        c.wait("resultado da busca", |m| match m {
+            S2C::SearchResults { nonce: n, hits, more } if *n == nonce => Some((hits.clone(), *more)),
+            _ => None,
+        })
+    };
+    // radical: "jogar" acha "jogo" e "jogar" (português)
+    let (h, more) = buscar(&mut beto, 1, "jogar", None, None);
+    assert!(!more);
+    let textos: Vec<&str> = h.iter().map(|x| x.message.content.as_str()).collect();
+    assert_eq!(textos, vec!["a transmissão do jogo começa às nove", "eu adoro jogar futebol", "vamos jogar futebol amanhã"], "mais novo primeiro");
+    assert_eq!(h[0].channel_name, "geral");
+    // só do autor
+    let (h, _) = buscar(&mut beto, 2, "futebol", Some(ana_id), None);
+    assert_eq!(h.len(), 1);
+    assert_eq!(h[0].message.author, "ana");
+    // só o filtro de autor, sem texto
+    let (h, _) = buscar(&mut beto, 3, "", Some(ana_id), None);
+    assert_eq!(h.len(), 2);
+    // paginação: antes do id mais novo
+    let (h, _) = buscar(&mut beto, 4, "jogar", None, Some(h[0].message.id));
+    assert!(h.iter().all(|x| x.message.content != "a transmissão do jogo começa às nove"));
+    // sem resultados
+    let (h, _) = buscar(&mut beto, 5, "xyzinexistente", None, None);
+    assert!(h.is_empty());
+    // quem não é do servidor não busca nele
+    let mut fora = env.client();
+    let code2 = env.invite(1);
+    fora.register("carla", &code2);
+    fora.send(C2S::Search { nonce: 9, channel_id: None, server_id: Some(server_id), from: None, text: "jogar".into(), before: None });
+    assert_eq!(fora.error_code().0, telacast_proto::ErrorCode::Forbidden);
+    // sem escopo
+    fora.send(C2S::Search { nonce: 10, channel_id: None, server_id: None, from: None, text: "x".into(), before: None });
+    assert_eq!(fora.error_code().0, telacast_proto::ErrorCode::InvalidInput);
+}

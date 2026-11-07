@@ -81,6 +81,9 @@ enum Act {
     Discard(u64),
     ToggleSpoiler(i64, u32),
     SetStatus(p::Status),
+    Search(bool),
+    Goto { channel: i64, id: i64 },
+    CloseSearch,
     StartEdit(i64, String),
     CancelEdit,
     SaveEdit(i64, String),
@@ -141,6 +144,9 @@ struct Session {
     visits: HashMap<(u8, i64), u32>,
     /// Canais e DMs visitados, o mais recente primeiro.
     recent: Vec<i64>,
+    search: Option<SearchState>,
+    /// Ir até uma mensagem assim que o histórico do canal carregar: (canal, id).
+    pending_goto: Option<(i64, i64)>,
     /// Divisor "novas mensagens": (canal, último id lido ao abrir, já rolei até ele).
     marker: Option<(i64, i64, bool)>,
     /// Canais com uma página de mensagens antigas a caminho.
@@ -151,6 +157,21 @@ struct Session {
     jump_wanted: Option<(i64, i64, u8)>,
     /// (canal, id e posição na tela da primeira mensagem da lista), para manter a rolagem ao carregar antigas.
     anchor: Option<(i64, i64, f32)>,
+}
+
+/// Painel de busca de mensagens (Ctrl+F).
+struct SearchState {
+    query: String,
+    hits: Vec<p::SearchHit>,
+    more: bool,
+    loading: bool,
+    appending: bool,
+    nonce: u64,
+    focus: bool,
+    /// Já buscou ao menos uma vez (para distinguir "sem resultados" de "ainda não buscou").
+    searched: bool,
+    /// Buscar só no canal atual (em vez do servidor inteiro).
+    channel_scope: bool,
 }
 
 /// Mensagem enviada que o servidor ainda não confirmou (aparece apagada na lista).
@@ -223,6 +244,8 @@ impl Session {
             mentions: HashMap::new(),
             visits: HashMap::new(),
             recent: Vec::new(),
+            search: None,
+            pending_goto: None,
             marker: None,
             older: HashSet::new(),
             has_more: HashMap::new(),
@@ -328,6 +351,20 @@ impl Session {
             self.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce });
         }
         self.pending.push(pend);
+    }
+
+    /// Rola até a mensagem `id` do canal aberto; se não estiver carregada, busca páginas antigas.
+    fn jump_to(&mut self, id: i64) {
+        let found = self.current_channel().and_then(|c| self.msgs.get(&c)).is_some_and(|v| v.iter().any(|m| m.id == id));
+        if found {
+            self.jump = Some(Jump { id, since: Instant::now(), scrolled: false });
+        } else if let Some(ch) = self.current_channel().filter(|c| self.has_more.get(c) == Some(&true)) {
+            // vai buscando páginas antigas até achar (no máximo 10, ou 500 mensagens)
+            self.jump_wanted = Some((ch, id, 10));
+            self.load_older(ch);
+        } else {
+            self.toast = Some(("A mensagem não está mais disponível".into(), Instant::now()));
+        }
     }
 
     /// Pede a página de mensagens anteriores à mais antiga já carregada.
@@ -505,6 +542,20 @@ impl Session {
                             }
                         }
                     }
+                    S2C::SearchResults { nonce, hits, more } => {
+                        if let Some(st) = &mut self.search {
+                            if st.nonce == nonce {
+                                if st.appending {
+                                    st.hits.extend(hits);
+                                } else {
+                                    st.hits = hits;
+                                }
+                                st.more = more;
+                                st.loading = false;
+                                st.searched = true;
+                            }
+                        }
+                    }
                     S2C::MessageEdited { channel_id, message_id, content } => {
                         if let Some(m) = self.msgs.get_mut(&channel_id).and_then(|v| v.iter_mut().find(|m| m.id == message_id)) {
                             m.content = content;
@@ -555,6 +606,13 @@ impl Session {
                             }
                         }
                         self.msgs.insert(channel_id, v);
+                        // abri o canal vindo da busca: agora que há mensagens, vai até a escolhida
+                        if let Some((gch, gid)) = self.pending_goto {
+                            if gch == channel_id {
+                                self.pending_goto = None;
+                                self.jump_to(gid);
+                            }
+                        }
                     }
                     S2C::DmOpened { channel_id } => self.open(View::Dm(channel_id)),
                     S2C::ServerJoined { server_id } => self.open_server(server_id),
@@ -828,6 +886,41 @@ impl App {
 
 /// Sigla do servidor: primeira letra de cada palavra, sem forçar maiúscula (regra do Discord).
 /// Consome um Enter sem Shift (Shift+Enter continua quebrando linha).
+/// Separa a consulta em texto + filtros: `de:nome` (ou `de:eu`) e `em:#canal`. O resto é o texto.
+/// Devolve (texto, autor, canal).
+fn parse_search(query: &str, snap: &p::Snapshot, view: &View, me: i64) -> (String, Option<i64>, Option<i64>) {
+    let members: Vec<&p::User> = match view {
+        View::Chan { server, .. } => snap.servers.iter().find(|s| s.id == *server).map(|s| s.members.iter().collect()).unwrap_or_default(),
+        View::Dm(c) => snap.dms.iter().filter(|d| d.channel_id == *c).map(|d| &d.user).collect(),
+        View::Home => Vec::new(),
+    };
+    let channels: Vec<&p::Channel> = match view {
+        View::Chan { server, .. } => snap.servers.iter().find(|s| s.id == *server).map(|s| s.channels.iter().filter(|c| c.kind == 0).collect()).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let (mut from, mut chan) = (None, None);
+    let mut text: Vec<&str> = Vec::new();
+    for tok in query.split_whitespace() {
+        let low = tok.to_lowercase();
+        if let Some(v) = low.strip_prefix("de:") {
+            let who = if v == "eu" { Some(me) } else { members.iter().find(|u| u.name.to_lowercase() == v).map(|u| u.id) };
+            if who.is_some() {
+                from = who;
+                continue;
+            }
+        }
+        if let Some(v) = low.strip_prefix("em:") {
+            let v = v.trim_start_matches('#');
+            if let Some(c) = channels.iter().find(|c| c.name.to_lowercase() == v) {
+                chan = Some(c.id);
+                continue;
+            }
+        }
+        text.push(tok);
+    }
+    (text.join(" "), from, chan)
+}
+
 fn is_pending_or_own_echo(m: &p::Message, me: i64) -> bool {
     m.id < 0 || (m.author_id == me && m.nonce != 0)
 }
@@ -896,6 +989,24 @@ impl App {
     fn session_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &mut Session) -> bool {
         let mut acts: Vec<Act> = Vec::new();
 
+        // Ctrl+F abre e fecha o painel de busca (só dentro de um canal ou conversa)
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) && !matches!(s.view, View::Home) {
+            s.search = match s.search {
+                Some(_) => None,
+                None => Some(SearchState {
+                    query: String::new(),
+                    hits: Vec::new(),
+                    more: false,
+                    loading: false,
+                    appending: false,
+                    nonce: 0,
+                    focus: true,
+                    searched: false,
+                    channel_scope: false,
+                }),
+            };
+        }
+
         // Ctrl+K abre e fecha o seletor rápido (consumido antes de qualquer campo de texto)
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
             self.qs = if self.qs.is_some() { None } else { Some(quick::Qs::new()) };
@@ -952,7 +1063,9 @@ impl App {
         if !self.fullscreen {
             self.rail(ui, s, &mut acts);
             self.channel_panel(ui, s, &mut acts);
-            if let View::Chan { server, .. } = s.view {
+            if s.search.is_some() {
+                self.search_panel(ui, s, &mut acts);
+            } else if let View::Chan { server, .. } = s.view {
                 self.members_panel(ui, s, server, &mut acts);
             }
         }
@@ -1006,6 +1119,50 @@ impl App {
                         s.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce });
                     }
                 }
+                Act::CloseSearch => s.search = None,
+                Act::Goto { channel, id } => {
+                    let server = s.snap.servers.iter().find(|sv| sv.channels.iter().any(|c| c.id == channel)).map(|sv| sv.id);
+                    let already = s.current_channel() == Some(channel);
+                    match server {
+                        Some(server) => s.open(View::Chan { server, channel }),
+                        None => s.open(View::Dm(channel)),
+                    }
+                    if already {
+                        s.jump_to(id);
+                    } else {
+                        s.pending_goto = Some((channel, id));
+                    }
+                }
+                Act::Search(more) => {
+                    let view = s.view.clone();
+                    let (text, from, chan_override) = {
+                        let q = s.search.as_ref().map(|x| x.query.clone()).unwrap_or_default();
+                        parse_search(&q, &s.snap, &view, s.me.id)
+                    };
+                    if let Some(st) = &mut s.search {
+                        if text.is_empty() && from.is_none() {
+                            continue;
+                        }
+                        let (channel_id, server_id) = match &view {
+                            View::Chan { server, channel } => match chan_override {
+                                Some(c) => (Some(c), None),
+                                None if st.channel_scope => (Some(*channel), None),
+                                None => (None, Some(*server)),
+                            },
+                            View::Dm(c) => (Some(*c), None),
+                            View::Home => continue,
+                        };
+                        let before = if more { st.hits.last().map(|h| h.message.id) } else { None };
+                        st.nonce += 1;
+                        st.loading = true;
+                        st.appending = more;
+                        if !more {
+                            st.hits.clear();
+                        }
+                        let nonce = st.nonce;
+                        s.gw.send(C2S::Search { nonce, channel_id, server_id, from, text, before });
+                    }
+                }
                 Act::SetStatus(st) => {
                     s.me.status = st;
                     s.snap.me.status = st;
@@ -1022,21 +1179,7 @@ impl App {
                         v.retain(|m| m.id != -(nonce as i64));
                     }
                 }
-                Act::JumpTo(id) => {
-                    let found = s
-                        .current_channel()
-                        .and_then(|c| s.msgs.get(&c))
-                        .is_some_and(|v| v.iter().any(|m| m.id == id));
-                    if found {
-                        s.jump = Some(Jump { id, since: Instant::now(), scrolled: false });
-                    } else if let Some(ch) = s.current_channel().filter(|c| s.has_more.get(c) == Some(&true)) {
-                        // vai buscando páginas antigas até achar (no máximo 10, ou 500 mensagens)
-                        s.jump_wanted = Some((ch, id, 10));
-                        s.load_older(ch);
-                    } else {
-                        s.toast = Some(("A mensagem original não está mais disponível".into(), Instant::now()));
-                    }
-                }
+                Act::JumpTo(id) => s.jump_to(id),
                 Act::StartEdit(id, text) => s.editing = Some((id, text)),
                 Act::CancelEdit => s.editing = None,
                 Act::SaveEdit(id, text) => {
@@ -1368,6 +1511,167 @@ impl App {
                 row(ui, c, acts);
             }
         }
+    }
+
+    // ---- busca de mensagens (Ctrl+F)
+    fn search_panel(&mut self, ui: &mut egui::Ui, s: &mut Session, acts: &mut Vec<Act>) {
+        let in_server = matches!(s.view, View::Chan { .. });
+        let place = match &s.view {
+            View::Chan { server, .. } => s.snap.servers.iter().find(|x| x.id == *server).map(|x| x.name.clone()).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let pr = egui::Panel::right("search")
+            .frame(egui::Frame::new().fill(SIDE))
+            .resizable(false)
+            .exact_size(400.0)
+            .show(ui, |ui| {
+                // cabeçalho
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 52.0), Layout::left_to_right(Align::Center), |ui| {
+                    ui.add_space(16.0);
+                    ui.label(serif("Resultados de busca", 19.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(10.0);
+                        let (r, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(r, 8.0, L4);
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        let c = r.center();
+                        let st = egui::Stroke::new(1.5, if resp.hovered() { TEXT } else { MUTED });
+                        ui.painter().line_segment([c + egui::vec2(-5.0, -5.0), c + egui::vec2(5.0, 5.0)], st);
+                        ui.painter().line_segment([c + egui::vec2(-5.0, 5.0), c + egui::vec2(5.0, -5.0)], st);
+                        if resp.clicked() {
+                            acts.push(Act::CloseSearch);
+                        }
+                    });
+                });
+                rule_bleed(ui, 0.0);
+                ui.add_space(10.0);
+                let Some(st) = &mut s.search else { return };
+                egui::Frame::new().inner_margin(egui::Margin::symmetric(14, 0)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    // campo de busca
+                    let id = egui::Id::new("search-input");
+                    let focused = ui.memory(|m| m.has_focus(id));
+                    egui::Frame::new()
+                        .fill(L3)
+                        .stroke(egui::Stroke::new(1.0, if focused { AMBER } else { LINE2 }))
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::symmetric(12, 2))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            let hint = if in_server { format!("Buscar em {place}") } else { "Buscar nesta conversa".to_string() };
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut st.query)
+                                    .id(id)
+                                    .frame(egui::Frame::NONE)
+                                    .hint_text(hint)
+                                    .desired_width(f32::INFINITY)
+                                    .margin(egui::Margin::symmetric(0, 8)),
+                            );
+                            if st.focus {
+                                st.focus = false;
+                                r.request_focus();
+                            }
+                            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                acts.push(Act::Search(false));
+                                r.request_focus();
+                            }
+                        });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if in_server {
+                            ui.selectable_value(&mut st.channel_scope, false, "No servidor");
+                            ui.selectable_value(&mut st.channel_scope, true, "Neste canal");
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if small_button(ui, "Buscar", BLURPLE) {
+                                acts.push(Act::Search(false));
+                            }
+                        });
+                    });
+                    ui.label(RichText::new("Filtros: de:nome  em:#canal  (de:eu para as suas)").size(11.5).color(MUTED));
+                });
+                ui.add_space(6.0);
+                rule_bleed(ui, 0.0);
+                let Some(st) = &mut s.search else { return };
+                if st.loading && st.hits.is_empty() {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| ui.label(RichText::new("Buscando…").color(MUTED)));
+                    ui.ctx().request_repaint_after(Duration::from_millis(300));
+                } else if st.searched && st.hits.is_empty() {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("Buscamos por toda parte.").color(TEXT2));
+                        ui.label(RichText::new("Infelizmente, não encontramos nada.").color(MUTED));
+                    });
+                } else if !st.searched {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| ui.label(RichText::new("Escreva e aperte Enter para buscar.").color(MUTED)));
+                }
+                let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+                let mut go: Option<(i64, i64)> = None;
+                let mut want_more = false;
+                if !st.hits.is_empty() {
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        ui.label(RichText::new(format!("{}{} resultado{}", st.hits.len(), if st.more { "+" } else { "" }, if st.hits.len() == 1 { "" } else { "s" })).size(12.5).color(MUTED));
+                    });
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    for h in &st.hits {
+                        let m = &h.message;
+                        let bg = ui.painter().add(egui::Shape::Noop);
+                        let card = egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 10)).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new(format!("# {}", h.channel_name)).size(12.0).color(MUTED));
+                            ui.horizontal_top(|ui| {
+                                avatar(ui, &m.author, m.author_id, 32.0, None, SIDE);
+                                ui.add_space(4.0);
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(&m.author).strong().color(TEXT));
+                                        ui.label(RichText::new(format!("{} {}", fmt_day(m.ts), fmt_clock(m.ts))).size(11.5).color(MUTED));
+                                    });
+                                    let blocks = telacast_md::parse(&m.content);
+                                    let empty = HashSet::new();
+                                    let env = md_view::Env { snap: &s.snap, revealed: &empty, msg: m.id, now: now_secs };
+                                    let mut clicks = Vec::new();
+                                    md_view::show(ui, &blocks, &env, &md_view::Base { size: 14.5, color: TEXT2 }, m.edited, &mut clicks);
+                                });
+                            });
+                        });
+                        let r = ui.interact(card.response.rect, egui::Id::new(("hit", m.id)), egui::Sense::click());
+                        if r.hovered() {
+                            ui.painter().set(bg, egui::Shape::rect_filled(card.response.rect, 0.0, L2));
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if r.clicked() {
+                            go = Some((m.channel_id, m.id));
+                        }
+                        let (line, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+                        ui.painter().rect_filled(line, 0.0, LINE);
+                    }
+                    if st.more {
+                        ui.add_space(10.0);
+                        ui.vertical_centered(|ui| {
+                            if small_button(ui, if st.loading { "Carregando…" } else { "Mostrar mais" }, FIELD) && !st.loading {
+                                want_more = true;
+                            }
+                        });
+                        ui.add_space(14.0);
+                    }
+                });
+                if want_more {
+                    acts.push(Act::Search(true));
+                }
+                if let Some((channel, id)) = go {
+                    acts.push(Act::Goto { channel, id });
+                }
+            });
+        edge(ui, pr.response.rect, false);
     }
 
     // ---- membros

@@ -398,6 +398,55 @@ impl Store {
         Ok(())
     }
 
+    pub async fn is_member(&self, server: i64, user: i64) -> R<bool> {
+        let r: (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM members WHERE server_id = $1 AND user_id = $2)")
+            .bind(server)
+            .bind(user)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(r.0)
+    }
+
+    /// Busca por texto (`text` vazio = só o filtro de autor). Devolve até 26 resultados (um a mais
+    /// que a página, para saber se há mais), do mais novo para o mais antigo.
+    pub async fn search(
+        &self,
+        channel: Option<i64>,
+        server: Option<i64>,
+        from: Option<i64>,
+        text: &str,
+        before: Option<i64>,
+    ) -> R<Vec<(Message, String)>> {
+        type Row = (i64, i64, String, i64, String, String, bool);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT m.id, m.channel_id, c.name, m.author_id, u.display_name, m.content, m.edited_at IS NOT NULL
+             FROM messages m
+             JOIN channels c ON c.id = m.channel_id
+             JOIN users u ON u.id = m.author_id
+             WHERE (($1::bigint IS NOT NULL AND m.channel_id = $1) OR ($2::bigint IS NOT NULL AND c.server_id = $2 AND c.kind = 0))
+               AND ($3::bigint IS NULL OR m.author_id = $3)
+               AND ($4 = '' OR to_tsvector('portuguese', m.content) @@ websearch_to_tsquery('portuguese', $4))
+               AND ($5::bigint IS NULL OR m.id < $5)
+             ORDER BY m.id DESC LIMIT 26",
+        )
+        .bind(channel)
+        .bind(server)
+        .bind(from)
+        .bind(text)
+        .bind(before)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, channel_id, channel_name, author_id, author, content, edited)| {
+                (
+                    Message { id, channel_id, author_id, author, content, ts: ts_ms(id), edited, reply: None, nonce: 0 },
+                    channel_name,
+                )
+            })
+            .collect())
+    }
+
     pub async fn ack(&self, user: i64, channel: i64, message: i64) -> R<()> {
         sqlx::query(
             "INSERT INTO read_state(user_id, channel_id, last_read_id) VALUES ($1, $2, $3)

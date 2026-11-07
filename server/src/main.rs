@@ -779,6 +779,42 @@ async fn handle_authed(
                 }
             }
         }
+        C2S::Search { nonce, channel_id, server_id, from, text, before } => {
+            let text = text.trim();
+            if text.chars().count() > 200 {
+                err(ErrorCode::InvalidInput, "A busca aceita até 200 caracteres");
+                return true;
+            }
+            if channel_id.is_none() && server_id.is_none() {
+                err(ErrorCode::InvalidInput, "Escolha onde buscar");
+                return true;
+            }
+            if busy("search", 20, 10) {
+                err(ErrorCode::RateLimited, ERR_BUSY);
+                return true;
+            }
+            // só busca onde a pessoa pode ler
+            let allowed = match (channel_id, server_id) {
+                (Some(c), _) => app.store.can_access(c, me).await.unwrap_or(false),
+                (None, Some(s)) => app.store.is_member(s, me).await.unwrap_or(false),
+                _ => false,
+            };
+            if !allowed {
+                err(ErrorCode::Forbidden, "Você não tem acesso a este lugar");
+                return true;
+            }
+            let scope_channel = channel_id;
+            let scope_server = if channel_id.is_some() { None } else { server_id };
+            match app.store.search(scope_channel, scope_server, from, text, before).await {
+                Ok(mut rows) => {
+                    let more = rows.len() > 25;
+                    rows.truncate(25);
+                    let hits = rows.into_iter().map(|(message, channel_name)| p::SearchHit { message, channel_name }).collect();
+                    let _ = tx.send(S2C::SearchResults { nonce, hits, more });
+                }
+                Err(e) => db_err("search", e),
+            }
+        }
         C2S::SetStatus { status } => {
             let code = match status {
                 Status::Online => 0,
