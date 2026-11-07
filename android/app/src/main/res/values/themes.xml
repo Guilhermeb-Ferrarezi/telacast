@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Só existe o tema escuro (Grafite). Cores iguais às de app/src/theme.rs. -->
+    <color name="grafite_l0">#0A0A0B</color>
+    <color name="grafite_l2">#151517</color>
+
+    <style name="Theme.Telacast" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/grafite_l2</item>
+        <item name="android:colorBackground">@color/grafite_l2</item>
+        <item name="android:statusBarColor">@color/grafite_l2</item>
+        <item name="android:navigationBarColor">@color/grafite_l2</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:colorAccent">#E9B35E</item>
+    </style>
+</resources>

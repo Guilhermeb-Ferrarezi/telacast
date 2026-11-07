@@ -1,0 +1,22 @@
+# build e caches do Gradle
+build/
+.gradle/
+.kotlin/
+local.properties
+captures/
+
+# artefatos e segredos: nunca versionar chaves
+*.apk
+*.aab
+*.jks
+*.keystore
+keystore.properties
+*.pem
+
+# arquivos de editor
+.idea/
+*.iml
+.DS_Store
+
+# saída do Paparazzi: só docs/*.png é versionado (copiado de propósito)
+app/src/test/failures/
