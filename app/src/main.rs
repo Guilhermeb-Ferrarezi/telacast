@@ -373,8 +373,6 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        theme::aurora(ui.painter(), ui.max_rect(), ctx.input(|i| i.time) as f32);
-        ctx.request_repaint_after(Duration::from_millis(33)); // aurora animada (~30 fps)
         self.poll_login();
         match self.session.take() {
             Some(mut s) => {
@@ -399,16 +397,16 @@ impl eframe::App for App {
 
 impl App {
     fn login_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| {
             let busy = self.login.gw.is_some();
             let top = ((ui.available_height() - 470.0) / 2.0).max(10.0);
             ui.vertical_centered(|ui| {
                 ui.add_space(top);
-                glass(20)
+                glass(14)
                     .inner_margin(egui::Margin::same(32))
                     .show(ui, |ui| {
                         ui.set_width(340.0);
-                        ui.label(RichText::new("Telacast").size(30.0).strong().color(lerp(VIOLET, CYAN, 0.5)));
+                        ui.label(serif("Telacast", 34.0));
                         ui.label(
                             RichText::new(if self.login.resuming {
                                 "Entrando…"
@@ -421,11 +419,11 @@ impl App {
                         );
                         ui.add_space(8.0);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            ui.label(RichText::new("SERVIDOR").size(11.0).strong().color(MUTED));
+                            ui.label(caps(&"SERVIDOR"));
                             ui.add(egui::TextEdit::singleline(&mut self.login.server).desired_width(f32::INFINITY));
-                            ui.label(RichText::new("NOME DE USUÁRIO").size(11.0).strong().color(MUTED));
+                            ui.label(caps(&"NOME DE USUÁRIO"));
                             ui.add(egui::TextEdit::singleline(&mut self.login.user).desired_width(f32::INFINITY));
-                            ui.label(RichText::new("SENHA").size(11.0).strong().color(MUTED));
+                            ui.label(caps(&"SENHA"));
                             let pw = ui.add(
                                 egui::TextEdit::singleline(&mut self.login.pass)
                                     .password(true)
@@ -433,7 +431,7 @@ impl App {
                             );
                             let mut enter = pw.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
                             if self.login.register {
-                                ui.label(RichText::new("CÓDIGO DE CONVITE").size(11.0).strong().color(MUTED));
+                                ui.label(caps(&"CÓDIGO DE CONVITE"));
                                 let inv = ui.add(egui::TextEdit::singleline(&mut self.login.invite).desired_width(f32::INFINITY));
                                 enter |= inv.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
                             }
@@ -502,7 +500,7 @@ impl App {
             .frame(
                 egui::Frame::new()
                     .fill(if self.fullscreen { Color32::BLACK } else { BG })
-                    .inner_margin(egui::Margin::same(if self.fullscreen { 0 } else { 14 })),
+                    .inner_margin(egui::Margin::symmetric(if self.fullscreen { 0 } else { 28 }, 0)),
             )
             .show(ui, |ui| {
                 if self.fullscreen {
@@ -548,14 +546,15 @@ impl App {
 
     // ---- barra de servidores
     fn rail(&mut self, ui: &mut egui::Ui, s: &Session, acts: &mut Vec<Act>) {
-        egui::Panel::left("rail")
-            .frame(egui::Frame::new().fill(RAIL).inner_margin(egui::Margin::same(12)))
+        let pr = egui::Panel::left("rail")
+            .frame(egui::Frame::new().fill(RAIL).inner_margin(egui::Margin::symmetric(13, 14)))
             .resizable(false)
-            .exact_size(72.0)
+            .exact_size(68.0)
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 let home = matches!(s.view, View::Home | View::Dm(_));
-                if rail_button(ui, "T", home, BLURPLE).on_hover_text("Mensagens diretas").clicked() {
+                ui.vertical_centered(|ui| ui.label(serif("t", 26.0)));
+                if rail_button(ui, "DM", home, BLURPLE).on_hover_text("Mensagens diretas").clicked() {
                     acts.push(Act::Open(View::Home));
                 }
                 ui.separator();
@@ -572,11 +571,12 @@ impl App {
                     }
                 });
             });
+        edge(ui, pr.response.rect, true);
     }
 
     // ---- canais / DMs
     fn channel_panel(&mut self, ui: &mut egui::Ui, s: &Session, acts: &mut Vec<Act>) {
-        egui::Panel::left("channels")
+        let pr = egui::Panel::left("channels")
             .frame(egui::Frame::new().fill(SIDE).inner_margin(egui::Margin::same(10)))
             .resizable(false)
             .exact_size(240.0)
@@ -587,7 +587,7 @@ impl App {
                         View::Chan { server, channel } => {
                             let Some(sv) = s.snap.servers.iter().find(|x| x.id == *server) else { return };
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(&sv.name).size(16.0).strong());
+                                ui.label(serif(&sv.name, 22.0));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if small_button(ui, "Convite", FIELD) {
                                         acts.push(Act::Modal(Modal::Invite(sv.invite.clone())));
@@ -597,7 +597,7 @@ impl App {
                             ui.separator();
                             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new("CANAIS DE TEXTO").size(11.0).strong().color(MUTED));
+                                    ui.label(caps(&"CANAIS DE TEXTO"));
                                     if sv.owner == s.me.id {
                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                             if ui.small_button("+").on_hover_text("Criar canal").clicked() {
@@ -610,11 +610,11 @@ impl App {
                                     let live = s.snap.live.iter().any(|l| l.channel_id == c.id);
                                     let unread = s.unread.contains(&c.id);
                                     let r = list_row(ui, c.id == *channel, |ui| {
-                                        let col = if unread || c.id == *channel { TEXT } else { MUTED };
+                                        let col = if unread || c.id == *channel { TEXT } else { TEXT2 };
                                         let t = RichText::new(format!("# {}", c.name)).color(col);
                                         ui.label(if unread { t.strong() } else { t });
                                         if live {
-                                            ui.label(RichText::new("AO VIVO").size(10.0).strong().color(RED));
+                                            ui.label(RichText::new("AO VIVO").size(10.0).strong().color(AMBER));
                                         }
                                     });
                                     if r.clicked() {
@@ -628,14 +628,14 @@ impl App {
                                 ui.label(RichText::new("Amigos").strong());
                                 let pending = s.snap.friends.iter().filter(|f| f.status == p::FriendStatus::Incoming).count();
                                 if pending > 0 {
-                                    ui.label(RichText::new(format!(" {pending}")).strong().color(RED));
+                                    ui.label(RichText::new(format!(" {pending}")).strong().color(AMBER));
                                 }
                             });
                             if r.clicked() {
                                 acts.push(Act::Open(View::Home));
                             }
                             ui.add_space(6.0);
-                            ui.label(RichText::new("MENSAGENS DIRETAS").size(11.0).strong().color(MUTED));
+                            ui.label(caps(&"MENSAGENS DIRETAS"));
                             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                                 for d in &s.snap.dms {
                                     let sel = matches!(s.view, View::Dm(c) if c == d.channel_id);
@@ -655,13 +655,13 @@ impl App {
                 });
                 // cartão do usuário
                 egui::Frame::new()
-                    .fill(RAIL)
-                    .corner_radius(egui::CornerRadius::same(8))
+                    .fill(L2)
+                    .corner_radius(egui::CornerRadius::same(10))
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            avatar(ui, &s.me.name, s.me.id, 32.0, Some(true), RAIL);
+                            avatar(ui, &s.me.name, s.me.id, 32.0, Some(true), L2);
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
                                 ui.label(RichText::new(&s.me.name).strong());
@@ -675,12 +675,13 @@ impl App {
                         });
                     });
             });
+        edge(ui, pr.response.rect, true);
     }
 
     // ---- membros
     fn members_panel(&mut self, ui: &mut egui::Ui, s: &Session, server: i64, acts: &mut Vec<Act>) {
         let Some(sv) = s.snap.servers.iter().find(|x| x.id == server) else { return };
-        egui::Panel::right("members")
+        let pr = egui::Panel::right("members")
             .frame(egui::Frame::new().fill(SIDE).inner_margin(egui::Margin::same(10)))
             .resizable(false)
             .exact_size(220.0)
@@ -691,7 +692,7 @@ impl App {
                         if list.is_empty() {
                             continue;
                         }
-                        ui.label(RichText::new(format!("{title} — {}", list.len())).size(11.0).strong().color(MUTED));
+                        ui.label(caps(&format!("{title} — {}", list.len())));
                         for m in list {
                             let r = list_row(ui, false, |ui| {
                                 avatar(ui, &m.name, m.id, 28.0, Some(m.online), SIDE);
@@ -709,6 +710,7 @@ impl App {
                     }
                 });
             });
+        edge(ui, pr.response.rect, false);
     }
 
     // ---- centro
@@ -731,7 +733,7 @@ impl App {
                     .dms
                     .iter()
                     .find(|d| d.channel_id == ch)
-                    .map(|d| format!("@ {}", d.user.name))
+                    .map(|d| d.user.name.clone())
                     .unwrap_or_default();
                 self.chat_view(ui, ctx, s, acts, ch, &title, "Enviar mensagem");
             }
@@ -744,7 +746,7 @@ impl App {
                     .and_then(|x| x.channels.iter().find(|c| c.id == channel))
                     .map(|c| c.name.clone())
                     .unwrap_or_default();
-                self.chat_view(ui, ctx, s, acts, channel, &format!("# {name}"), &format!("Conversar em #{name}"));
+                self.chat_view(ui, ctx, s, acts, channel, &name, &format!("Conversar em #{name}"));
             }
         }
     }
@@ -760,8 +762,8 @@ impl App {
         hint: &str,
     ) {
         // cabeçalho
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(title).size(16.0).strong());
+        ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 63.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.label(serif(title, 24.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 match &self.publishing {
                     Some((pch, h)) => {
@@ -781,7 +783,8 @@ impl App {
                 }
             });
         });
-        ui.separator();
+        rule_bleed(ui, 28.0);
+        ui.add_space(10.0);
 
         // alguém ao vivo neste canal?
         if let Some(l) = s.snap.live.iter().find(|l| l.channel_id == ch) {
@@ -790,12 +793,13 @@ impl App {
             let watching_here = matches!(&self.watching, Some((c, _)) if *c == ch);
             egui::Frame::new()
                 .fill(CARD)
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::same(8))
+                .stroke(egui::Stroke::new(1.0, LINE2))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        dot(ui, RED);
+                        dot(ui, AMBER);
                         if mine {
                             ui.label("Você está ao vivo neste canal");
                         } else {
@@ -818,7 +822,7 @@ impl App {
         }
 
         // mensagens
-        let input_h = 56.0;
+        let input_h = 82.0;
         let h = (ui.available_height() - input_h).max(60.0);
         egui::ScrollArea::vertical()
             .id_salt(("chat", ch))
@@ -826,76 +830,91 @@ impl App {
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                ui.add_space(6.0);
                 let empty = Vec::new();
                 let msgs = s.msgs.get(&ch).unwrap_or(&empty);
                 if msgs.is_empty() {
-                    ui.add_space(20.0);
+                    ui.add_space(24.0);
                     ui.label(RichText::new("Ainda não há mensagens. Diga olá!").color(MUTED));
                 }
                 for (i, m) in msgs.iter().enumerate() {
-                    let grouped = i > 0
+                    let new_day = i == 0 || !same_day(msgs[i - 1].ts, m.ts);
+                    if new_day {
+                        day_divider(ui, &fmt_day(m.ts));
+                    }
+                    let grouped = !new_day
                         && msgs[i - 1].author_id == m.author_id
                         && m.ts - msgs[i - 1].ts < 5 * 60 * 1000;
                     let born = *s.seen.entry(m.id).or_insert_with(Instant::now);
-                    let age = born.elapsed().as_secs_f32() / 0.28;
+                    let age = born.elapsed().as_secs_f32() / 0.22;
                     ui.horizontal_top(|ui| {
                         if age < 1.0 {
                             ui.set_opacity(ease_out(age));
                             ui.ctx().request_repaint();
                         }
-                        ui.spacing_mut().item_spacing.y = 1.0;
                         if grouped {
-                            ui.add_space(40.0);
+                            ui.add_space(50.0);
                         } else {
-                            avatar(ui, &m.author, m.author_id, 32.0, None, BG);
-                            ui.add_space(2.0);
+                            avatar(ui, &m.author, m.author_id, 36.0, None, BG);
+                            ui.add_space(6.0);
                         }
                         ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.spacing_mut().item_spacing.y = 2.0;
                             if !grouped {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&m.author).strong().color(user_color(m.author_id)));
-                                    ui.label(RichText::new(fmt_time(m.ts)).size(11.0).color(MUTED));
+                                    ui.label(RichText::new(&m.author).strong().color(TEXT));
+                                    ui.label(RichText::new(fmt_clock(m.ts)).size(11.5).color(MUTED));
                                 });
                             }
-                            ui.add(egui::Label::new(&m.content).wrap());
+                            ui.add(egui::Label::new(RichText::new(&m.content).color(TEXT2)).wrap());
                         });
                     });
-                    if !grouped {
-                        ui.add_space(4.0);
-                    }
+                    ui.add_space(if grouped { 1.0 } else { 8.0 });
                 }
             });
 
         // entrada
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let r = ui.add_sized(
-                [ui.available_width() - 76.0, 36.0],
-                egui::TextEdit::singleline(&mut s.input).hint_text(hint).margin(egui::Margin::symmetric(10, 8)),
-            );
-            let enter = r.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
-            let clicked = ui.add_sized([68.0, 36.0], egui::Button::new("Enviar").fill(BLURPLE)).clicked();
-            if (enter || clicked) && !s.input.trim().is_empty() {
-                acts.push(Act::Send(C2S::Send { channel_id: ch, content: std::mem::take(&mut s.input) }));
-                r.request_focus();
-            }
-        });
+        ui.add_space(10.0);
+        let input_id = egui::Id::new(("compose", ch));
+        let focused = ctx.memory(|mem| mem.has_focus(input_id));
+        egui::Frame::new()
+            .fill(L3)
+            .stroke(egui::Stroke::new(1.0, if focused { AMBER } else { LINE2 }))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin { left: 16, right: 8, top: 8, bottom: 8 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let r = ui.add_sized(
+                        [ui.available_width() - 84.0, 32.0],
+                        egui::TextEdit::singleline(&mut s.input)
+                            .id(input_id)
+                            .frame(egui::Frame::NONE)
+                            .hint_text(hint)
+                            .margin(egui::Margin::symmetric(0, 6)),
+                    );
+                    let enter = r.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                    let clicked = small_button(ui, "Enviar", BLURPLE);
+                    if (enter || clicked) && !s.input.trim().is_empty() {
+                        acts.push(Act::Send(C2S::Send { channel_id: ch, content: std::mem::take(&mut s.input) }));
+                        r.request_focus();
+                    }
+                });
+            });
+        ui.add_space(22.0);
     }
 
     // ---- amigos
     fn friends_view(&mut self, ui: &mut egui::Ui, s: &mut Session, acts: &mut Vec<Act>) {
         let pending = s.snap.friends.iter().filter(|f| f.status != p::FriendStatus::Friend).count();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Amigos").size(16.0).strong());
+        ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 63.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.label(serif("Amigos", 24.0));
             ui.add_space(12.0);
             ui.selectable_value(&mut s.tab, HomeTab::Online, "Disponível");
             ui.selectable_value(&mut s.tab, HomeTab::All, "Todos");
             ui.selectable_value(&mut s.tab, HomeTab::Pending, format!("Pendente ({pending})"));
             ui.selectable_value(&mut s.tab, HomeTab::Add, "Adicionar amigo");
         });
-        ui.separator();
+        rule_bleed(ui, 28.0);
 
         if s.tab == HomeTab::Add {
             ui.add_space(8.0);
@@ -903,15 +922,13 @@ impl App {
             ui.label(RichText::new("Você pode adicionar amigos com o nome de usuário deles.").color(MUTED));
             ui.horizontal(|ui| {
                 let r = ui.add_sized(
-                    [ui.available_width() - 160.0, 36.0],
+                    [ui.available_width() - 140.0, 36.0],
                     egui::TextEdit::singleline(&mut s.add_friend)
                         .hint_text("Digite um nome de usuário")
                         .margin(egui::Margin::symmetric(10, 8)),
                 );
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let click = ui
-                    .add_sized([150.0, 36.0], egui::Button::new("Enviar pedido").fill(BLURPLE))
-                    .clicked();
+                let click = small_button(ui, "Enviar pedido", BLURPLE);
                 if (enter || click) && !s.add_friend.trim().is_empty() {
                     acts.push(Act::Send(C2S::FriendRequest { username: std::mem::take(&mut s.add_friend) }));
                     s.toast = Some(("Pedido de amizade enviado".into(), Instant::now()));
@@ -1081,14 +1098,14 @@ impl App {
                         });
                         ui.add_space(6.0);
                         if *create {
-                            ui.label(RichText::new("NOME DO SERVIDOR").size(11.0).strong().color(MUTED));
+                            ui.label(caps(&"NOME DO SERVIDOR"));
                             ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
                             if big_button(ui, "Criar", BLURPLE) && !name.trim().is_empty() {
                                 acts.push(Act::Send(C2S::CreateServer { name: name.clone() }));
                                 close = true;
                             }
                         } else {
-                            ui.label(RichText::new("CÓDIGO DO CONVITE").size(11.0).strong().color(MUTED));
+                            ui.label(caps(&"CÓDIGO DO CONVITE"));
                             ui.add(egui::TextEdit::singleline(code).desired_width(f32::INFINITY));
                             if big_button(ui, "Entrar no servidor", BLURPLE) && !code.trim().is_empty() {
                                 acts.push(Act::Send(C2S::JoinServer { code: code.clone() }));
@@ -1107,7 +1124,7 @@ impl App {
                     .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(ctx, |ui| {
                         ui.set_width(300.0);
-                        ui.label(RichText::new("NOME DO CANAL").size(11.0).strong().color(MUTED));
+                        ui.label(caps(&"NOME DO CANAL"));
                         ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
                         if big_button(ui, "Criar canal", BLURPLE) && !name.trim().is_empty() {
                             acts.push(Act::Send(C2S::CreateChannel { server_id: *server, name: name.clone() }));
@@ -1144,7 +1161,7 @@ impl App {
                     .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(ctx, |ui| {
                         ui.set_width(320.0);
-                        ui.label(RichText::new("TELA").size(11.0).strong().color(MUTED));
+                        ui.label(caps(&"TELA"));
                         egui::ComboBox::from_id_salt("mon")
                             .width(ui.available_width())
                             .selected_text(self.monitors.get(self.monitor).cloned().unwrap_or_default())
@@ -1153,13 +1170,13 @@ impl App {
                                     ui.selectable_value(&mut self.monitor, i, n);
                                 }
                             });
-                        ui.label(RichText::new("QUADROS POR SEGUNDO").size(11.0).strong().color(MUTED));
+                        ui.label(caps(&"QUADROS POR SEGUNDO"));
                         ui.horizontal_wrapped(|ui| {
                             for f in [30, 60, 90, 120, 144] {
                                 ui.selectable_value(&mut self.fps, f, f.to_string());
                             }
                         });
-                        ui.label(RichText::new("QUALIDADE (MBPS)").size(11.0).strong().color(MUTED));
+                        ui.label(caps(&"QUALIDADE (MBPS)"));
                         ui.horizontal_wrapped(|ui| {
                             for (k, l) in [(4000, "4"), (8000, "8"), (15000, "15"), (30000, "30")] {
                                 ui.selectable_value(&mut self.kbps, k, l);
@@ -1196,8 +1213,9 @@ impl App {
                 .anchor(Align2::CENTER_BOTTOM, [0.0, -24.0])
                 .show(ctx, |ui| {
                     egui::Frame::new()
-                        .fill(RAIL)
-                        .corner_radius(egui::CornerRadius::same(8))
+                        .fill(L3)
+                        .stroke(egui::Stroke::new(1.0, LINE2))
+                        .corner_radius(egui::CornerRadius::same(10))
                         .inner_margin(egui::Margin::same(12))
                         .show(ui, |ui| ui.label(msg));
                 });
