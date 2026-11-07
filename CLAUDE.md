@@ -49,6 +49,7 @@ Cadastro é **fechado por convite**. Senha de 8 a 128 caracteres. Não ponha sen
 - `interaction.selectable_labels = false` é global (texto de interface não seleciona); o texto das **mensagens** liga `.selectable(true)` e abre o menu de contexto no próprio rótulo. Não crie um alvo de clique por cima da linha: ele rouba a seleção.
 - Barras de hover (ações da mensagem) são desenhadas só com o `painter` e `ui.interact`, **sem** ocupar layout; `scope_builder` empurrava a lista.
 - Anexos: o app baixa imagens em threads (`app/src/files.rs`, cache de texturas em `Session.images`); o servidor guarda em `TELACAST_FILES_DIR` (padrão `./files`, ignorado pelo git) e os testes usam uma pasta em `/tmp`. Para testar na tela virtual sem diálogo: `TELACAST_ATTACH=/caminho/arquivo` anexa uma vez ao abrir um canal.
+- Instância única (`app/src/single.rs`): é por pasta de dados (`XDG_DATA_HOME`), então testes na tela virtual com pasta isolada não esbarram no app do usuário. Socket abstrato (caminho de socket comum estoura 108 bytes).
 - Modais: use `theme::modal(ctx, título, largura, &mut dismissed, corpo)` (é `egui::Modal`; um `Area` solto deixa o clique vazar para os botões de baixo).
 - `TextEdit::frame` recebe `egui::Frame` (use `Frame::NONE`). `Id::new` está depreciado (só avisa).
 - `consume_key(NONE, Enter)` engole Shift+Enter; use `take_plain_enter` (em `main.rs`).

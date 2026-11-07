@@ -86,7 +86,7 @@ Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de e
 
 ### 0.4 Cliente ([R09])
 - [ ] **Token no keyring** do sistema (hoje está em texto no arquivo do app), diretórios XDG, log em arquivo, panic hook. P0 **S**
-- [ ] **Instância única**. P0 **S**
+- [x] **Instância única** (`app/src/single.rs`: trava de arquivo `instance.lock` na pasta de dados + socket abstrato; a segunda abertura chama a primeira para a frente e sai). P0 **S**
 
 **Marco A — pode expor na internet** quando 0.2 e 0.3 (P0/P1) estiverem prontos. Aí vale o plano da VPS da Oracle (Caddy + systemd + DuckDNS + backup do `.db`).
 

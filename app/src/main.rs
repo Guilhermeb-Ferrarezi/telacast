@@ -5,6 +5,7 @@ mod md_view;
 mod net;
 mod publisher;
 mod quick;
+mod single;
 mod theme;
 mod viewer;
 
@@ -26,6 +27,9 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    if !single::acquire() {
+        return Ok(());
+    }
     eframe::run_native(
         "Telacast",
         eframe::NativeOptions {
@@ -36,6 +40,7 @@ fn main() -> eframe::Result {
         },
         Box::new(|cc| {
             apply_theme(&cc.egui_ctx);
+            single::serve(cc.egui_ctx.clone());
             Ok(Box::new(App::new(cc)))
         }),
     )
@@ -931,6 +936,10 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if single::take_raise() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.poll_login(&ctx);
         match self.session.take() {
             Some(mut s) => {
