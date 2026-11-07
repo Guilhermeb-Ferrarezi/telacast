@@ -631,3 +631,21 @@ pub fn gear_icon(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) {
         p.line_segment([c + d * 0.30 * s, c + d * 0.42 * s], Stroke::new((s * 0.16).max(2.0), color));
     }
 }
+
+/// Monitor (compartilhar tela).
+pub fn screen_icon(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) {
+    let s = size;
+    let st = Stroke::new((s * 0.09).max(1.5), color);
+    let body = Rect::from_center_size(c + vec2(0.0, -0.06 * s), vec2(0.78 * s, 0.50 * s));
+    p.rect_stroke(body, 0.06 * s, st, StrokeKind::Middle);
+    p.line_segment([c + vec2(0.0, 0.19 * s), c + vec2(0.0, 0.32 * s)], st);
+    p.line_segment([c + vec2(-0.18 * s, 0.34 * s), c + vec2(0.18 * s, 0.34 * s)], st);
+}
+
+/// Câmera de vídeo.
+pub fn camera_icon(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) {
+    let s = size;
+    let st = Stroke::new((s * 0.09).max(1.5), color);
+    p.rect_stroke(Rect::from_center_size(c + vec2(-0.08 * s, 0.0), vec2(0.58 * s, 0.42 * s)), 0.07 * s, st, StrokeKind::Middle);
+    p.add(egui::Shape::convex_polygon(vec![c + vec2(0.26 * s, -0.04 * s), c + vec2(0.44 * s, -0.16 * s), c + vec2(0.44 * s, 0.16 * s), c + vec2(0.26 * s, 0.04 * s)], color, Stroke::NONE));
+}

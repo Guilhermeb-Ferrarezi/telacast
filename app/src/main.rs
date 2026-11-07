@@ -238,6 +238,8 @@ enum Act {
     ToggleMute,
     ToggleDeaf,
     OpenVoiceView,
+    /// Abre o diálogo Transmitir (com o canal de voz como destino, ou o aberto se `None`).
+    OpenGoLive(Option<i64>),
     OpenVoiceSettings,
     SetVoiceDevices { input: Option<String>, output: Option<String> },
     OpenProfile { user: i64, name: String, anchor: egui::Rect, left: bool },
@@ -1247,6 +1249,8 @@ struct App {
     monitors: Vec<String>,
     monitor: usize,
     golive: GoLive,
+    /// Canal onde a transmissão vai ser feita (o de voz, quando o diálogo abre pela visão de voz).
+    golive_target: Option<i64>,
     publishing: Option<(i64, publisher::Handle)>,
     watching: Option<(i64, viewer::Handle)>,
     texture: Option<egui::TextureHandle>,
@@ -1293,6 +1297,7 @@ impl App {
             kbps: get("kbps").parse().unwrap_or(8000),
             monitors: publisher::monitor_names(),
             golive: GoLive::new(),
+            golive_target: None,
             monitor: 0,
             publishing: None,
             watching: None,
@@ -2332,6 +2337,10 @@ impl App {
                     s.apply_voice_flags();
                 }
                 Act::OpenVoiceView => s.voice_view = true,
+                Act::OpenGoLive(target) => {
+                    self.golive_target = target;
+                    s.modal = Modal::GoLive;
+                }
                 Act::OpenVoiceSettings => {
                     // listar os dispositivos pode levar um instante (e o ALSA reclama no terminal; é normal)
                     s.modal = Modal::VoiceSettings(voice::list_devices());
@@ -2563,7 +2572,7 @@ impl App {
             .show(ui, |ui| {
                 let w = ui.available_width();
                 let in_voice = s.my_voice().is_some();
-                let list_h = (ui.available_height() - 60.0 - if in_voice { 66.0 } else { 0.0 }).max(50.0);
+                let list_h = (ui.available_height() - 60.0 - if in_voice { 106.0 } else { 0.0 }).max(50.0);
                 ui.allocate_ui(egui::vec2(w, list_h), |ui| match &s.view {
                     View::Chan { server, channel } => {
                         let Some(sv) = s.snap.servers.iter().find(|x| x.id == *server) else { return };
@@ -2649,6 +2658,39 @@ impl App {
                                             acts.push(Act::LeaveVoice);
                                         }
                                     });
+                                });
+                                // linha 2: Vídeo (câmera, em breve) e Tela (compartilhar), como no Discord
+                                ui.add_space(6.0);
+                                let sharing = self.publishing.as_ref().is_some_and(|(c, _)| *c == mv.channel_id);
+                                let bw = (ui.available_width() - 6.0) / 2.0;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    for (is_screen, label) in [(false, "Vídeo"), (true, "Tela")] {
+                                        let (r, resp) = ui.allocate_exact_size(egui::vec2(bw, 32.0), egui::Sense::click());
+                                        let enabled = is_screen;
+                                        let active = is_screen && sharing;
+                                        let hot = resp.hovered() && enabled;
+                                        let pt = ui.painter();
+                                        pt.rect_filled(r, 8.0, if active { alpha(AMBER, 0.16) } else if hot { L4 } else { L3 });
+                                        if active {
+                                            pt.rect_stroke(r, 8.0, egui::Stroke::new(1.0, AMBER), egui::StrokeKind::Inside);
+                                        }
+                                        let ink = if !enabled { alpha(TEXT2, 0.4) } else if active { AMBER } else { TEXT };
+                                        let ic = egui::pos2(r.left() + 24.0, r.center().y);
+                                        if is_screen {
+                                            screen_icon(pt, ic, 18.0, ink);
+                                        } else {
+                                            camera_icon(pt, ic, 18.0, ink);
+                                        }
+                                        pt.text(egui::pos2(r.left() + 40.0, r.center().y), Align2::LEFT_CENTER, label, egui::FontId::proportional(13.0), ink);
+                                        if hot {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
+                                        let tip = if is_screen { if sharing { "Gerenciar a transmissão" } else { "Compartilhar a tela" } } else { "Câmera: em breve" };
+                                        if resp.on_hover_text(tip).clicked() && enabled {
+                                            acts.push(Act::OpenGoLive(Some(mv.channel_id)));
+                                        }
+                                    }
                                 });
                             });
                     });
@@ -2973,6 +3015,19 @@ impl App {
         let stage = egui::Rect::from_min_max(total.min + egui::vec2(16.0, 16.0), egui::pos2(total.max.x - 16.0, total.max.y - controls_h - 8.0));
         let members: Vec<p::VoiceState> = s.voice_members(mv.channel_id).into_iter().cloned().collect();
         let n = members.len().max(1);
+        // assistindo a uma transmissão do canal: o vídeo ocupa o palco e a grade vira uma faixa embaixo
+        let watching_here = matches!(&self.watching, Some((c, _)) if *c == mv.channel_id);
+        let live_here = s.snap.live.iter().find(|l| l.channel_id == mv.channel_id).cloned();
+        let sharing = self.publishing.as_ref().is_some_and(|(c, _)| *c == mv.channel_id);
+        let (stream_rect, stage) = if watching_here {
+            let strip = 120.0;
+            (
+                Some(egui::Rect::from_min_max(stage.min, egui::pos2(stage.max.x, stage.max.y - strip - 8.0))),
+                egui::Rect::from_min_max(egui::pos2(stage.min.x, stage.max.y - strip), stage.max),
+            )
+        } else {
+            (None, stage)
+        };
         // grade: o número de colunas que dá o maior tile 16:9
         let (gap, aspect) = (8.0_f32, 16.0 / 9.0);
         let mut best = (1usize, 0.0_f32);
@@ -3021,6 +3076,19 @@ impl App {
             if speaking {
                 pt.rect_stroke(rect, 8.0, egui::Stroke::new(3.0, OK), egui::StrokeKind::Inside);
             }
+            // quem está transmitindo: etiqueta "AO VIVO" e, para os outros, o botão Assistir
+            if live_here.as_ref().is_some_and(|l| l.user_id == v.user_id) {
+                let g = pt.layout_no_wrap(if v.user_id == s.me.id { "VOCÊ ESTÁ AO VIVO".to_string() } else { "AO VIVO".to_string() }, egui::FontId::proportional(10.5), AMBER);
+                let pill = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), g.size() + egui::vec2(14.0, 8.0));
+                pt.rect_filled(pill, 5.0, Color32::from_black_alpha(170));
+                pt.galley(pill.min + egui::vec2(7.0, 4.0), g, AMBER);
+                if v.user_id != s.me.id && !watching_here {
+                    let btn = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.bottom() - 40.0), egui::vec2(110.0, 30.0));
+                    if ui.put(btn, egui::Button::new(RichText::new("Assistir").color(L0)).fill(AMBER)).clicked() {
+                        acts.push(Act::Watch(mv.channel_id));
+                    }
+                }
+            }
             if resp.clicked() {
                 acts.push(Act::OpenProfile { user: v.user_id, name: name.clone(), anchor: rect, left: false });
             }
@@ -3041,10 +3109,14 @@ impl App {
                 });
             }
         }
+        if let Some(sr) = stream_rect {
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sr));
+            self.stream_area(&mut child, ctx, &*s, acts, true);
+        }
         // barra de controles
         let bar = egui::Rect::from_min_max(egui::pos2(total.min.x, total.max.y - controls_h), total.max);
         let (bw, bh, bgap) = (44.0_f32, 44.0_f32, 8.0_f32);
-        let total_w = bw * 3.0 + 56.0 + bgap * 3.0;
+        let total_w = bw * 4.0 + 56.0 + bgap * 4.0;
         let mut x = bar.center().x - total_w / 2.0;
         let yb = bar.center().y - bh / 2.0;
         let deaf = s.voice_deaf;
@@ -3074,6 +3146,23 @@ impl App {
             };
             if resp.on_hover_text(tip).clicked() {
                 acts.push(if is_deaf { Act::ToggleDeaf } else { Act::ToggleMute });
+            }
+        }
+        // compartilhar tela (abre o diálogo Transmitir para este canal de voz)
+        {
+            let r = egui::Rect::from_min_size(egui::pos2(x, yb), egui::vec2(bw, bh));
+            x += bw + bgap;
+            let resp = ui.interact(r, egui::Id::new("voice-share"), egui::Sense::click());
+            let hot = resp.hovered();
+            let pt = ui.painter();
+            pt.rect_filled(r, 12.0, if sharing { alpha(AMBER, 0.18) } else if hot { L4 } else { L3 });
+            pt.rect_stroke(r, 12.0, egui::Stroke::new(1.0, if sharing { AMBER } else { LINE2 }), egui::StrokeKind::Inside);
+            screen_icon(pt, r.center(), 24.0, if sharing { AMBER } else { TEXT });
+            if hot {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.on_hover_text(if sharing { "Gerenciar a transmissão" } else { "Compartilhar a tela" }).clicked() {
+                acts.push(Act::OpenGoLive(Some(mv.channel_id)));
             }
         }
         let r = egui::Rect::from_min_size(egui::pos2(x, yb), egui::vec2(56.0, bh));
@@ -3461,14 +3550,14 @@ impl App {
                             acts.push(Act::StopPublish);
                         }
                         if !done && small_button(ui, "Qualidade", FIELD) {
-                            acts.push(Act::Modal(Modal::GoLive));
+                            acts.push(Act::OpenGoLive(None));
                         }
                         dot(ui, status_color(&st));
                         ui.label(RichText::new(if *pch == ch { st } else { format!("{st} (outro canal)") }).size(12.0));
                     }
                     None => {
                         if small_button(ui, "Ao vivo", GREEN) {
-                            acts.push(Act::Modal(Modal::GoLive));
+                            acts.push(Act::OpenGoLive(None));
                         }
                     }
                 }
@@ -4365,7 +4454,7 @@ impl App {
         if resp.double_clicked() {
             acts.push(Act::Fullscreen);
         }
-        let btn = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-78.0, 8.0), egui::vec2(68.0, 26.0));
+        let btn = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-94.0, 8.0), egui::vec2(84.0, 28.0));
         if ui.put(btn, egui::Button::new("Fechar").fill(Color32::from_black_alpha(170))).clicked() {
             acts.push(Act::StopWatch);
         }
@@ -4682,6 +4771,7 @@ impl App {
                     });
             }
             Modal::GoLive => {
+                let cur = self.golive_target.or(cur);
                 self.golive.refresh(ctx);
                 let live = self.publishing.is_some();
                 let place = cur

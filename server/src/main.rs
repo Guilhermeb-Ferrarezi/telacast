@@ -465,7 +465,12 @@ impl App {
 
     async fn auth_stream(&self, token: &str, channel: i64) -> Option<i64> {
         let uid = self.store.session_user(&auth::hash_token(token)).await.ok().flatten()?;
-        self.store.can_access(channel, uid).await.ok()?.then_some(uid)
+        if self.store.can_access(channel, uid).await.ok()? {
+            return Some(uid);
+        }
+        // canal de voz: transmite e assiste quem está nele agora (como no Discord)
+        let in_voice = self.voice.lock().unwrap_or_else(|e| e.into_inner()).get(&uid).is_some_and(|v| v.channel == channel);
+        in_voice.then_some(uid)
     }
 }
 

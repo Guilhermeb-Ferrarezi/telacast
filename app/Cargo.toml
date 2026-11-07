@@ -24,5 +24,6 @@ ed25519-dalek = "2"
 cpal = "0.16"
 opus = "0.4"
 rtrb = "0.3"
+nnnoiseless = { version = "0.5", default-features = false }
 telacast-md = { path = "../md" }
 telacast-qs = { path = "../qs" }
