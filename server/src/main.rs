@@ -15,7 +15,7 @@ use axum::{
 };
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use p::{ErrorCode, C2S, S2C, PROTO_VERSION};
+use p::{ErrorCode, Status, C2S, S2C, PROTO_VERSION};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -81,6 +81,8 @@ struct App {
     auth_limit: Limiter,
     limits: Limiter,
     /// Últimos `nonce` aceitos por usuário (evita duplicar mensagem reenviada após reconexão).
+    /// Conexões marcadas como "paradas" pelo app (ausente automático).
+    idle: Mutex<HashSet<u64>>,
     nonces: Mutex<(std::collections::HashSet<(i64, u64)>, std::collections::VecDeque<(i64, u64)>)>,
     /// Hash de uma senha qualquer, usado para gastar o mesmo tempo quando o usuário não existe.
     dummy_hash: String,
@@ -118,7 +120,30 @@ impl App {
             .values()
             .map(|r| (r.channel, r.user))
             .collect();
-        let user = |id: i64, name: String| p::User { id, name, online: online.contains(&id) };
+        // status escolhido por quem está conectado; "ausente automático" = todas as conexões da pessoa paradas
+        let connected: Vec<i64> = online.iter().copied().collect();
+        let manual: HashMap<i64, i16> = self.store.manual_statuses(&connected).await?.into_iter().collect();
+        let all_idle: HashSet<i64> = {
+            let conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+            let idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+            conns.iter().filter(|(_, v)| !v.is_empty() && v.iter().all(|(cid, _)| idle.contains(cid))).map(|(u, _)| *u).collect()
+        };
+        let user = |id: i64, name: String| {
+            let status = if !online.contains(&id) {
+                Status::Offline
+            } else {
+                match manual.get(&id).copied().unwrap_or(0) {
+                    1 => Status::Idle,
+                    2 => Status::Dnd,
+                    // invisível: só a própria pessoa sabe; para os outros é offline
+                    3 if id == me => Status::Invisible,
+                    3 => Status::Offline,
+                    _ if all_idle.contains(&id) => Status::Idle,
+                    _ => Status::Online,
+                }
+            };
+            p::User { id, name, online: !matches!(status, Status::Offline | Status::Invisible), status }
+        };
 
         let raw = self.store.servers_of(me).await?;
         let ids: Vec<i64> = raw.iter().map(|s| s.0).collect();
@@ -225,6 +250,7 @@ impl App {
     }
 
     fn disconnect(self: &Arc<Self>, uid: i64, cid: u64) {
+        self.idle.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
         let last = {
             let mut c = self.conns.lock().unwrap_or_else(|e| e.into_inner());
             match c.get_mut(&uid) {
@@ -331,6 +357,7 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         hash_sem: Semaphore::new(permits),
         auth_limit: Limiter::default(),
         limits: Limiter::default(),
+        idle: Mutex::new(HashSet::new()),
         nonces: Mutex::new(Default::default()),
         dummy_hash,
     });
@@ -448,7 +475,7 @@ async fn finish_login(
         return;
     };
     *session = Some(Session { uid, token_hash: auth::hash_token(&token) });
-    let _ = tx.send(S2C::Auth { token, me: p::User { id: uid, name, online: true } });
+    let _ = tx.send(S2C::Auth { token, me: p::User { id: uid, name, online: true, status: Status::Online } });
     app.connect(uid, cid, tx.clone());
     app.push_snapshot(uid).await;
 }
@@ -558,6 +585,20 @@ async fn handle(
                 Err(e) => {
                     error!("resume: {e}");
                     err(ErrorCode::Internal, ERR_INTERNAL);
+                }
+            }
+            true
+        }
+        C2S::SetIdle { idle } => {
+            if let Some(s) = session.as_ref() {
+                let uid = s.uid;
+                let changed = {
+                    let mut set = app.idle.lock().unwrap_or_else(|e| e.into_inner());
+                    if idle { set.insert(cid) } else { set.remove(&cid) }
+                };
+                if changed {
+                    app.push_snapshot(uid).await;
+                    app.presence_changed(uid).await;
                 }
             }
             true
@@ -733,6 +774,29 @@ async fn handle_authed(
                 }
             }
         }
+        C2S::SetStatus { status } => {
+            let code = match status {
+                Status::Online => 0,
+                Status::Idle => 1,
+                Status::Dnd => 2,
+                Status::Invisible => 3,
+                Status::Offline => {
+                    err(ErrorCode::InvalidInput, "Use Invisível no lugar de Offline");
+                    return true;
+                }
+            };
+            if busy("status", 30, 60) {
+                err(ErrorCode::RateLimited, ERR_BUSY);
+            } else {
+                match app.store.set_status(me, code).await {
+                    Ok(()) => {
+                        app.push_snapshot(me).await;
+                        app.presence_changed(me).await;
+                    }
+                    Err(e) => db_err("set_status", e),
+                }
+            }
+        }
         C2S::Ack { channel_id, message_id } => {
             if !busy("ack", 120, 10) && app.store.can_access(channel_id, me).await.unwrap_or(false) {
                 if let Err(e) = app.store.ack(me, channel_id, message_id).await {
@@ -808,7 +872,7 @@ async fn handle_authed(
             }
         }
         // Tratados em `handle`.
-        C2S::Register { .. } | C2S::Login { .. } | C2S::Resume { .. } => {}
+        C2S::Register { .. } | C2S::Login { .. } | C2S::Resume { .. } | C2S::SetIdle { .. } => {}
     }
     true
 }

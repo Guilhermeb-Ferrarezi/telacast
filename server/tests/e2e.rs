@@ -420,3 +420,54 @@ fn nonce_nao_duplica_mensagem() {
     let hist = beto.wait("o histórico", |m| if let S2C::History { messages, .. } = m { Some(messages.clone()) } else { None });
     assert_eq!(hist.len(), 2);
 }
+
+#[test]
+fn status_manual_e_ausente_automatico() {
+    use telacast_proto::Status;
+    let env = Env::start();
+    let code = env.invite(2);
+    let mut ana = env.client();
+    let (_, ana_id) = ana.register("ana", &code);
+    let mut beto = env.client();
+    beto.register("beto", &code);
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    beto.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
+    beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+
+    // como o beto vê a ana
+    let vista_do_beto = |beto: &mut Client, want: Status| {
+        beto.wait("o status da ana", |m| match m {
+            S2C::Snapshot(s) => s
+                .servers
+                .first()
+                .and_then(|sv| sv.members.iter().find(|u| u.id == ana_id))
+                .filter(|u| u.status == want)
+                .map(|u| (u.status, u.online)),
+            _ => None,
+        })
+    };
+    ana.send(C2S::SetStatus { status: Status::Dnd });
+    assert_eq!(vista_do_beto(&mut beto, Status::Dnd), (Status::Dnd, true), "não perturbe continua online");
+    ana.send(C2S::SetStatus { status: Status::Invisible });
+    assert_eq!(vista_do_beto(&mut beto, Status::Offline), (Status::Offline, false), "invisível aparece offline para os outros");
+    // para ela mesma, continua invisível
+    let propria = ana.wait("o próprio status", |m| match m {
+        S2C::Snapshot(s) if s.me.status == Status::Invisible => Some(s.me.status),
+        _ => None,
+    });
+    assert_eq!(propria, Status::Invisible);
+    ana.send(C2S::SetStatus { status: Status::Online });
+    assert_eq!(vista_do_beto(&mut beto, Status::Online).0, Status::Online);
+    // ausente automático: a única conexão da ana fica parada
+    ana.send(C2S::SetIdle { idle: true });
+    assert_eq!(vista_do_beto(&mut beto, Status::Idle).0, Status::Idle);
+    ana.send(C2S::SetIdle { idle: false });
+    assert_eq!(vista_do_beto(&mut beto, Status::Online).0, Status::Online);
+    // Offline não pode ser escolhido
+    ana.send(C2S::SetStatus { status: Status::Offline });
+    assert_eq!(ana.error_code().0, telacast_proto::ErrorCode::InvalidInput);
+}

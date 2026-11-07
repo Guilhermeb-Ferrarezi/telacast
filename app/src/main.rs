@@ -79,6 +79,7 @@ enum Act {
     Resend(u64),
     Discard(u64),
     ToggleSpoiler(i64, u32),
+    SetStatus(p::Status),
     StartEdit(i64, String),
     CancelEdit,
     SaveEdit(i64, String),
@@ -131,6 +132,8 @@ struct Session {
     nonce_seq: u64,
     /// Spoilers que o usuário abriu (mensagem, número do spoiler); só em memória, como no Discord.
     revealed: HashSet<(i64, u32)>,
+    /// Já avisei o servidor que estou parado?
+    idle_sent: bool,
     /// Canais com uma página de mensagens antigas a caminho.
     older: HashSet<i64>,
     /// Canais que ainda têm mensagens mais antigas no servidor (a última página veio cheia).
@@ -207,6 +210,7 @@ impl Session {
             pending: Vec::new(),
             nonce_seq: 0,
             revealed: HashSet::new(),
+            idle_sent: false,
             older: HashSet::new(),
             has_more: HashMap::new(),
             jump_wanted: None,
@@ -401,6 +405,7 @@ impl Session {
                     }
                     // o servidor descarta o que já recebeu (mesmo nonce); o resto sai agora
                     self.resend_pending();
+                    self.idle_sent = false; // a conexão nova começa "ativa" no servidor
                 }
                 Event::Msg(m) => match m {
                     S2C::Snapshot(sn) => {
@@ -528,6 +533,10 @@ struct App {
     watching: Option<(i64, viewer::Handle)>,
     texture: Option<egui::TextureHandle>,
     fullscreen: bool,
+    /// Última atividade do usuário (relógio de parede: suspender o PC conta como tempo parado).
+    last_input: std::time::SystemTime,
+    /// Tempo parado até virar "ausente" (10 min; `TELACAST_IDLE_SECS` encurta para testar).
+    idle_after: Duration,
 }
 
 impl App {
@@ -565,6 +574,10 @@ impl App {
             watching: None,
             texture: None,
             fullscreen: false,
+            last_input: std::time::SystemTime::now(),
+            idle_after: Duration::from_secs(
+                std::env::var("TELACAST_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(600),
+            ),
         }
     }
 
@@ -788,6 +801,20 @@ impl App {
     fn session_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &mut Session) -> bool {
         let mut acts: Vec<Act> = Vec::new();
 
+        // ausente automático: sem nenhuma entrada por `idle_after`, avisa o servidor; ao voltar, avisa de novo
+        if ctx.input(|i| !i.events.is_empty()) {
+            self.last_input = std::time::SystemTime::now();
+        }
+        let parado = self.last_input.elapsed().unwrap_or_default();
+        let idle_now = parado >= self.idle_after;
+        if idle_now != s.idle_sent && matches!(s.link, Link::Up) {
+            s.idle_sent = idle_now;
+            s.gw.send(C2S::SetIdle { idle: idle_now });
+        }
+        if !idle_now {
+            ctx.request_repaint_after(self.idle_after.saturating_sub(parado) + Duration::from_millis(200));
+        }
+
         // faixa de conexão: aparece só enquanto a ligação com o servidor está fora
         if !self.fullscreen && !matches!(s.link, Link::Up) {
             egui::Panel::top("link")
@@ -864,6 +891,11 @@ impl App {
                         let (ch, content, reply_to) = (p.ch, p.content.clone(), p.reply_to);
                         s.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce });
                     }
+                }
+                Act::SetStatus(st) => {
+                    s.me.status = st;
+                    s.snap.me.status = st;
+                    s.gw.send(C2S::SetStatus { status: st });
                 }
                 Act::ToggleSpoiler(msg, id) => {
                     if !s.revealed.remove(&(msg, id)) {
@@ -1006,7 +1038,7 @@ impl App {
                                     let sel = matches!(s.view, View::Dm(c) if c == d.channel_id);
                                     let unread = s.unread.contains(&d.channel_id);
                                     let r = list_row(ui, sel, |ui| {
-                                        avatar(ui, &d.user.name, d.user.id, 24.0, Some(d.user.online), SIDE);
+                                        avatar(ui, &d.user.name, d.user.id, 24.0, Some(d.user.status), SIDE);
                                         let t = RichText::new(&d.user.name);
                                         ui.label(if unread { t.strong().color(TEXT) } else { t.color(TEXT2) });
                                     });
@@ -1027,18 +1059,54 @@ impl App {
                         .inner_margin(egui::Margin::same(8))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                avatar(ui, &s.me.name, s.me.id, 32.0, Some(true), L2);
+                            let my = if s.me.status == p::Status::Offline { p::Status::Online } else { s.me.status };
+                            let bg = ui.painter().add(egui::Shape::Noop);
+                            let row = ui.horizontal(|ui| {
+                                avatar(ui, &s.me.name, s.me.id, 32.0, Some(my), L2);
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 0.0;
                                     ui.label(RichText::new(&s.me.name).strong().color(TEXT));
-                                    ui.label(RichText::new("Online").size(11.5).color(MUTED));
+                                    ui.label(RichText::new(status_label(my)).size(11.5).color(MUTED));
                                 });
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if small_button(ui, "Sair", FIELD) {
-                                        acts.push(Act::Logout);
+                            });
+                            // clicar no cartão abre o menu de status
+                            let rc = row.response.rect.expand2(egui::vec2(6.0, 4.0)).intersect(ui.max_rect().expand2(egui::vec2(0.0, 4.0)));
+                            let card = ui.interact(rc, egui::Id::new("me-card"), egui::Sense::click());
+                            if card.hovered() {
+                                ui.painter().set(bg, egui::Shape::rect_filled(rc, 8.0, L3));
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            egui::Popup::menu(&card).width(220.0).show(|ui| {
+                                ui.set_min_width(210.0);
+                                for (st, label) in [
+                                    (p::Status::Online, "Online"),
+                                    (p::Status::Idle, "Ausente"),
+                                    (p::Status::Dnd, "Não perturbe"),
+                                    (p::Status::Invisible, "Invisível"),
+                                ] {
+                                    let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click());
+                                    if resp.hovered() {
+                                        ui.painter().rect_filled(r, 6.0, L4);
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     }
-                                });
+                                    presence_dot(ui.painter(), r.left_center() + egui::vec2(14.0, 0.0), 5.0, st, if resp.hovered() { L4 } else { L3 });
+                                    ui.painter().text(
+                                        r.left_center() + egui::vec2(32.0, 0.0),
+                                        Align2::LEFT_CENTER,
+                                        label,
+                                        egui::FontId::proportional(14.0),
+                                        if st == my { AMBER } else { TEXT },
+                                    );
+                                    if resp.clicked() {
+                                        acts.push(Act::SetStatus(st));
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                if ui.button(RichText::new("Sair").color(RED)).clicked() {
+                                    acts.push(Act::Logout);
+                                    ui.close();
+                                }
                             });
                         });
                 });
@@ -1201,7 +1269,7 @@ impl App {
                         ui.label(caps(&format!("{title} — {}", list.len())));
                         for m in list {
                             let r = list_row(ui, false, |ui| {
-                                avatar(ui, &m.name, m.id, 28.0, Some(m.online), SIDE);
+                                avatar(ui, &m.name, m.id, 28.0, Some(m.status), SIDE);
                                 let t = RichText::new(&m.name);
                                 ui.label(if online { t } else { t.color(MUTED) });
                                 if m.id == sv.owner {
@@ -1764,13 +1832,13 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            avatar(ui, &f.user.name, f.user.id, 36.0, Some(f.user.online), BG);
+                            avatar(ui, &f.user.name, f.user.id, 36.0, Some(f.user.status), BG);
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
                                 ui.label(RichText::new(&f.user.name).strong());
                                 ui.label(
                                     RichText::new(match f.status {
-                                        p::FriendStatus::Friend if f.user.online => "Online",
+                                        p::FriendStatus::Friend if f.user.online => status_label(f.user.status),
                                         p::FriendStatus::Friend => "Offline",
                                         p::FriendStatus::Incoming => "Pedido de amizade recebido",
                                         p::FriendStatus::Outgoing => "Pedido de amizade enviado",

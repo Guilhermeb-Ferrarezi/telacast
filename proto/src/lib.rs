@@ -25,11 +25,27 @@ pub enum ErrorCode {
     Unknown,
 }
 
+/// Presença de uma pessoa. `Invisible` só aparece para a própria pessoa (os outros a veem `Offline`).
+/// Valor desconhecido (servidor mais novo) vira `Offline`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Status {
+    Online,
+    Idle,
+    Dnd,
+    Invisible,
+    #[default]
+    #[serde(other)]
+    Offline,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct User {
     pub id: i64,
     pub name: String,
+    /// Conectada e visível (online, ausente ou não perturbe).
     pub online: bool,
+    #[serde(default)]
+    pub status: Status,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -137,6 +153,10 @@ pub enum C2S {
     Edit { message_id: i64, content: String },
     /// O autor ou o dono do servidor apaga.
     Delete { message_id: i64 },
+    /// Status escolhido (fica salvo na conta). `Offline` não é aceito: use `Invisible`.
+    SetStatus { status: Status },
+    /// O app avisa que ficou parado (ou voltou): "ausente" automático. Vale só para esta conexão.
+    SetIdle { idle: bool },
     /// Marca o canal como lido até `message_id`.
     Ack { channel_id: i64, message_id: i64 },
     /// "Está digitando…" (reenviar a cada poucos segundos).

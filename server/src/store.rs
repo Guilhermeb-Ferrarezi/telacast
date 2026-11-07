@@ -113,6 +113,16 @@ impl Store {
         Ok(r.map(|x| x.0))
     }
 
+    pub async fn set_status(&self, uid: i64, status: i16) -> R<()> {
+        sqlx::query("UPDATE users SET status = $2 WHERE id = $1").bind(uid).bind(status).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Status escolhido (0 a 3) de cada usuário da lista.
+    pub async fn manual_statuses(&self, ids: &[i64]) -> R<Vec<(i64, i16)>> {
+        sqlx::query_as("SELECT id, status FROM users WHERE id = ANY($1)").bind(ids).fetch_all(&self.pool).await
+    }
+
     pub async fn display_name(&self, id: i64) -> R<Option<String>> {
         let r: Option<(String,)> = sqlx::query_as("SELECT display_name FROM users WHERE id = $1")
             .bind(id)

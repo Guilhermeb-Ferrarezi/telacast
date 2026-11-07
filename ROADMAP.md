@@ -19,7 +19,7 @@ Atualizado em 2026-11-07 (marcas: `[x]` pronto, `[~]` parcial, `[ ]` pendente).
 | Contas | cadastro **só com convite**, login (argon2 fora da thread principal, hash falso para usuário inexistente), token só com hash e validade deslizante de 30 dias, `Logout`, limite de tentativas, sessão salva no app |
 | Servidores | criar, convite por código (128 bits), entrar; **categorias recolhíveis** e canais de texto (só o dono cria), membros online/offline |
 | Chat | tempo real; **responder** (clicar na resposta salta até a original), **editar** ("(editado)"), **apagar** (autor ou dono), **não lido guardado no servidor** (`Ack`), **"digitando…"**, agrupamento, divisor de dia, hora ao passar o mouse, texto selecionável, menu do botão direito. Histórico: 50 por página, carrega mais ao rolar para cima |
-| Social | amigos (pedir/aceitar/remover), DMs 1:1, presença online/offline |
+| Social | amigos (pedir/aceitar/remover), DMs 1:1, presença com **status manual** (online, ausente, não perturbe, invisível) e **ausente automático** |
 | Vídeo | transmissão de tela por canal: captura X11, NVENC, relay por WebSocket, fallback openh264 |
 | Interface | tema **Grafite** (camadas de cinza, âmbar, serifa), barra de servidores com pílula 8/20/40 e sigla, cabeçalho do servidor com menu, canais com categorias, painel de membros, login, modais, barra de ações no hover |
 | Infra | Postgres 18, ids snowflake `i64`, migrações embutidas, **heartbeat e reconexão automática**, testes unitários e **3 e2e** (fluxo completo, limite de login, responder/editar/apagar/ler) |
@@ -138,7 +138,7 @@ Prioridade máxima do [R02]; moderação do [R07].
 ## Fase 4 — Social, perfil, interface e sistema
 
 **Social ([R05])**
-- [ ] P0: **status manual** (online/ausente/não perturbe/invisível) e ausente automático; **bloquear usuário**. **S / M**
+- [~] P0: **status manual** (online/ausente/não perturbe/invisível: feito, salvo na conta, menu no cartão do usuário, bolinha com forma própria) e **ausente automático** (10 min sem entrada, conta suspensão do PC; feito); **falta bloquear usuário** e o não perturbe silenciar notificações (ainda não há notificações). **S / M**
 - [ ] P1: silenciar servidor/canal/DM, **notificação desktop + som** respeitando DND, abas Bloqueados/busca em amigos. **S–M**
 - [ ] P2: **DM em grupo**, status personalizado, níveis de notificação, privacidade (quem me adiciona/manda DM), ignorar. **S–L**
 - [ ] P3: chamadas em DM (depende da Fase 2), atividade/rich presence, sugestões de amigos

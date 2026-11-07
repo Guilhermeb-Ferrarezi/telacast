@@ -172,7 +172,7 @@ fn anim(ui: &Ui, id: egui::Id, on: bool, secs: f32) -> f32 {
 
 /// Avatar redondo, cor suave por usuário, inicial no centro. `surface` é a cor do fundo atrás dele
 /// (serve de contorno para a bolinha de presença).
-pub fn avatar(ui: &mut Ui, name: &str, id: i64, size: f32, online: Option<bool>, surface: Color32) -> Response {
+pub fn avatar(ui: &mut Ui, name: &str, id: i64, size: f32, status: Option<telacast_proto::Status>, surface: Color32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
     let p = ui.painter();
     let c = rect.center();
@@ -180,12 +180,45 @@ pub fn avatar(ui: &mut Ui, name: &str, id: i64, size: f32, online: Option<bool>,
     p.circle_filled(c, size / 2.0, bg);
     let ch = name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into());
     p.text(c, Align2::CENTER_CENTER, ch, FontId::proportional(size * 0.4), fg);
-    if let Some(on) = online {
-        let d = rect.right_bottom() - vec2(size * 0.12, size * 0.12);
-        p.circle_filled(d, size * 0.17, surface);
-        p.circle_filled(d, size * 0.11, if on { OK } else { MUTED });
+    if let Some(st) = status {
+        presence_dot(p, rect.right_bottom() - vec2(size * 0.12, size * 0.12), size * 0.11, st, surface);
     }
     resp
+}
+
+/// Bolinha de presença: online cheia, ausente em meia-lua, não perturbe com barra, invisível/offline vazada.
+/// `surface` é a cor do fundo, usada para o contorno e para os recortes.
+pub fn presence_dot(p: &egui::Painter, c: egui::Pos2, r: f32, st: telacast_proto::Status, surface: Color32) {
+    use telacast_proto::Status;
+    p.circle_filled(c, r * 1.55, surface);
+    match st {
+        Status::Online => {
+            p.circle_filled(c, r, OK);
+        }
+        Status::Idle => {
+            p.circle_filled(c, r, AMBER);
+            p.circle_filled(c + vec2(-r * 0.45, -r * 0.45), r * 0.62, surface);
+        }
+        Status::Dnd => {
+            p.circle_filled(c, r, RED);
+            p.rect_filled(Rect::from_center_size(c, vec2(r * 1.2, r * 0.5)), 0.0, surface);
+        }
+        Status::Invisible | Status::Offline => {
+            p.circle_filled(c, r, MUTED);
+            p.circle_filled(c, r * 0.55, surface);
+        }
+    }
+}
+
+pub fn status_label(st: telacast_proto::Status) -> &'static str {
+    use telacast_proto::Status;
+    match st {
+        Status::Online => "Online",
+        Status::Idle => "Ausente",
+        Status::Dnd => "Não perturbe",
+        Status::Invisible => "Invisível",
+        Status::Offline => "Offline",
+    }
 }
 
 fn user_tint(id: i64) -> (Color32, Color32) {
