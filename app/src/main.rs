@@ -228,6 +228,7 @@ struct Login {
     server: String,
     user: String,
     pass: String,
+    invite: String,
     register: bool,
     error: String,
     gw: Option<Gateway>,
@@ -259,6 +260,7 @@ impl App {
             },
             user: get("user"),
             pass: String::new(),
+            invite: String::new(),
             register: false,
             error: String::new(),
             gw: None,
@@ -290,9 +292,9 @@ impl App {
         let l = &mut self.login;
         l.error.clear();
         l.gw = Some(gateway::open(&l.server, ctx.clone()));
-        let (username, password) = (l.user.trim().to_string(), l.pass.clone());
+        let (username, password, invite) = (l.user.trim().to_string(), l.pass.clone(), l.invite.clone());
         l.pending = Some(if l.register {
-            C2S::Register { username, password }
+            C2S::Register { username, password, invite }
         } else {
             C2S::Login { username, password }
         });
@@ -429,7 +431,12 @@ impl App {
                                     .password(true)
                                     .desired_width(f32::INFINITY),
                             );
-                            let enter = pw.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                            let mut enter = pw.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                            if self.login.register {
+                                ui.label(RichText::new("CÓDIGO DE CONVITE").size(11.0).strong().color(MUTED));
+                                let inv = ui.add(egui::TextEdit::singleline(&mut self.login.invite).desired_width(f32::INFINITY));
+                                enter |= inv.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+                            }
                             if !self.login.error.is_empty() {
                                 ui.label(RichText::new(&self.login.error).color(RED));
                             }

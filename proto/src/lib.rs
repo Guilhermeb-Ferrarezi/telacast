@@ -73,9 +73,12 @@ pub struct Message {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum C2S {
-    Register { username: String, password: String },
+    /// `invite`: código de convite da instância (cadastro fechado).
+    Register { username: String, password: String, invite: String },
     Login { username: String, password: String },
     Resume { token: String },
+    /// Encerra a sessão (revoga o token) e fecha a conexão.
+    Logout,
     CreateServer { name: String },
     JoinServer { code: String },
     CreateChannel { server_id: i64, name: String },
