@@ -83,12 +83,19 @@ class Repository(
     fun abrirCanal(canal: Long) = synchronized(lock) {
         val s = _estado.value
         ack(s, canal)
-        var novo = s.copy(canalAberto = canal, naoLidos = s.naoLidos - canal, mencoes = s.mencoes - canal)
+        // divisor "novas mensagens": só se havia algo mais novo que o último lido no momento de abrir
+        val (ultima, lida) = s.canal(canal)?.let { it.lastMessageId to it.lastReadId }
+            ?: s.snapshot?.dms?.firstOrNull { it.channelId == canal }?.let { it.lastMessageId to it.lastReadId } ?: (0L to 0L)
+        val marcadores = if (ultima > lida) s.marcadores + (canal to lida) else s.marcadores - canal
+        var novo = s.copy(canalAberto = canal, naoLidos = s.naoLidos - canal, mencoes = s.mencoes - canal, marcadores = marcadores)
         if (canal !in s.carregados && gateway.enviar(C2S.History(canal, null))) {
             novo = novo.copy(carregados = novo.carregados + canal)
         }
         _estado.value = novo
     }
+
+    /** Esc / "dispensar": tira o divisor "novas mensagens" do canal. */
+    fun dispensarMarcador(canal: Long) = modificar { it.copy(marcadores = it.marcadores - canal) }
 
     fun fecharCanal() = modificar { it.copy(canalAberto = null) }
 
@@ -98,14 +105,36 @@ class Repository(
     }
 
     /** Carrega a página mais antiga (`History{before}`), se o servidor ainda tem e não há pedido em andamento. */
-    fun carregarAnteriores(canal: Long) = synchronized(lock) {
+    fun carregarAnteriores(canal: Long) = synchronized(lock) { pedirAnteriores(canal) }
+
+    private fun pedirAnteriores(canal: Long): Boolean {
         val s = _estado.value
-        if (canal in s.buscandoAntigas || s.temMais[canal] != true) return
-        val maisAntiga = s.mensagens[canal]?.firstOrNull { it.id > 0 }?.id ?: return
-        if (gateway.enviar(C2S.History(canal, maisAntiga))) {
-            _estado.value = s.copy(buscandoAntigas = s.buscandoAntigas + canal)
+        if (canal in s.buscandoAntigas || s.temMais[canal] != true) return false
+        val maisAntiga = s.mensagens[canal]?.firstOrNull { it.id > 0 }?.id ?: return false
+        if (!gateway.enviar(C2S.History(canal, maisAntiga))) return false
+        _estado.value = s.copy(buscandoAntigas = s.buscandoAntigas + canal)
+        return true
+    }
+
+    /**
+     * Salta até a mensagem `id` (clique no cabeçalho de uma resposta). Se não estiver carregada, busca páginas
+     * mais antigas até achar, no máximo [PAGINAS_DO_SALTO] (igual ao desktop). O resultado aparece em
+     * [AppState.destaque] (a tela rola até ela e a realça); se não achar, sai um [Aviso.Texto].
+     */
+    fun saltarPara(canal: Long, id: Long) = synchronized(lock) {
+        val s = _estado.value
+        when {
+            s.mensagens[canal].orEmpty().any { it.id == id } ->
+                _estado.value = s.copy(destaque = Destaque(canal, id, relogio()), salto = null)
+            s.temMais[canal] == true -> {
+                _estado.value = s.copy(salto = Salto(canal, id, PAGINAS_DO_SALTO))
+                if (!pedirAnteriores(canal)) _estado.value = _estado.value.copy(salto = null)
+            }
+            else -> _avisos.trySend(Aviso.Texto("A mensagem não está mais disponível"))
         }
     }
+
+    fun limparDestaque() = modificar { it.copy(destaque = null) }
 
     // ------------------------------------------------------------------ envio otimista
 
@@ -298,11 +327,25 @@ class Repository(
             val atual = s.mensagens[ch].orEmpty()
             val tenho = atual.mapTo(HashSet()) { it.id }
             val frente = h.messages.filter { it.id !in tenho }
-            _estado.value = s.copy(
+            var novo = s.copy(
                 mensagens = s.mensagens + (ch to (frente + atual)),
                 buscandoAntigas = s.buscandoAntigas - ch,
                 temMais = s.temMais + (ch to cheia),
             )
+            val salto = s.salto?.takeIf { it.canal == ch }
+            if (salto != null) {
+                val achou = novo.mensagens[ch].orEmpty().any { it.id == salto.id }
+                if (achou) {
+                    novo = novo.copy(salto = null, destaque = Destaque(ch, salto.id, relogio()))
+                } else if (salto.paginas > 1 && cheia) {
+                    novo = novo.copy(salto = salto.copy(paginas = salto.paginas - 1))
+                } else {
+                    novo = novo.copy(salto = null)
+                    _avisos.trySend(Aviso.Texto("Não achei a mensagem original; ela é muito antiga"))
+                }
+            }
+            _estado.value = novo
+            if (novo.salto != null && !pedirAnteriores(ch)) _estado.value = _estado.value.copy(salto = null)
             return
         }
         // carga inicial (ou recarga após reconectar): vale o histórico, mais o que chegou ao vivo depois dele
@@ -386,6 +429,7 @@ class Repository(
     companion object {
         const val LIMITE_TEXTO = 4000
         const val TAMANHO_PAGINA = 50
+        const val PAGINAS_DO_SALTO = 10
     }
 }
 

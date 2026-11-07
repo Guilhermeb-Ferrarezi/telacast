@@ -247,11 +247,41 @@ class IntegracaoTest {
         assertEquals("msg 006", primeira.first().content)
         assertEquals("msg 055", primeira.last().content)
 
-        bob.repo.carregarAnteriores(canal)
+        // salto até uma mensagem fora da primeira página: busca a página antiga e realça (B6)
+        val alvo = paula.estado.mensagens[canal]!!.first { it.content == "msg 003" }.id
+        bob.repo.saltarPara(canal, alvo)
+        esperar("destaque da mensagem antiga") { bob.estado.destaque?.takeIf { it.id == alvo } }
         val tudo = esperar("página 2") { bob.estado.mensagens[canal]?.takeIf { it.size == total } }
         assertEquals((1..total).map { "msg %03d".format(it) }, tudo.map { it.content })
         assertEquals("ordem por id", tudo.map { it.id }.sorted(), tudo.map { it.id })
         assertEquals(false, bob.estado.temMais[canal])
+    }
+
+    // ------------------------------------------------------------------ anexos por HTTP
+
+    @Test fun anexoSobeBaixaEViajaNaMensagem() {
+        val canal = novoCanal()
+        ana.repo.abrirCanal(canal); bob.repo.abrirCanal(canal)
+        esperar("histórico") { if (ana.estado.mensagens.containsKey(canal) && bob.estado.mensagens.containsKey(canal)) true else null }
+        // PNG de 1x1 pixel
+        val png = java.util.Base64.getDecoder().decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+        val api = app.telacast.arquivos.OkHttpArquivos()
+        val enviador = app.telacast.arquivos.EnviadorDeAnexos(api, escopo, { app.telacast.arquivos.Arquivos.urlHttp(url!!) }, { ana.gateway.token })
+        assertEquals(null, enviador.adicionar(canal, listOf(app.telacast.arquivos.FonteEmMemoria("pixel.png", png, ehImagem = true))))
+        val anexo = esperar("upload pronto") { enviador.prontos(canal).firstOrNull() }
+        assertEquals("image/png", anexo.mime)
+        assertEquals(1, anexo.width)
+        assertEquals("pixel.png", anexo.name)
+
+        ana.repo.enviarMensagem(canal, "olha o anexo", anexos = listOf(anexo))
+        val recebida = esperar("bob recebe a mensagem com anexo") { bob.estado.mensagens[canal]?.firstOrNull { it.content == "olha o anexo" } }
+        assertEquals(listOf(anexo.id), recebida.attachments.map { it.id })
+
+        // bob baixa pelo mesmo endereço que o app usa
+        val baixado = runBlocking { api.baixar(app.telacast.arquivos.Arquivos.url(app.telacast.arquivos.Arquivos.urlHttp(url!!), anexo, bob.gateway.token!!), 1L shl 20) }
+        assertEquals(png.toList(), baixado?.toList())
+        // sem token o servidor recusa
+        assertEquals(null, runBlocking { api.baixar(app.telacast.arquivos.Arquivos.url(app.telacast.arquivos.Arquivos.urlHttp(url!!), anexo, "invalido"), 1L shl 20) })
     }
 
     // ------------------------------------------------------------------ rede caindo e Resume

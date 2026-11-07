@@ -23,6 +23,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -373,5 +374,69 @@ class RepositoryTest {
         assertEquals(77L, a.estado.eu?.id)
         assertEquals(null, a.estado.canalAberto)
     }
-}
 
+    // ------------------------------------------------------------------ marcador "novas mensagens" e salto (B4/B6)
+
+    @Test fun abrirCanalComNaoLidasGuardaOMarcadorNoUltimoLido() = runTest {
+        val a = amb(); a.entrar()
+        a.repo.abrirCanal(geral)
+        // snapshot da fixture: geral tem last_message_id 112624001234567905 e last_read_id 112624001234567890
+        assertEquals(112624001234567890L, a.estado.marcadores[geral])
+        a.repo.dispensarMarcador(geral)
+        assertTrue(a.estado.marcadores.isEmpty())
+        a.repo.abrirCanal(memes) // memes já estava lido
+        assertTrue(memes !in a.estado.marcadores)
+    }
+
+    private fun paginaCheia(de: Long) = (de until de + 50).map { msg(it) }
+
+    @Test fun saltoAcheiAMensagemJaCarregada() = runTest {
+        val a = amb(); a.entrar(); a.repo.abrirCanal(geral); a.servidor(S2C.History(geral, listOf(msg(10), msg(11))))
+        a.repo.saltarPara(geral, 10)
+        assertEquals(10L, a.estado.destaque?.id)
+        a.repo.limparDestaque()
+        assertNull(a.estado.destaque)
+    }
+
+    @Test fun saltoBuscaPaginasAntigasAteAchar() = runTest {
+        val a = amb(); a.entrar(); a.repo.abrirCanal(geral); a.servidor(S2C.History(geral, paginaCheia(1000)))
+        a.novos()
+        a.repo.saltarPara(geral, 920)
+        assertEquals(listOf<C2S>(C2S.History(geral, 1000)), a.novos())
+        a.servidor(S2C.History(geral, paginaCheia(950))) // 950..999: não tem a 920
+        assertNull(a.estado.destaque)
+        assertEquals(listOf<C2S>(C2S.History(geral, 950)), a.novos())
+        a.servidor(S2C.History(geral, paginaCheia(900))) // 900..949: tem
+        assertEquals(920L, a.estado.destaque?.id)
+        assertNull(a.estado.salto)
+        assertTrue(a.novos().isEmpty())
+    }
+
+    @Test fun saltoDesisteDepoisDe10PaginasOuQuandoOHistoricoAcaba() = runTest {
+        val a = amb(); a.entrar(); a.repo.abrirCanal(geral); a.servidor(S2C.History(geral, paginaCheia(10_000)))
+        val avisos = mutableListOf<Aviso>()
+        a.t.backgroundScope.launch { a.repo.avisos.collect { avisos += it } }
+        a.repo.saltarPara(geral, 1)
+        var base = 10_000L
+        repeat(10) { a.t.runCurrent(); base -= 50; a.servidor(S2C.History(geral, paginaCheia(base))) }
+        assertNull(a.estado.salto)
+        assertNull(a.estado.destaque)
+        assertEquals("exatamente 10 páginas pedidas", 10, a.c.c2s.count { it is C2S.History && it.before != null })
+        assertTrue(avisos.any { it is Aviso.Texto && it.msg.contains("muito antiga") })
+
+        // começo do histórico (página incompleta) também encerra
+        val b = amb(); b.entrar(); b.repo.abrirCanal(geral); b.servidor(S2C.History(geral, paginaCheia(1000)))
+        b.repo.saltarPara(geral, 5)
+        b.servidor(S2C.History(geral, (990L..999L).map { msg(it) }))
+        assertNull(b.estado.salto)
+    }
+
+    @Test fun saltoSemMaisPaginasAvisa() = runTest {
+        val a = amb(); a.entrar(); a.repo.abrirCanal(geral); a.servidor(S2C.History(geral, listOf(msg(10))))
+        val avisos = mutableListOf<Aviso>()
+        a.t.backgroundScope.launch { a.repo.avisos.collect { avisos += it } }
+        a.t.runCurrent()
+        a.repo.saltarPara(geral, 3); a.t.runCurrent()
+        assertEquals(listOf<Aviso>(Aviso.Texto("A mensagem não está mais disponível")), avisos)
+    }
+}

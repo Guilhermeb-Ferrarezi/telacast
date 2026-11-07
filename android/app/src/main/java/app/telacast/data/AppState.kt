@@ -61,6 +61,12 @@ data class AppState(
     val voz: List<VoiceState> = emptyList(),
     val espectadores: Map<Long, List<Long>> = emptyMap(),
     val sessoes: List<SessionInfo> = emptyList(),
+    /** Divisor "novas mensagens": canal -> último id lido quando o canal foi aberto (só se havia o que ler). */
+    val marcadores: Map<Long, Long> = emptyMap(),
+    /** Salto até uma mensagem antiga em andamento (buscando páginas). */
+    val salto: Salto? = null,
+    /** Mensagem a rolar até e realçar em âmbar por ~1,5 s. */
+    val destaque: Destaque? = null,
 ) {
     /** O que a tela mostra no canal: as reais em ordem e, no fim, as provisórias na ordem de envio. */
     fun lista(canal: Long): List<Message> {
@@ -80,10 +86,17 @@ data class AppState(
     }
 }
 
+/** Salto até uma resposta antiga: busca no máximo `paginas` páginas de histórico (como o desktop). */
+data class Salto(val canal: Long, val id: Long, val paginas: Int)
+
+data class Destaque(val canal: Long, val id: Long, val desde: Long)
+
 /** Avisos de uma vez só (a tela reage e esquece): navegação e erros. */
 sealed interface Aviso {
     data class Erro(val codigo: app.telacast.proto.ErrorCode, val msg: String) : Aviso
     data class DmAberta(val canal: Long) : Aviso
     data class ServidorEntrou(val servidor: Long) : Aviso
     data object SenhaTrocada : Aviso
+    /** Mensagem informativa curta (por exemplo, "A mensagem não está mais disponível"). */
+    data class Texto(val msg: String) : Aviso
 }

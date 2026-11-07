@@ -25,4 +25,12 @@ class PreferenciasAndroid(contexto: Context) : Preferencias {
     override var ultimoServidor: Long
         get() = p.getLong("ultimo_servidor", 0)
         set(v) { p.edit().putLong("ultimo_servidor", v).apply() }
+
+    private val rascunhos = contexto.getSharedPreferences("telacast_rascunhos", Context.MODE_PRIVATE)
+
+    override fun rascunho(canal: Long): String = rascunhos.getString(canal.toString(), "") ?: ""
+
+    override fun salvarRascunho(canal: Long, texto: String) {
+        rascunhos.edit().apply { if (texto.isEmpty()) remove(canal.toString()) else putString(canal.toString(), texto) }.apply()
+    }
 }

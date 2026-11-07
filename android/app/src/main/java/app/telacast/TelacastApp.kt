@@ -14,6 +14,7 @@ class TelacastApp : Application() {
             preferencias = PreferenciasAndroid(this),
             cofre = CofreKeystore(this),
             servidorPadrao = BuildConfig.SERVIDOR_PADRAO,
+            decodificarImagem = { app.telacast.arquivos.decodificarBitmap(it) },
         )
     }
 }

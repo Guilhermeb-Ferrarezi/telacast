@@ -38,6 +38,13 @@ val Newsreader: FontFamily = FontFamily(
     }
 )
 
+/** JetBrains Mono (variável) para código em mensagens e prévias de texto. */
+val Mono: FontFamily = FontFamily(
+    listOf(400, 600).map { w ->
+        Font(R.font.jetbrainsmono, FontWeight(w), FontStyle.Normal, variationSettings = FontVariation.Settings(FontVariation.weight(w)))
+    }
+)
+
 /** Estilos de texto com os tamanhos do desktop (Body 14.5, Button 13.5, Small 12, Heading 24 serifa). */
 object Tipos {
     val Corpo = TextStyle(fontFamily = Inter, fontWeight = FontWeight.Normal, fontSize = 14.5.sp, lineHeight = 21.sp, color = Grafite.Texto)

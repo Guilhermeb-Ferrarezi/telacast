@@ -1,7 +1,13 @@
 package app.telacast
 
 import androidx.lifecycle.ViewModel
+import app.telacast.arquivos.Arquivos
+import app.telacast.arquivos.FonteDeArquivo
 import app.telacast.data.Aviso
+import androidx.compose.ui.text.input.TextFieldValue
+import app.telacast.data.SugestoesDeMencao
+import app.telacast.proto.Attachment
+import app.telacast.proto.Message
 import app.telacast.data.AppState
 import app.telacast.estado.AbaInicio
 import app.telacast.estado.Destino
@@ -169,6 +175,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
     fun abrirCanal(servidor: Long, canal: Long) {
         _nav.update { it.irPara(Destino.Canal(servidor, canal)) }
         repo.abrirCanal(canal)
+        c.compositor.abrirCanal(canal)
         c.preferencias.ultimoServidor = servidor
         c.preferencias.ultimoCanal = canal
     }
@@ -176,6 +183,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
     fun abrirDm(canal: Long) {
         _nav.update { it.irPara(Destino.Dm(canal)).copy(servidorNoPainel = null) }
         repo.abrirCanal(canal)
+        c.compositor.abrirCanal(canal)
     }
 
     fun abrirAmigos() {
@@ -188,6 +196,80 @@ class AppViewModel(private val c: Container) : ViewModel() {
         _recolhidas.value = novo
         c.preferencias.categoriasRecolhidas = novo
     }
+
+    // ------------------------------------------------------------------ conversa: mensagens, compositor e anexos
+
+    val compositor = c.compositor.estado
+    val anexos = c.enviador.anexos
+    val imagens get() = c.imagens
+    val previas get() = c.previas
+
+    private val _spoilers = MutableStateFlow<Set<Pair<Long, Int>>>(emptySet())
+    val spoilers: StateFlow<Set<Pair<Long, Int>>> = _spoilers.asStateFlow()
+    private val _textosAbertos = MutableStateFlow<Set<Long>>(emptySet())
+    val textosAbertos: StateFlow<Set<Long>> = _textosAbertos.asStateFlow()
+    private val _reveladas = MutableStateFlow<Set<Long>>(emptySet())
+    /** Mensagens de usuários bloqueados que a pessoa mandou mostrar. */
+    val reveladas: StateFlow<Set<Long>> = _reveladas.asStateFlow()
+
+    fun urlDoAnexo(a: Attachment): String = Arquivos.url(c.baseHttp(), a, repo.token.orEmpty())
+
+    fun alternarSpoiler(mensagem: Long, id: Int) = _spoilers.update { val k = mensagem to id; if (k in it) it - k else it + k }
+    fun alternarTexto(id: Long) = _textosAbertos.update { if (id in it) it - id else it + id }
+    fun mostrarBloqueada(id: Long) = _reveladas.update { it + id }
+
+    private fun mensagem(id: Long): Message? = repo.estado.value.canalAberto?.let { repo.estado.value.lista(it) }?.firstOrNull { it.id == id }
+
+    fun textoDaMensagem(id: Long): String? = mensagem(id)?.content
+    fun carregarAnteriores(canal: Long) = repo.carregarAnteriores(canal)
+
+    fun mudarCompositor(v: TextFieldValue) = c.compositor.mudar(v)
+    fun escolherSugestao(s: SugestoesDeMencao, nome: String) = c.compositor.completarMencao(s, nome)
+    fun cancelarResposta() = c.compositor.cancelarResposta()
+    fun cancelarEdicao() = c.compositor.cancelarEdicao()
+
+    /** Envia a mensagem (ou salva a edição). Com anexos ainda subindo, não envia (o botão fica apagado). */
+    fun enviarMensagem() {
+        val estado = c.compositor.estado.value
+        val canal = estado.canal
+        if (c.enviador.emAndamento(canal)) return
+        val editando = estado.editando != null
+        if (c.compositor.enviar(c.enviador.prontos(canal)) && !editando) c.enviador.concluir(canal)
+    }
+
+    fun anexar(fontes: List<FonteDeArquivo>) {
+        val canal = c.compositor.estado.value.canal
+        if (canal == 0L || fontes.isEmpty()) return
+        c.enviador.adicionar(canal, fontes)?.let(::mostrarAviso)
+    }
+
+    fun removerAnexo(chave: Long) = c.enviador.remover(chave)
+    fun tentarAnexo(chave: Long) = c.enviador.tentarDeNovo(chave)
+
+    fun abrirFolha(m: Message) = _nav.update { it.abrirFolha(m.id) }
+    fun fecharFolha() = _nav.update { it.fecharFolha() }
+    fun maisEmojis(id: Long) = _nav.update { it.abrirFolha(id, emojis = true) }
+
+    fun responderA(id: Long) { mensagem(id)?.let(c.compositor::responder); fecharFolha() }
+    fun editarMensagem(id: Long) { mensagem(id)?.let(c.compositor::editar); fecharFolha() }
+    fun fixarMensagem(id: Long) { mensagem(id)?.let { repo.fixar(id, !it.pinned) }; fecharFolha() }
+    fun pedirApagar(id: Long) { mensagem(id)?.let { m -> _nav.update { it.abrirDialogo(Dialogo.ConfirmarApagar(id, m.content.ifEmpty { "(anexo)" })) } } }
+    fun apagarMensagem(id: Long) { repo.apagar(id); fecharDialogo() }
+
+    /** Reage com o emoji; se eu já tinha reagido, tira a reação. */
+    fun reagirComEmoji(id: Long, emoji: String) {
+        val ja = mensagem(id)?.reactions?.firstOrNull { it.emoji == emoji }?.me == true
+        repo.reagir(id, emoji, !ja)
+        fecharFolha()
+    }
+
+    fun reagir(id: Long, emoji: String, adicionar: Boolean) = repo.reagir(id, emoji, adicionar)
+    fun saltarPara(respostaA: Long) { repo.estado.value.canalAberto?.let { repo.saltarPara(it, respostaA) } }
+    fun limparDestaque() = repo.limparDestaque()
+    fun reenviar(nonce: Long) = repo.reenviar(nonce)
+    fun descartar(nonce: Long) = repo.descartarPendente(nonce)
+    fun abrirImagem(a: Attachment) = _nav.update { it.abrirDialogo(Dialogo.Imagem(a)) }
+    fun abrirTexto(a: Attachment) = _nav.update { it.abrirDialogo(Dialogo.Texto(a)) }
 
     // ------------------------------------------------------------------ ações de servidor e conta
 
@@ -234,6 +316,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
                 if (sv != null && canal != null) abrirCanal(sv.id, canal.id) else _nav.update { it.selecionarServidor(a.servidor) }
             }
             Aviso.SenhaTrocada -> mostrarAviso("Senha alterada.")
+            is Aviso.Texto -> mostrarAviso(a.msg)
         }
     }
 

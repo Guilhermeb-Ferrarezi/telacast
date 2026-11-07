@@ -63,6 +63,8 @@ class AcoesPrincipais(
     val aoConvidar: (String) -> Unit = {},
     val aoEscolherStatus: (Status) -> Unit = {},
     val aoPedirSaida: () -> Unit = {},
+    val conversa: AcoesDaConversa = AcoesDaConversa(),
+    val folha: AcoesDaFolha = AcoesDaFolha(),
 )
 
 /**
@@ -78,6 +80,7 @@ fun TelaPrincipal(
     aviso: String?,
     acoes: AcoesPrincipais,
     modifier: Modifier = Modifier,
+    conversa: DadosDaConversa = DadosDaConversa(),
 ) {
     BoxWithConstraints(modifier.fillMaxSize().background(Grafite.L2)) {
         val larguraGaveta = minOf((LARGURA_TRILHO + LARGURA_PAINEL).dp, maxWidth - 56.dp)
@@ -112,7 +115,7 @@ fun TelaPrincipal(
         ) {
             Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.statusBars)) {
                 (estado.conexao as? EstadoConexao.Reconectando)?.let { FaixaDeReconexao(it.tentativa) }
-                Box(Modifier.weight(1f)) { Centro(estado, nav, acoes) }
+                Box(Modifier.weight(1f)) { Centro(estado, nav, acoes, conversa) }
             }
 
             CamadaLateral(pEsq, aEsquerda = true, largura = larguraGaveta, aoFechar = acoes.aoFecharGaveta) {
@@ -123,6 +126,7 @@ fun TelaPrincipal(
                 Box(Modifier.windowInsetsPadding(WindowInsets.statusBars)) { PainelDeMembros(sv) }
             }
 
+            nav.folha?.let { f -> FolhaDaMensagem(estado, f.mensagem, f.emojis, acoes.folha) }
             nav.dialogo?.let { DialogoAtual(it, acoes.dialogo) }
             if (aviso != null) {
                 AvisoCurto(aviso, Modifier.align(Alignment.BottomCenter).windowInsetsPadding(WindowInsets.navigationBars).padding(bottom = 16.dp))
@@ -142,17 +146,17 @@ private fun FaixaDeReconexao(tentativa: Int) {
 }
 
 @Composable
-private fun Centro(estado: AppState, nav: Navegacao, acoes: AcoesPrincipais) {
+private fun Centro(estado: AppState, nav: Navegacao, acoes: AcoesPrincipais, conversa: DadosDaConversa) {
     val sn = estado.snapshot
     when (val d = nav.destino) {
         is Destino.Canal -> {
             val canal = sn?.servers?.firstOrNull { it.id == d.servidor }?.channels?.firstOrNull { it.id == d.canal }
-            if (canal != null) TelaDeCanal(estado, canal, acoes.aoAbrirGaveta, acoes.aoAbrirMembros)
+            if (canal != null) TelaDeCanal(estado, canal, acoes.aoAbrirGaveta, acoes.aoAbrirMembros, conversa, acoes.conversa)
             else TelaDeAmigos(estado, nav.abaInicio, acoes.aoAbrirGaveta, acoes.amigos)
         }
         is Destino.Dm -> {
             val dm = sn?.dms?.firstOrNull { it.channelId == d.canal }
-            if (dm != null) TelaDeDm(estado, dm, acoes.aoAbrirGaveta)
+            if (dm != null) TelaDeDm(estado, dm, acoes.aoAbrirGaveta, conversa, acoes.conversa)
             else TelaDeAmigos(estado, nav.abaInicio, acoes.aoAbrirGaveta, acoes.amigos)
         }
         Destino.Amigos -> TelaDeAmigos(estado, nav.abaInicio, acoes.aoAbrirGaveta, acoes.amigos)
@@ -214,4 +218,16 @@ private fun CamadaLateral(progresso: Float, aEsquerda: Boolean, largura: Dp, aoF
                 .offset { IntOffset((((if (aEsquerda) progresso - 1f else 1f - progresso)) * px).roundToInt(), 0) },
         ) { conteudo() }
     }
+}
+
+/** Folha inferior da mensagem aberta pelo toque longo (ou o seletor de emojis). */
+@Composable
+private fun FolhaDaMensagem(estado: AppState, id: Long, emojis: Boolean, a: AcoesDaFolha) {
+    val canal = estado.canalAberto ?: return
+    val m = estado.lista(canal).firstOrNull { it.id == id } ?: return
+    val eu = estado.eu ?: return
+    val dono = estado.snapshot?.servers?.any { it.owner == eu.id && it.channels.any { c -> c.id == canal } } == true
+    val dm = estado.snapshot?.dms?.any { it.channelId == canal } == true
+    if (emojis) FolhaDeEmojis(a.aoReagir, a.aoFechar)
+    else FolhaDeAcoes(m, minha = m.authorId == eu.id, podeApagar = m.authorId == eu.id || dono, podeFixar = dono || dm, acoes = a)
 }

@@ -8,17 +8,20 @@ Plano: `docs/MOBILE-PLAN.md` (raiz do repositório). Este arquivo é o estado da
 
 ## Passo atual
 
-A1, A2 e A3 estão commitados. **B1 (login e cadastro), B2 (navegação com gaveta) e B3 (canais e Início) feitos, aguardando revisão e commit.** Próximo: **B4 (lista de mensagens) e B5 (compositor e ações)**.
+A1 a A3 e B1 a B3 estão commitados. **B4 (mensagens), B5 (compositor e ações) e B6 (histórico) feitos, aguardando revisão e commit.** Próximo: **B7 (Início completo: amigos e DMs), B8 (membros e perfil), B9 (ajustes)**; depois a fase C (vídeo).
 
 ## Feito
 
-- A1 a A3: projeto, tema Grafite, protocolo (fixtures), Gateway, Repository, integração contra o servidor real (ver "Achados" abaixo).
-- **B1 Login/cadastro** (`ui/Login.kt`, `estado/FormLogin.kt`, `AppViewModel`): servidor editável (padrão em `BuildConfig.SERVIDOR_PADRAO`: `10.0.2.2:8080` no debug, vazio no release), usuário, senha, convite (alterna Entrar / Registrar-se), "Entrando…", erros em português (`TextosDeErro`), retomada da sessão salva ("Entrando…" + "Usar outra conta"). Token cifrado com AES-GCM do Android Keystore (`armazenamento/CifraAesGcm.kt` + `CofreKeystore.kt`, SharedPreferences privadas; sem `security-crypto`); guarda também o último servidor e usuário. `sessaoInvalida` apaga o token e volta ao login.
-- **B2 Navegação** (`ui/Principal.kt`, `estado/Navegacao.kt`): gaveta à esquerda própria (trilho 72 dp + painel 240 dp, abre por botão ou arrastando; toque no escurecido fecha), painel de membros à direita (lista simples; por gesto ou botão), `BackHandler` na raiz (`ui/Raiz.kt`) fecha diálogo, menu, membros e gaveta, nessa ordem, antes de sair. Navegação por estado próprio (`Navegacao`, imutável, testado).
-- **B3 Canais** (`ui/Trilho.kt`, `ui/Painel.kt`, `ui/Sobreposicoes.kt`): trilho com pílula 8/40 dp, sigla, selo de menções (99+), botão "+"; cabeçalho do servidor em serifa com menu (Convidar pessoas; dono: Criar canal e Criar categoria); categorias recolhíveis (estado salvo; recolhida só mostra canal aberto, não lido ou com gente na voz); canais com `#`, não lido em negrito + barra, pílula de menções; voz com alto-falante e quem está nela ("Canais de voz chegam em breve" ao tocar); cartão do usuário com presença e menu de status (Online, Ausente, Não perturbe, Invisível, Sair da conta); diálogos criar servidor / entrar com convite, criar canal ou categoria, convidar (copiar código), confirmar saída.
-- **Início** (`ui/Centro.kt`): "Amigos" com abas Disponível, Todos, Pendente (aceitar, recusar, cancelar) e Adicionar amigo; na gaveta, "Amigos" e as mensagens diretas. DM e canal abrem com cabeçalho e um espaço para a lista (B4).
-- Imagens: `docs/telas/*.png` (24, ~1,2 MB), geradas por `TelasSnapshotTest` com `AppState` falso (`Amostras.kt`), sem rede.
-- Verificado: 118 testes unitários (proto 21, gateway 13, OkHttp 5, repository 25, ViewModel 15, navegação 6, formulário 4, cifra 4, 24 imagens de telas + paleta) e 10 de integração; `verifyPaparazziDebug` verde.
+- A1 a A3: projeto, tema Grafite, protocolo (fixtures), Gateway, Repository, integração contra o servidor real.
+- B1 a B3: login/cadastro, gaveta com trilho e canais, menus, diálogos, Início mínimo (ver `docs/telas/`).
+- **Markdown** (`md/Markdown.kt`): porte fiel de `md/src/lib.rs` (blocos e inlines), com os mesmos casos de `md/src/tests.rs` em `MarkdownTest`. O desenho (`ui/MarkdownView.kt`) gera `AnnotatedString` com `LinkAnnotation.Clickable`: negrito, itálico, sublinhado, tachado, código em linha e em bloco (JetBrains Mono, `res/font/jetbrainsmono.ttf`), citação, listas, título, subtexto, spoiler que revela ao toque, links, menções `<@id>` com o nome atual, `<#id>`, `@everyone`/`@here` e carimbos `<t:..>`.
+- **Lista de mensagens B4** (`ui/Mensagens.kt`, `data/ItensDaLista.kt`): `LazyColumn(reverseLayout = true)`; as regras do desktop estão em `ItensDaLista.montar` (puro, testado): agrupamento (mesmo autor, menos de 5 min, sem resposta, sem quebra de dia/novas/sistema), divisor de dia (hoje, ontem, data), "NOVAS MENSAGENS" (marcador = último lido ao abrir o canal; `AppState.marcadores`), avisos de sistema (kind 2 e 3), mensagens de bloqueado recolhidas ("Mostrar mensagem"), pendentes em opacidade reduzida com "Enviando…", "Sem conexão. Será enviada ao reconectar." ou "Não foi enviada." com Tentar de novo e Descartar, reações em chips (âmbar quando eu reagi; toque alterna; "+" abre o seletor), "Fixada", "(editado)", cabeçalho de resposta que salta até a original.
+- **Anexos** (`arquivos/`, `ui/Anexos.kt`): imagem inline até 400x300 dp (cache LRU em memória por bytes, um download por anexo, `BitmapFactory` com `inSampleSize`), tela cheia com zoom (pinça e toque duplo), cartão de arquivo, prévia de texto/código (6 linhas, Expandir, Abrir em tela cheia, Baixar), download pelo `DownloadManager`. Sem Coil.
+- **Compositor B5** (`ui/Compositor.kt`, `data/Compositor.kt`): campo multilinha até 6 linhas, Enviar (âmbar com texto), "+" com `GetMultipleContents`, bandeja de miniaturas 120 dp com progresso, falha e remover, fila de 3 uploads por vez e no máximo 10 anexos por mensagem (`arquivos/Envios.kt`), "Respondendo a", "Editando mensagem" com Salvar/Cancelar, "fulano está digitando…", `Typing` no máximo a cada 4 s, rascunho por canal (SharedPreferences), autocompletar de `@` (membros, `@everyone`, `@here`).
+- **Folha de ações** (`ui/Folha.kt`): toque longo abre folha inferior desenhada na composição: prévia selecionável, reações rápidas, Responder, Editar (minhas), Copiar texto, Fixar/Desafixar (dono do servidor ou DM), Apagar (minhas ou dono; com confirmação); seletor de emojis.
+- **Histórico B6**: perto do topo chama `carregarAnteriores` (indicador "Carregando mensagens antigas…"; a posição não pula); salto até resposta antiga (`Repository.saltarPara`, no máximo 10 páginas, realce âmbar por ~1,5 s em `AppState.destaque`); `Ack` ao abrir o canal, ao chegar o histórico e ao chegar mensagem com o canal aberto.
+- Imagens: `docs/telas/*.png` (48), geradas por `TelasSnapshotTest` e `ConversaSnapshotTest` com `AppState` falso e bitmaps gerados em código.
+- Verificado: 213 testes unitários (24 `TelasSnapshotTest` + 24 `ConversaSnapshotTest` + paleta incluídos; markdown 15, itens da lista 11, compositor 13, arquivos 14, repository 30, ViewModel 15 + 13 da conversa) e 11 de integração (inclui upload/download de anexo por HTTP e salto até mensagem antiga); `verifyPaparazziDebug` verde.
 
 ## Bloqueado
 
@@ -35,7 +38,7 @@ scripts/gradle.sh testDebugUnitTest       # unitários (proto, gateway, reposito
 scripts/gradle.sh verifyPaparazziDebug    # compara a paleta com app/src/test/snapshots
 scripts/paleta.sh                         # regrava só a paleta (docs/paleta.png)
 scripts/telas.sh                          # regrava TODOS os PNGs (paleta + docs/telas/); só quando o visual mudar de propósito
-scripts/it.sh                             # INTEGRAÇÃO contra o servidor real; ~55 s (a paginação respeita 12 envios por 10 s)
+scripts/it.sh                             # INTEGRAÇÃO contra o servidor real; ~60 s (a paginação respeita 12 envios por 10 s)
 scripts/it.sh --tests '*IntegracaoTest.digitando*'   # um teste só (argumentos extras vão para o Gradle)
 ```
 
@@ -67,6 +70,22 @@ AGP 8.5.2, Kotlin 2.0.21 (plugins do compilador Compose e de serialização), Gr
 - Limite de `Send` (12 por 10 s) estoura fácil em teste: uma `Send` recusada vira `Error RateLimited` e a pendente fica na fila; a tela do B-passos precisa de "reenviar/descartar" (o `Repository` já tem `reenviar` e `descartarPendente`).
 - Cadastro/login: 10 por 5 min por IP; a suíte de integração usa 8.
 
+## Decisões do B4 a B6
+
+- Toque longo abre a folha (não há SelectionContainer na lista: ele roubaria o toque longo); o texto da mensagem fica selecionável na prévia da folha, e há "Copiar texto".
+- Enviar com anexo ainda subindo: o botão Enviar fica apagado até todos terminarem (o desktop "arma" a mensagem e a envia sozinho depois). Mais simples e sem estado escondido; anexo que falhou continua na bandeja com "Tentar de novo" ou remover.
+- O `History` não traz `nonce`; a conciliação de pendentes (A3) continua valendo.
+- Mensagem nova só rola para o fim se a pessoa já estava no fim (ou se a nova é minha).
+- O seletor de emojis tem 36 emojis fixos (sem busca). O servidor só aceita emoji sem letras, números ASCII nem espaço.
+- Compartilhar anexo não foi feito (compartilharia o endereço com o token); há Baixar (DownloadManager) e abrir em tela cheia.
+- Moldura de sistema: a lista usa `windowInsetsPadding(navigationBars union ime)` no compositor; a barra de status é tratada na raiz da tela principal.
+
+## Pendências e fora do escopo (B7 em diante)
+
+- Fixadas do canal (`Pins`) tem estado no Repository mas não tem tela; "Ver todas as mensagens fixadas" ainda não faz nada.
+- Perfil ao tocar no avatar ou na menção (B8), busca (`Search`), bloquear/desbloquear pela interface, ajustes (trocar senha, sessões) e voz.
+- Prova em aparelho: nada foi instalado; só imagens na JVM e integração contra o servidor real. Falta conferir na prática: teclado e `imePadding`, `GetMultipleContents`, `DownloadManager`, gestos de zoom e a rolagem do salto (o deslocamento do centro usa um valor negativo em `animateScrollToItem` com `reverseLayout`; está certo na teoria, mas só o aparelho confirma).
+
 ## Decisões do B1 a B3
 
 - Linhas de canal com 40 dp (o desktop usa 34) e menus com itens de 44 dp: alvo de toque. Botões de formulário com 46 a 48 dp.
@@ -82,9 +101,9 @@ AGP 8.5.2, Kotlin 2.0.21 (plugins do compilador Compose e de serialização), Gr
 - Busca (`Search`) não tem estado nem tela.
 - Sem prova em aparelho: nada foi instalado; só imagens na JVM.
 
-## Sugestões para B4/B5
+## Sugestões para B7 em diante
 
-- A lista de mensagens usa `AppState.lista(canal)` (reais em ordem + provisórias no fim); `Repository.carregarAnteriores(canal)` ao chegar no topo; `LazyColumn(reverseLayout = true)`.
-- Compositor: `Repository.enviarMensagem` já valida (vazio, 4000), faz o envio otimista e converte `@nome` em token; `reenviar`/`descartarPendente` para a mensagem que não saiu (limite de 12 envios por 10 s).
-- O ponto âmbar do botão da gaveta (`temNovidade`) e as barras de não lido já usam `naoLidos` e `mencoes` do `AppState`.
-- `imePadding()` já está na tela de login e nos diálogos; o compositor precisa dele também.
+- B7: amigos e DMs completos reaproveitam `Repository.abrirDm`, `pedirAmizade`, `aceitarAmigo`, `removerAmigo`; falta bloquear (`C2S.Block`) e a lista "Bloqueados" (o `Snapshot.blocked` já alimenta a lista de mensagens).
+- B8: o perfil em folha inferior pode reusar `FolhaBase` de `ui/Folha.kt`; `AcoesMd.aoUsuario` e o avatar da mensagem já têm o gancho.
+- Fixadas: `Repository.pedirFixadas` e `AppState.fixadas` prontos; falta a tela (lista com `MensagemView`) e ligar o link de `LinhaDeSistema`.
+- C1: o `Gateway` já entrega quadros binários (`EventoGateway.Binario`); a transmissão usa conexão própria `/watch/{canal}?token=` (OkHttp) e `Snapshot.live` diz quem transmite.

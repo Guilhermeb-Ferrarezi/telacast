@@ -71,39 +71,28 @@ fun BarraSuperior(
     }
 }
 
-/** Canal de texto aberto. Por ora só o cabeçalho e um espaço onde a lista de mensagens entra (B4). */
+/** Canal de texto aberto: barra com o nome e o botão de membros, lista de mensagens e compositor. */
 @Composable
-fun TelaDeCanal(estado: AppState, canal: Channel, aoMenu: () -> Unit, aoMembros: () -> Unit, modifier: Modifier = Modifier) {
-    Column(modifier.fillMaxSize().background(Grafite.L2)) {
-        BarraSuperior(
-            aoMenu, temNovidade(estado), acao = { Toque(aoMembros, Modifier.size(48.dp), Formas.Cartao, fundoPressionado = Grafite.L3) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { IconeMembros(Grafite.Texto2) } } },
-        ) {
-            Text("#", style = Tipos.Titulo.copy(fontSize = 22.sp, color = Grafite.Apagado))
-            Spacer(Modifier.width(6.dp))
-            Text(canal.name, style = Tipos.Titulo.copy(fontSize = 20.sp, lineHeight = 26.sp), maxLines = 1, overflow = TextOverflow.Ellipsis)
-        }
-        EspacoDasMensagens("#${canal.name}", "Este é o começo do canal. A lista de mensagens chega no próximo passo.")
+fun TelaDeCanal(
+    estado: AppState, canal: Channel, aoMenu: () -> Unit, aoMembros: () -> Unit,
+    dados: DadosDaConversa, acoes: AcoesDaConversa, modifier: Modifier = Modifier,
+) {
+    TelaDeConversa(
+        estado, canal.id, "Mensagem em #${canal.name}", aoMenu, dados, acoes, modifier,
+        acaoDireita = { Toque(aoMembros, Modifier.size(48.dp), Formas.Cartao, fundoPressionado = Grafite.L3) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { IconeMembros(Grafite.Texto2) } } },
+    ) {
+        Text("#", style = Tipos.Titulo.copy(fontSize = 22.sp, color = Grafite.Apagado))
+        Spacer(Modifier.width(6.dp))
+        Text(canal.name, style = Tipos.Titulo.copy(fontSize = 20.sp, lineHeight = 26.sp), maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
 
 @Composable
-fun TelaDeDm(estado: AppState, dm: Dm, aoMenu: () -> Unit, modifier: Modifier = Modifier) {
-    Column(modifier.fillMaxSize().background(Grafite.L2)) {
-        BarraSuperior(aoMenu, temNovidade(estado)) {
-            Avatar(dm.user.name, dm.user.id, 28.dp, dm.user.status.presenca(), Grafite.L2)
-            Spacer(Modifier.width(10.dp))
-            Text(dm.user.name, style = Tipos.Titulo.copy(fontSize = 20.sp, lineHeight = 26.sp), maxLines = 1, overflow = TextOverflow.Ellipsis)
-        }
-        EspacoDasMensagens(dm.user.name, "Esta é a conversa com ${dm.user.name}. A lista de mensagens chega no próximo passo.")
-    }
-}
-
-@Composable
-private fun EspacoDasMensagens(titulo: String, texto: String) {
-    Column(Modifier.fillMaxSize().padding(32.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(titulo, style = Tipos.Titulo.copy(fontSize = 28.sp, lineHeight = 34.sp), textAlign = TextAlign.Center)
-        Spacer(Modifier.height(8.dp))
-        Text(texto, style = Tipos.CorpoApagado, textAlign = TextAlign.Center)
+fun TelaDeDm(estado: AppState, dm: Dm, aoMenu: () -> Unit, dados: DadosDaConversa, acoes: AcoesDaConversa, modifier: Modifier = Modifier) {
+    TelaDeConversa(estado, dm.channelId, "Conversar com @${dm.user.name}", aoMenu, dados, acoes, modifier) {
+        Avatar(dm.user.name, dm.user.id, 28.dp, dm.user.status.presenca(), Grafite.L2)
+        Spacer(Modifier.width(10.dp))
+        Text(dm.user.name, style = Tipos.Titulo.copy(fontSize = 20.sp, lineHeight = 26.sp), maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
 

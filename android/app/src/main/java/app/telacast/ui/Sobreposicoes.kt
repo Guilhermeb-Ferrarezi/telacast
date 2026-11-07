@@ -127,6 +127,8 @@ class AcoesDialogo(
     val aoTrocarModo: (criar: Boolean) -> Unit = {},
     val aoCriarCanal: (servidor: Long, nome: String, categoria: Boolean, pai: Long?) -> Unit = { _, _, _, _ -> },
     val aoConfirmarSaida: () -> Unit = {},
+    val aoApagarMensagem: (Long) -> Unit = {},
+    val aoBaixarAnexo: (app.telacast.proto.Attachment) -> Unit = {},
 )
 
 @Composable
@@ -135,6 +137,19 @@ fun DialogoAtual(d: Dialogo, a: AcoesDialogo) {
         is Dialogo.AdicionarServidor -> DialogoAdicionarServidor(d.criar, a)
         is Dialogo.CriarCanal -> DialogoCriarCanal(d, a)
         is Dialogo.Convidar -> DialogoConvidar(d.codigo, a.aoFechar)
+        is Dialogo.Imagem -> VisualizadorDeImagem(d.anexo, a.aoFechar) { a.aoBaixarAnexo(d.anexo) }
+        is Dialogo.Texto -> VisualizadorDeTexto(d.anexo, a.aoFechar) { a.aoBaixarAnexo(d.anexo) }
+        is Dialogo.ConfirmarApagar -> Janela("Apagar mensagem?", a.aoFechar) {
+            Text("Isso não pode ser desfeito.", style = Tipos.CorpoApagado)
+            Spacer(Modifier.height(12.dp))
+            Text(d.previa, style = Tipos.Corpo.copy(fontSize = 14.sp, color = Grafite.Texto2), maxLines = 3, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                modifier = Modifier.fillMaxWidth().background(Grafite.L2, Formas.Botao).border(1.dp, Grafite.Linha2, Formas.Botao).padding(12.dp))
+            Spacer(Modifier.height(18.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Botao("Cancelar", TipoBotao.Quieto, Modifier.weight(1f), aoClicar = a.aoFechar)
+                Botao("Apagar", TipoBotao.Perigo, Modifier.weight(1f), aoClicar = { a.aoApagarMensagem(d.mensagem) })
+            }
+        }
         Dialogo.ConfirmarSair -> Janela("Sair da conta?", a.aoFechar) {
             Text("Você vai precisar entrar de novo com seu usuário e senha.", style = Tipos.CorpoApagado)
             Spacer(Modifier.height(18.dp))

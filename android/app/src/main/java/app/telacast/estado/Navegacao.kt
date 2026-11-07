@@ -1,5 +1,7 @@
 package app.telacast.estado
 
+import app.telacast.proto.Attachment
+
 /** Para onde o centro da tela aponta. */
 sealed interface Destino {
     /** Início: amigos (e, na gaveta, as mensagens diretas). */
@@ -22,7 +24,15 @@ sealed interface Dialogo {
     data class CriarCanal(val servidor: Long, val categoria: Boolean = false, val pai: Long? = null) : Dialogo
     data class Convidar(val codigo: String) : Dialogo
     data object ConfirmarSair : Dialogo
+    data class ConfirmarApagar(val mensagem: Long, val previa: String) : Dialogo
+    /** Imagem de um anexo em tela cheia. */
+    data class Imagem(val anexo: Attachment) : Dialogo
+    /** Texto de um anexo em tela cheia. */
+    data class Texto(val anexo: Attachment) : Dialogo
 }
+
+/** Folha inferior de uma mensagem (toque longo); `emojis` mostra o seletor de reação. */
+data class FolhaDeMensagem(val mensagem: Long, val emojis: Boolean = false)
 
 /**
  * Estado de navegação do app, por conta própria (sem biblioteca de navegação). Imutável; cada função devolve o novo
@@ -36,6 +46,7 @@ data class Navegacao(
     val membrosAbertos: Boolean = false,
     val menu: MenuAberto? = null,
     val dialogo: Dialogo? = null,
+    val folha: FolhaDeMensagem? = null,
     val abaInicio: AbaInicio = AbaInicio.Disponivel,
 ) {
     fun abrirGaveta() = copy(gavetaAberta = true, membrosAbertos = false, menu = null)
@@ -57,16 +68,19 @@ data class Navegacao(
 
     fun abrirMenu(m: MenuAberto) = copy(menu = if (menu == m) null else m)
     fun fecharMenu() = copy(menu = null)
-    fun abrirDialogo(d: Dialogo) = copy(dialogo = d, menu = null)
+    fun abrirDialogo(d: Dialogo) = copy(dialogo = d, menu = null, folha = null)
+    fun abrirFolha(mensagem: Long, emojis: Boolean = false) = copy(folha = FolhaDeMensagem(mensagem, emojis), menu = null)
+    fun fecharFolha() = copy(folha = null)
     fun fecharDialogo() = copy(dialogo = null)
     fun escolherAba(a: AbaInicio) = copy(abaInicio = a)
 
     /** Algo que o botão Voltar do sistema fecha antes de sair do app? */
-    val podeVoltar: Boolean get() = dialogo != null || menu != null || membrosAbertos || gavetaAberta
+    val podeVoltar: Boolean get() = dialogo != null || folha != null || menu != null || membrosAbertos || gavetaAberta
 
-    /** Voltar do sistema: fecha, nesta ordem, diálogo, menu, painel de membros e gaveta. */
+    /** Voltar do sistema: fecha, nesta ordem, diálogo, folha, menu, painel de membros e gaveta. */
     fun voltar(): Navegacao = when {
         dialogo != null -> fecharDialogo()
+        folha != null -> fecharFolha()
         menu != null -> fecharMenu()
         membrosAbertos -> fecharMembros()
         gavetaAberta -> fecharGaveta()
