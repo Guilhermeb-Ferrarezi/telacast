@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Telacast — Grafite</title>
+<style>
+@font-face{font-family:"Inter";src:url("../../app/assets/fonts/Inter.ttf");font-weight:100 900}
+@font-face{font-family:"Newsreader";src:url("../../app/assets/fonts/Newsreader.ttf");font-weight:100 900}
+@font-face{font-family:"DM Sans";src:url("../../app/assets/fonts/DMSans.ttf");font-weight:100 900}
+@font-face{font-family:"Manrope";src:url("../../app/assets/fonts/Manrope.ttf");font-weight:100 900}
+@font-face{font-family:"IBM Plex Sans";src:url("../../app/assets/fonts/IBMPlexSans.ttf");font-weight:100 900}
+@font-face{font-family:"Geist";src:url("../../app/assets/fonts/Geist.ttf");font-weight:100 900}
+@font-face{font-family:"Fraunces";src:url("../../app/assets/fonts/Fraunces.ttf");font-weight:100 900}
+@font-face{font-family:"Instrument Serif";src:url("../../app/assets/fonts/InstrumentSerif.ttf");font-weight:100 900}
+@font-face{font-family:"Source Serif 4";src:url("../../app/assets/fonts/SourceSerif4.ttf");font-weight:100 900}
+@font-face{font-family:"JetBrains Mono";src:url("../../app/assets/fonts/JetBrainsMono.ttf");font-weight:100 900}
+:root{
+  /* camadas: só tom, sem brilho */
+  --l0:#0a0a0b; --l1:#101012; --l2:#151517; --l3:#1c1c1f; --l4:#252528;
+  --line:#242427; --line2:#303034;
+  --text:#ecebe7; --text2:#b7b5ae; --muted:#8a8882;
+  --amber:#e9b35e; --amber-ink:#1a1204;     /* único acento */
+  --ok:#74b98f;                              /* presença (semântica) */
+  --serif:"Newsreader",Georgia,serif; --sans:"Inter",system-ui,sans-serif;
+  --e:cubic-bezier(.2,.7,.2,1);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--l0);color:var(--text);font:14px/1.5 var(--sans);font-feature-settings:"tnum","cv11";overflow:hidden;
+  -webkit-font-smoothing:antialiased}
+button,input{font:inherit;color:inherit;border:0;background:none}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px;border-radius:6px}
+
+.app{height:100%;display:grid;grid-template-columns:68px 252px minmax(0,1fr) 236px}
+
+/* ---------- rail ---------- */
+.rail{background:var(--l0);display:flex;flex-direction:column;align-items:center;gap:8px;padding:14px 0;border-right:1px solid var(--line)}
+.mono{width:42px;height:42px;border-radius:12px;background:var(--l3);display:grid;place-items:center;font-weight:600;font-size:13px;
+  letter-spacing:.02em;color:var(--text2);position:relative;transition:background .16s var(--e),color .16s,border-radius .2s var(--e)}
+.mono:hover{background:var(--l4);color:var(--text)}
+.mono.on{background:var(--text);color:var(--l0);border-radius:14px}
+.mono .pip{position:absolute;right:-3px;top:-3px;width:10px;height:10px;border-radius:50%;background:var(--amber);border:2px solid var(--l0)}
+.rail .brand{font-family:var(--serif);font-size:23px;font-weight:500;color:var(--text);width:42px;height:42px;display:grid;place-items:center;
+  margin-bottom:4px;letter-spacing:-.02em}
+.hair{width:24px;height:1px;background:var(--line2);margin:4px 0}
+.rail .add{background:none;border:1px dashed var(--line2);color:var(--muted);font-size:18px;font-weight:300}
+.rail .add:hover{border-color:var(--text2);color:var(--text)}
+
+/* ---------- canais ---------- */
+.side{background:var(--l1);display:flex;flex-direction:column;border-right:1px solid var(--line);min-height:0}
+.sh{padding:18px 18px 12px}
+.sh h2{font-family:var(--serif);font-weight:500;font-size:22px;letter-spacing:-.01em;line-height:1.15}
+.sh p{color:var(--muted);font-size:12px;margin-top:3px}
+.sec{padding:14px 18px 6px;font-size:11px;font-weight:600;letter-spacing:.09em;color:var(--muted);text-transform:uppercase;display:flex;justify-content:space-between}
+.list{padding:0 10px;overflow:auto;flex:1}
+.ch{display:flex;align-items:center;gap:10px;height:34px;padding:0 10px;border-radius:8px;color:var(--text2);cursor:pointer;
+  transition:background .14s var(--e),color .14s}
+.ch i{font-style:normal;color:var(--muted);font-family:var(--serif);font-size:17px;width:12px;text-align:center}
+.ch:hover{background:var(--l2);color:var(--text)}
+.ch.on{background:var(--l3);color:var(--text)}
+.ch.unread{color:var(--text);font-weight:600}
+.ch .n{margin-left:auto;font-size:11px;font-weight:600;background:var(--amber);color:var(--amber-ink);border-radius:9px;padding:0 6px;line-height:17px}
+.ch .air{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:10px;font-weight:700;letter-spacing:.1em;color:var(--amber)}
+.air::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--amber);animation:air 2.4s ease-in-out infinite}
+@keyframes air{50%{opacity:.25}}
+.me{display:flex;align-items:center;gap:10px;padding:12px 14px;border-top:1px solid var(--line)}
+.me b{font-weight:600;font-size:13px;display:block;line-height:1.2}
+.me small{color:var(--muted);font-size:11px}
+.ibtn{margin-left:auto;width:32px;height:32px;border-radius:8px;display:grid;place-items:center;color:var(--muted);transition:background .14s,color .14s}
+.ibtn:hover{background:var(--l3);color:var(--text)}
+
+.av{flex:none;width:32px;height:32px;border-radius:50%;display:grid;place-items:center;font-weight:600;font-size:12.5px;
+  color:var(--c2);background:var(--c1);position:relative}
+.av.s{width:26px;height:26px;font-size:11px}.av.l{width:38px;height:38px;font-size:14px}
+.av .st{position:absolute;right:-1px;bottom:-1px;width:10px;height:10px;border-radius:50%;background:var(--muted);border:2px solid var(--l1)}
+.av.on .st{background:var(--ok)}
+.t1{--c1:#3b3548;--c2:#cfc6e6}.t2{--c1:#2f4540;--c2:#bfe0d6}.t3{--c1:#4a3a36;--c2:#e8cbbf}.t4{--c1:#33404f;--c2:#c3d4e8}.t5{--c1:#4b4530;--c2:#ead9a4}
+
+/* ---------- principal ---------- */
+.main{background:var(--l2);display:flex;flex-direction:column;min-width:0;min-height:0}
+.head{height:64px;flex:none;display:flex;align-items:center;gap:14px;padding:0 28px;border-bottom:1px solid var(--line)}
+.head h1{font-family:var(--serif);font-weight:500;font-size:24px;letter-spacing:-.015em}
+.head .topic{color:var(--muted);font-size:13px;padding-left:14px;border-left:1px solid var(--line2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sp{flex:1}
+.btn{height:36px;padding:0 16px;border-radius:9px;font-weight:600;font-size:13px;transition:background .14s,transform .1s,border-color .14s}
+.btn:active{transform:translateY(1px)}
+.btn.p{background:var(--amber);color:var(--amber-ink)}
+.btn.p:hover{background:#f0c070}
+.btn.o{box-shadow:inset 0 0 0 1px var(--line2);color:var(--text2)}
+.btn.o:hover{background:var(--l3);color:var(--text)}
+
+/* palco da transmissão */
+.stage{flex:none;overflow:hidden;max-height:0;transition:max-height .42s var(--e);border-bottom:1px solid var(--line)}
+.stage.open{max-height:380px}
+.sbox{padding:20px 28px;display:grid;grid-template-columns:1fr;gap:12px}
+.screen{position:relative;aspect-ratio:16/8.2;max-height:290px;width:100%;background:var(--l0);border:1px solid var(--line2);border-radius:10px;overflow:hidden}
+.screen .win{position:absolute;background:var(--l2);border:1px solid var(--line2);border-radius:6px}
+.screen .win b{display:block;height:14px;border-bottom:1px solid var(--line2);background:var(--l3)}
+.screen .ln{position:absolute;height:5px;border-radius:2px;background:var(--l4)}
+.tag{position:absolute;left:14px;top:14px;display:flex;align-items:center;gap:8px;background:var(--amber);color:var(--amber-ink);
+  font-size:11px;font-weight:700;letter-spacing:.1em;padding:4px 9px;border-radius:5px}
+.tag::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--amber-ink);animation:air 2.4s ease-in-out infinite}
+.meta{display:flex;align-items:center;gap:16px;font-size:12px;color:var(--muted)}
+.meta b{color:var(--text);font-weight:600;font-size:13px}
+.meta span{font-variant-numeric:tabular-nums;font-family:ui-monospace,"JetBrains Mono",monospace;font-size:11.5px;letter-spacing:-.01em}
+
+/* mensagens */
+.msgs{flex:1;overflow:auto;padding:8px 0 12px;min-height:0;scroll-behavior:smooth}
+.day{display:flex;align-items:center;gap:14px;padding:18px 28px 8px;color:var(--muted);font-family:var(--serif);font-style:italic;font-size:14px}
+.day::before,.day::after{content:"";height:1px;background:var(--line);flex:1}
+.m{position:relative;display:grid;grid-template-columns:38px 1fr;gap:14px;padding:6px 28px;animation:in .28s var(--e) both}
+.m:hover{background:rgba(255,255,255,.018)}
+.m.g{padding-top:1px;padding-bottom:1px}
+.m.g .av{visibility:hidden;height:0}
+.m .who{display:flex;align-items:baseline;gap:10px}
+.m .who b{font-weight:600;font-size:14px}
+.m .who time{color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums}
+.m p{color:var(--text2);font-size:14.5px;line-height:1.55;max-width:70ch}
+.m .tools{position:absolute;right:28px;top:-14px;display:flex;background:var(--l3);border:1px solid var(--line2);border-radius:8px;opacity:0;transform:translateY(3px);
+  transition:opacity .12s,transform .12s var(--e);pointer-events:none}
+.m:hover .tools{opacity:1;transform:none;pointer-events:auto}
+.tools button{height:28px;padding:0 10px;font-size:12px;color:var(--text2);transition:background .12s,color .12s}
+.tools button:hover{background:var(--l4);color:var(--text)}
+.tools button+button{border-left:1px solid var(--line2)}
+@keyframes in{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.swap{animation:swap .22s var(--e)}@keyframes swap{from{opacity:.0}to{opacity:1}}
+
+.compose{flex:none;padding:0 28px 22px}
+.box{display:flex;align-items:center;background:var(--l3);border:1px solid var(--line2);border-radius:12px;padding:0 6px 0 16px;height:50px;
+  transition:border-color .16s,background .16s}
+.box:focus-within{border-color:var(--amber);background:var(--l3)}
+.box input{flex:1;height:100%;outline:0}
+.box input::placeholder{color:var(--muted)}
+.box kbd{font:500 11px var(--sans);color:var(--muted);border:1px solid var(--line2);border-radius:5px;padding:1px 6px;margin-right:8px}
+
+/* ---------- membros ---------- */
+.members{background:var(--l1);border-left:1px solid var(--line);overflow:auto;padding:6px 10px}
+.mem{display:flex;align-items:center;gap:10px;height:42px;padding:0 10px;border-radius:8px;color:var(--text2);cursor:pointer;transition:background .14s}
+.mem:hover{background:var(--l2);color:var(--text)}
+.mem.off{color:var(--muted)}.mem.off .av{opacity:.55}
+.mem em{margin-left:auto;font-style:normal;font-family:var(--serif);font-size:12.5px;color:var(--amber)}
+
+/* ---------- legenda ---------- */
+.legend{position:fixed;left:50%;bottom:10px;transform:translateX(-50%);z-index:9;display:flex;gap:18px;align-items:center;font-size:12px;color:var(--muted);
+  background:var(--l1);border:1px solid var(--line2);padding:7px 16px;border-radius:999px}
+.legend label{cursor:pointer;display:flex;gap:6px;align-items:center}
+select{background:var(--l3);color:var(--text);border:1px solid var(--line2);border-radius:6px;padding:3px 6px;font:12px var(--sans)}
+.sw{display:inline-flex;gap:3px}.sw i{width:12px;height:12px;border-radius:3px;border:1px solid var(--line2)}
+@media (prefers-reduced-motion:reduce),(.reduce){*{animation:none!important;transition:none!important}}
+.reduce *{animation:none!important;transition:none!important}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="rail" aria-label="Servidores">
+    <div class="brand">t</div>
+    <button class="mono" title="Mensagens diretas" aria-label="Mensagens diretas">DM<span class="pip"></span></button>
+    <div class="hair"></div>
+    <button class="mono on" title="Casa" aria-label="Casa">Ca</button>
+    <button class="mono" title="Jogos" aria-label="Jogos">Jo</button>
+    <button class="mono" title="Estudo" aria-label="Estudo">Es</button>
+    <button class="mono add" title="Adicionar servidor" aria-label="Adicionar servidor">+</button>
+  </nav>
+
+  <aside class="side" aria-label="Canais">
+    <div class="sh"><h2>Casa</h2><p>3 membros · 2 online</p></div>
+    <div class="sec"><span>Canais</span><span style="cursor:pointer">+</span></div>
+    <div class="list" id="chans"></div>
+    <div class="me">
+      <div class="av on t2">A<span class="st"></span></div>
+      <div><b>ana</b><small>Online</small></div>
+      <button class="ibtn" title="Configurações" aria-label="Configurações">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg>
+      </button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="head">
+      <h1 id="title">geral</h1><span class="topic" id="topic">Conversa geral da casa</span><span class="sp"></span>
+      <button class="btn o" id="watch">Assistir</button>
+      <button class="btn p">Ao vivo</button>
+    </header>
+
+    <section class="stage" id="stage" aria-label="Transmissão">
+      <div class="sbox">
+        <div class="screen">
+          <div class="win" style="left:5%;top:14%;width:56%;height:70%"><b></b>
+            <div class="ln" style="left:6%;top:30%;width:60%"></div><div class="ln" style="left:6%;top:42%;width:44%"></div>
+            <div class="ln" style="left:6%;top:54%;width:72%"></div><div class="ln" style="left:6%;top:66%;width:38%"></div></div>
+          <div class="win" style="left:48%;top:30%;width:44%;height:58%;background:#1a1a1d"><b></b>
+            <div class="ln" style="left:8%;top:34%;width:70%"></div><div class="ln" style="left:8%;top:50%;width:50%"></div></div>
+          <span class="tag">AO VIVO</span>
+        </div>
+        <div class="meta"><b>beto</b><span>1920×1080</span><span>60 fps</span><span>H.264 · NVENC</span><span>7,9 Mbps</span><span class="sp"></span>
+          <button class="btn o" style="height:30px;padding:0 12px" id="close">Fechar</button></div>
+      </div>
+    </section>
+
+    <div class="msgs" id="msgs"></div>
+
+    <form class="compose" id="f">
+      <div class="box"><input id="i" autocomplete="off" placeholder="Escreva em geral" aria-label="Mensagem"><kbd>Enter</kbd>
+        <button class="btn p" type="submit" style="height:38px">Enviar</button></div>
+    </form>
+  </main>
+
+  <aside class="members" aria-label="Membros">
+    <div class="sec" style="padding-left:10px">Online — 2</div>
+    <div class="mem"><div class="av on t2 s">A<span class="st"></span></div>ana<em>dona</em></div>
+    <div class="mem"><div class="av on t3 s">B<span class="st"></span></div>beto</div>
+    <div class="sec" style="padding-left:10px">Offline — 1</div>
+    <div class="mem off"><div class="av t4 s">C<span class="st"></span></div>carla</div>
+  </aside>
+</div>
+
+<div class="legend">
+  <span class="sw" title="camadas"><i style="background:#0a0a0b"></i><i style="background:#101012"></i><i style="background:#151517"></i><i style="background:#1c1c1f"></i><i style="background:#252528"></i></span>
+  <span class="sw" title="acento"><i style="background:#e9b35e"></i></span>
+  <label>Títulos <select id="ft"></select></label>
+  <label>Texto <select id="fb"></select></label>
+  <label><input type="checkbox" id="rm"> reduzir movimento</label>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const T={ana:'t2',beto:'t3',carla:'t4'};
+const chans=[['geral','Conversa geral da casa',0,true],['jogos','Planos para a noite',2,false],['música','Playlists e achados',0,false],['avisos','Só o essencial',0,false]];
+const data={
+  'geral':[['ana','12:04','Bom dia. Quem vai testar a transmissão hoje?'],['beto','12:05','Eu. Já estou ao vivo aqui no canal.'],['beto','12:05','Está em 1080p a 60, o NVENC dá conta tranquilo.'],['carla','12:07','Entrando agora, me esperem.']],
+  'jogos':[['carla','11:40','Alguém joga hoje à noite?'],['ana','11:42','Eu entro depois das 20h.'],['beto','11:50','Combinado. Levo o mapa novo.']],
+  'música':[['beto','10:15','Essa playlist ficou perfeita para trabalhar.'],['beto','10:16','Mandei o link no privado.']],
+  'avisos':[['ana','09:00','O servidor entra em manutenção no domingo, às 3h.']]
+};
+let cur='geral';
+const ini=n=>n[0].toUpperCase();
+function row(m,prev){
+  const g=prev&&prev[0]===m[0];
+  return `<div class="m ${g?'g':''}"><div class="av l ${T[m[0]]}">${ini(m[0])}</div><div>${g?'':`<div class="who"><b>${m[0]}</b><time>${m[1]}</time></div>`}<p>${m[2]}</p></div>
+  <div class="tools"><button>Responder</button><button>Reagir</button><button>···</button></div></div>`;
+}
+function render(){
+  $('#chans').innerHTML=chans.map(([n,,u,l])=>`<div class="ch ${n===cur?'on':''} ${u&&n!==cur?'unread':''}" data-c="${n}"><i>#</i>${n}${l?'<span class="air">AO VIVO</span>':(u&&n!==cur?`<span class="n">${u}</span>`:'')}</div>`).join('');
+  document.querySelectorAll('.ch').forEach(e=>e.onclick=()=>{cur=e.dataset.c;chans.find(c=>c[0]===cur)[2]=0;render()});
+  $('#title').textContent=cur;$('#topic').textContent=chans.find(c=>c[0]===cur)[1];$('#i').placeholder='Escreva em '+cur;
+  const m=$('#msgs');m.innerHTML='<div class="day">hoje</div>'+data[cur].map((x,i)=>row(x,data[cur][i-1])).join('');
+  m.classList.remove('swap');void m.offsetWidth;m.classList.add('swap');m.scrollTop=1e9;
+}
+$('#watch').onclick=()=>$('#stage').classList.toggle('open');
+$('#close').onclick=()=>$('#stage').classList.remove('open');
+$('#f').onsubmit=e=>{e.preventDefault();const v=$('#i').value.trim();if(!v)return;
+  const d=new Date(),t=d.getHours()+':'+String(d.getMinutes()).padStart(2,'0');
+  const x=['ana',t,v.replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))],prev=data[cur].at(-1);
+  data[cur].push(x);$('#msgs').insertAdjacentHTML('beforeend',row(x,prev));$('#msgs').scrollTop=1e9;$('#i').value=''};
+$('#rm').onchange=e=>document.body.classList.toggle('reduce',e.target.checked);
+const TIT=['Newsreader','Fraunces','Instrument Serif','Source Serif 4','Inter','Manrope','Geist','DM Sans','JetBrains Mono'];
+const BODY=['Inter','Geist','DM Sans','Manrope','IBM Plex Sans','JetBrains Mono'];
+const fill=(el,list,cur)=>{el.innerHTML=list.map(n=>`<option ${n===cur?'selected':''}>${n}</option>`).join('')};
+fill($('#ft'),TIT,'Newsreader');fill($('#fb'),BODY,'Inter');
+const mono=n=>n==='JetBrains Mono'?'ui-monospace,monospace':(['Newsreader','Fraunces','Instrument Serif','Source Serif 4'].includes(n)?'Georgia,serif':'system-ui,sans-serif');
+$('#ft').onchange=e=>document.documentElement.style.setProperty('--serif',`"${e.target.value}",${mono(e.target.value)}`);
+$('#fb').onchange=e=>document.documentElement.style.setProperty('--sans',`"${e.target.value}",${mono(e.target.value)}`);
+render();setTimeout(()=>$('#stage').classList.add('open'),500);
+</script>
+</body>
+</html>

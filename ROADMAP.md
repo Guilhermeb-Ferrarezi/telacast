@@ -1,0 +1,183 @@
+# Telacast — Roadmap
+
+Clone próprio do Discord em Rust: cliente egui, servidor axum + SQLite, vídeo H.264 por NVENC.
+Não usa a API nem os servidores do Discord. Este roadmap sai de 10 relatórios de pesquisa em
+[`docs/discord/`](docs/discord/) (01 a 10), lidos e consolidados em 2026-11-07.
+
+## Como ler
+
+- **Esforço relativo** (não é prazo): **S** pequeno (cabe numa sessão), **M** médio (servidor + cliente), **L** grande (várias sessões ou muda o modelo de dados).
+- **[R07]** = relatório 07, e assim por diante. Itens com **[minha decisão]** são ordenação ou sugestão minha, não do relatório.
+- **Atenção às fontes:** vários relatórios foram escritos de memória, porque as páginas de suporte do Discord devolveram 403/404 e o cliente instalado só foi listado. O que é *número do Discord* (limites, níveis, atalhos, hexadecimais) está na seção "A confirmar" e **não deve virar requisito sem checar**. As decisões de produto abaixo não dependem desses números.
+
+## Onde estamos
+
+| Área | Já existe |
+|---|---|
+| Contas | cadastro/login (argon2), token de sessão, sessão salva no app |
+| Servidores | criar, convite por código, entrar, canais de texto (só o dono cria), membros online/offline |
+| Chat | mensagens em tempo real, histórico das últimas 50, agrupamento por autor, não lido em negrito |
+| Social | amigos (pedir/aceitar/remover), DMs 1:1, presença online/offline |
+| Vídeo | transmissão de tela por canal: captura X11, NVENC (231 fps medidos em 1080p), relay por WebSocket, fallback openh264 |
+| Interface | tema escuro estilo Discord, barra de servidores, canais, membros, login, modais |
+
+Lacunas grandes: **sem áudio, sem TLS, sem cargos/permissões, sem moderação, sem editar/apagar mensagem, sem reconexão automática.**
+
+## Mapa de dependências
+
+```
+Fase 0 (fundação) ──► Fase 1 (chat) ──► Fase 2 (voz)
+        │                  │
+        │                  └──► Fase 3 (cargos e moderação) ──► Fase 4 (social/UX/sistema)
+        └──► [Marco A: pode expor na internet]                    └──► Fase 5 (extensibilidade)
+```
+
+Cargos (Fase 3) bloqueiam moderação, canais privados e papéis de voz/palco. Voz (Fase 2) **não** depende de cargos,
+então dá para trocar as fases 2 e 3 se você quiser falar antes de moderar (ver "Decisões em aberto").
+
+---
+
+## Fase 0 — Fundação: segurança, robustez e modelo de dados
+
+Pré-requisito para tudo. Os itens de segurança são obrigatórios **antes de expor o servidor fora do localhost** ([R07]).
+
+### 0.1 Decidir o modelo de dados agora (ainda não há dados reais, migrar depois custa caro)
+- [ ] **IDs estilo snowflake** (ms | nó | seq, gerado no servidor) em todas as tabelas, **mantendo `i64`** (cabe em 63 bits; string no JSON só se um dia houver cliente web) — [R06] P2, **[minha decisão]: fazer já**, porque sem dados reais não há migração. Fica pequeno: um gerador no servidor no lugar do `AUTOINCREMENT`. **S**
+- [ ] **`display_name` separado do `username`** — [R01] P0, base de identidade. **S**
+- [ ] `channels` ganha `kind` (texto/voz/anúncio/palco) e `parent_id` (categorias); DM vira canal com tabela `channel_members` (prepara DM em grupo) — [R02][R05]. **M**
+- [ ] Tabelas já previstas: `read_state`, `roles`, `member_roles`, `channel_overwrites`, `bans`, `invites`, `audit` — criar o esquema junto, usar nas fases seguintes. **S**
+
+### 0.2 Segurança (auditoria do servidor, 19 riscos em [R07])
+- [ ] **TLS (`wss://`)**: proxy reverso (Caddy) na frente do servidor; cliente com TLS (rustls) e que recuse `ws://` fora de localhost. P0 **M**
+- [ ] **Rate limit** por IP e por conta (login/cadastro, `Send`, `JoinServer`, pedidos de amizade) e **Argon2 em `spawn_blocking`** com semáforo + hash falso para usuário inexistente. P0 **M**
+- [ ] **Tokens**: guardar só o hash, expiração, `Logout`, revogar ao trocar senha, lista de sessões; **tirar o token da URL do vídeo** (ticket de uso único). P0 **M** ([R07]+[R01])
+- [ ] **Cadastro fechado — decidido: só entra quem tem convite** (por enquanto). O `Register` passa a exigir um **código de convite da instância** (128 bits, com expiração e limite de usos, revogável), gerado pelo operador do servidor por linha de comando (`telacast-server invite`), o que também resolve a criação da primeira conta. Os convites de *servidor* (guild) também passam a 128 bits. P1 **S**
+- [ ] **Limites**: conexões por IP, ping/idle timeout, canal limitado no lugar de `unbounded_channel`, tamanho máximo de quadro de vídeo, limites de servidores/canais por usuário. P1 **M**
+- [ ] Nomes de usuário: restringir Unicode (homóglifos). P2 **S**
+
+### 0.3 Protocolo ([R06])
+- [ ] **Heartbeat + ACK** e derrubar conexões zumbi (corrige "online" falso). P0 **S**
+- [ ] **Reconexão automática** com backoff e banner na UI. P0 **S**
+- [ ] **`nonce`** no envio, deduplicação e mensagem otimista. P0 **S**
+- [ ] **`ErrorCode` estáveis** + variante `Unknown` nos enums (cliente antigo não quebra). P0 **S**
+- [ ] **`PROTO_VERSION`** no login. P1 **S**
+- [ ] **`seq` nos eventos + Resume** com buffer; re-sync por `after`. P1 **M**
+- [ ] Testes automáticos do servidor (hoje só o script manual que usei) — **[minha decisão]** **S/M**
+
+### 0.4 Cliente ([R09])
+- [ ] **Token no keyring** do sistema (hoje está em texto no arquivo do app), diretórios XDG, log em arquivo, panic hook. P0 **S**
+- [ ] **Instância única**. P0 **S**
+
+**Marco A — pode expor na internet** quando 0.2 e 0.3 (P0/P1) estiverem prontos. Aí vale o plano da VPS da Oracle (Caddy + systemd + DuckDNS + backup do `.db`).
+
+---
+
+## Fase 1 — Chat completo
+
+- [ ] **Eventos incrementais** no lugar do Snapshot completo (`MessageUpdate/Delete`, `ChannelCreate…`, `MemberAdd…`, `PresenceUpdate`), começando por presença e mensagens; manter `RequestSnapshot` como válvula. P2 do [R06], mas **[minha decisão]: já aqui**, porque editar/apagar precisam de eventos e o Snapshot atual amplifica carga ([R07] #12). **L**
+- [ ] **Editar e excluir** as próprias mensagens, com "(editado)". P0 **S** ([R03])
+- [ ] **Paginação ao rolar** (`before`) e `after`/`around`. P0 **S**
+- [ ] **Não lidos de verdade**: `last_read` no servidor, contagem de menções, divisor "novas mensagens". P0 **M** ([R03][R05][R10])
+- [ ] **Markdown básico** (negrito, itálico, código, bloco, citação, link, spoiler). P0 **M–L** (parser + layout rico em egui)
+- [ ] **Base de UI**: tokens de tema, modal padronizado (Esc/clique fora/confirmação destrutiva), **menus de contexto**, **barra de ações ao passar o mouse**. P0 **M** ([R10])
+- [ ] **Menções** `@usuário`/`#canal` com autocomplete e destaque. P1 **M**
+- [ ] **Respostas** com prévia e pular para a mensagem. P1 **M**
+- [ ] **"Digitando…"**, **fixadas**, mensagens de sistema (entrou/fixou). P1 **S** cada
+- [ ] **Reações** com emoji Unicode. P1 **M**
+- [ ] **Busca** com FTS5 do SQLite e filtros `from:`/`in:`/`has:`. P1 **M**
+- [ ] **Anexos**: upload por HTTP (não pelo WebSocket), armazenamento por hash, prévia inline, arrastar-e-soltar, colar imagem. P1 **L** ([R03][R06][R09])
+- [ ] Prévia de link (cuidado com SSRF), emoji Unicode no picker. P2 **M**
+
+## Fase 2 — Voz (maior lacuna do produto)
+
+Proposta do [R04]: começar simples, trocar o transporte depois.
+
+- [ ] **Canal de voz**: modelo, entrar/sair, lista de participantes, `voice_state` no servidor. P0 **M**
+- [ ] **Áudio Opus pelo WebSocket atual** (`cpal` + Opus + jitter buffer + mixagem), com o mesmo formato de quadro que um UDP futuro usaria. P0 **M**
+- [ ] **Mudo, ensurdecer, indicador de fala** (VAD por energia). P0 **S**
+- [ ] **Volume por usuário**, seleção de dispositivos, push-to-talk dentro da janela. P1 **S**
+- [ ] **Áudio do sistema na transmissão de tela** (monitor do PipeWire/Pulse → Opus como 2º fluxo). P1 **M**
+- [ ] **Presets de qualidade** (720p30, 1080p60, fonte) mapeados nos parâmetros do NVENC. P1 **S**
+- [ ] P2: **UDP com fallback para WS** (**L**), supressão de ruído `nnnoiseless` e eco (**M**), câmera V4L2 (**M**), canal de palco (**M**)
+- [ ] P3: `webrtc-rs`, E2EE (MLS ou chave por sala), limites por plano, atalho global no Wayland
+
+## Fase 3 — Cargos, permissões e moderação
+
+Prioridade máxima do [R02]; moderação do [R07].
+
+- [ ] **Cargos + `@everyone` + bitfield u64 + `compute_permissions(member, canal)`** único e **com testes**. P0 **L**
+- [ ] **Hierarquia** e regra "só concede o que tem" (sem isso é falha de segurança). P0 **M**
+- [ ] **Categorias** e **canais privados** (overrides por canal/categoria). P0 **M**
+- [ ] **Sair, editar e excluir servidor**, transferir propriedade. P0 **S**
+- [ ] **Kick e ban** (tabela `bans` checada no `JoinServer`), lista de banidos, **revalidar acesso nas transmissões ao expulsar**. P1 **M** ([R07] #8, #10)
+- [ ] **Convites avançados**: expiração, usos máximos, revogar, listar. P1 **M**
+- [ ] **UI**: editor de cargos (permissões tri-estado), atribuir cargos, lista de membros por cargo e cor, overrides por canal, filtro de membros por `VIEW_CHANNEL`. P1 **L**
+- [ ] **Timeout**, **log de auditoria** (retenção ~45 dias), **denúncia ao dono**, **slow mode**, apelidos. P2 **M**
+- [ ] P3: AutoMod simples (palavras, anti-flood), verificação de e-mail, filtro de mídia (só quando houver anexos de terceiros)
+
+## Fase 4 — Social, perfil, interface e sistema
+
+**Social ([R05])**
+- [ ] P0: **status manual** (online/ausente/não perturbe/invisível) e ausente automático; **bloquear usuário**. **S / M**
+- [ ] P1: silenciar servidor/canal/DM, **notificação desktop + som** respeitando DND, abas Bloqueados/busca em amigos. **S–M**
+- [ ] P2: **DM em grupo**, status personalizado, níveis de notificação, privacidade (quem me adiciona/manda DM), ignorar. **S–L**
+- [ ] P3: chamadas em DM (depende da Fase 2), atividade/rich presence, sugestões de amigos
+
+**Perfil ([R01])**
+- [ ] P0: **upload de avatar** (usa o armazenamento da Fase 1), lista de sessões (já na 0.2). **M**
+- [ ] P1: bio, pronomes, banner, cor de destaque e **cartão de perfil**; troca de senha; recuperação de senha por e-mail (exige SMTP). **S–M**
+- [ ] P2: **2FA TOTP**, apelido por servidor, **exportar dados e excluir conta** (LGPD), nota privada. **S–M**
+
+**Interface ([R10])**
+- [ ] P0: **tela de Configurações** (Minha conta, Aparência, Notificações, Voz, Sair). **M**
+- [ ] P1: **Ctrl+K (Quick Switcher)**, popout de perfil, **temas claro e AMOLED**, zoom e tamanho de fonte, atalhos básicos. **S–M**
+- [ ] P2: busca com filtros na UI, modo compacto, pastas de servidores e arrastar para reordenar, onboarding e estados vazios, acessibilidade (AccessKit, alto contraste). **S–L**
+- [ ] P3: i18n, atalhos remapeáveis, "modo desenvolvedor".
+
+**Sistema ([R09])**
+- [ ] P1: **bandeja + fechar para a bandeja**, **notificações nativas**, **atalhos globais no X11** (mutar, PTT), arrastar-e-soltar. **S–M**
+- [ ] P2: detecção de jogo por `/proc` ("Jogando X"), autostart, **deep link `telacast://`** para convites, aviso de nova versão, ausente automático por suspensão. **S–M**
+- [ ] P3: RPC local `telacast-ipc`, janela de overlay flutuante, auto-update assinado, atalhos no Wayland. **M–L**
+- Arquitetura: manter captura + NVENC em thread/processo auxiliar, para uma falha do driver não derrubar a UI ([R09]).
+
+## Fase 5 — Extensibilidade ([R08])
+
+- [ ] **Webhooks de entrada** (+ embeds simples) — P1 **S**, retorno imediato (CI, scripts, RSS)
+- [ ] **Contas de bot + token** (mostrado uma vez, só o hash no banco), API documentada e crate cliente `telacast-bot` — P1 **M**
+- [ ] **Emoji customizado por servidor**, Rich Presence simples — P2 **M / S**
+- [ ] **Slash commands** (picker `/`, interações com prazo de 3 s) — P2 **L**
+- [ ] Botões, menus e modais — P3 **L**
+
+---
+
+## Fora do escopo (decisão: não fazer por enquanto)
+
+- **Usar a API, a conta ou os servidores do Discord**, incluindo logar com conta de usuário de terceiros (viola os Termos e arrisca o banimento de quem usar). Decidimos fazer o nosso.
+- Nitro/boost/monetização, descoberta pública, parceiro/verificado, insights.
+- Activities, Social SDK, App Directory, integrações Twitch/YouTube/Spotify, OAuth2 de terceiros.
+- Passkeys/WebAuthn, MFA por SMS, conexões externas, badges do Discord.
+- Sharding, formato ETF, opcodes numéricos (mantemos enums Rust tipados).
+- Fundo virtual, NDI, clips, overlay injetado em jogos, E2EE por MLS (TLS + servidor confiável bastam por ora).
+
+## Decisões em aberto (precisam de você)
+
+1. **Ordem:** voz antes de cargos (como está) ou cargos antes? Voz não depende de cargos.
+2. **Opus no Linux:** o crate `opus` exige a `libopus` do sistema (`sudo apt install`). Você prefere Rust "puro" sem pacotes do sistema; alternativa é `audiopus_sys` compilando a partir da fonte (precisa de cmake). Qual caminho?
+3. **Anexos:** onde guardar (pasta local do servidor, hash de conteúdo) e qual limite de tamanho.
+4. ~~**Cadastro:**~~ **decidido:** fechado, só com convite da instância (por enquanto).
+5. ~~**Snowflake agora?**~~ **decidido:** sim, mantendo `i64`.
+
+## A confirmar antes de virar requisito (vieram de memória, não de documentação lida)
+
+Limites e números do Discord: tamanho de bio e de status, quantidade de códigos de backup, prazo de exclusão de conta
+([R01]); níveis de boost, limites de emoji e requisitos de Comunidade ([R02]); tamanho máximo de mensagem e de upload ([R03]);
+limites de Stage, tabela Nitro/boost, detalhes de Krisp e VAD ([R04]); regras de bloqueio, privacidade e notificações ([R05]);
+limites de taxa e tamanhos do gateway ([R06]); denúncias, raids e níveis de verificação ([R07]); todo o conteúdo de [R08]
+(a documentação não foi baixada); hexadecimais, larguras e atalhos de [R10]. Não afetam as decisões de produto acima, só
+os números de implementação.
+
+## Observações sobre os relatórios
+
+- [R07] lista 19 riscos do nosso servidor, com arquivo e linha. As linhas podem ter mudado desde a leitura; conferir ao corrigir.
+- [R05] e [R03] checaram o que já temos por `grep` em `proto/src/lib.rs`, sem revisar o app inteiro; a tabela "Onde estamos" acima foi conferida contra o que construímos.
+- [R09] e [R04] usaram só nomes de símbolos e strings do cliente do Discord; nada foi decompilado.

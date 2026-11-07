@@ -1,0 +1,17 @@
+[package]
+name = "telacast"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.104"
+eframe = { version = "0.37.0", features = ["persistence"] }
+egui = "0.37.0"
+openh264 = "0.9.9"
+tungstenite = "0.30.0"
+x11rb = { version = "0.14.0", features = ["randr"] }
+nvidia-video-codec-sdk = { path = "../vendor/nvidia-video-codec-sdk" }
+cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12080"] }
+telacast-proto = { version = "0.1.0", path = "../proto" }
+serde_json = "1.0.154"
+chrono = "0.4.45"
