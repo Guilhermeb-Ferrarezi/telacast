@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -32,6 +33,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -92,6 +95,17 @@ fun TelaPrincipal(
         val larguraMembros = minOf(280.dp, maxWidth - 56.dp)
         val pxGaveta = with(LocalDensity.current) { larguraGaveta.toPx() }
         val limiarPx = with(LocalDensity.current) { 48.dp.toPx() }
+
+        // Abrir a gaveta ou o painel de membros fecha o teclado e tira o foco do compositor (senão o teclado
+        // ficava por cima da gaveta e escondia o cartão do usuário).
+        val foco = LocalFocusManager.current
+        val teclado = LocalSoftwareKeyboardController.current
+        LaunchedEffect(nav.gavetaAberta, nav.membrosAbertos) {
+            if (nav.gavetaAberta || nav.membrosAbertos) {
+                foco.clearFocus()
+                teclado?.hide()
+            }
+        }
 
         val alvoEsq = if (nav.gavetaAberta) 1f else 0f
         val alvoDir = if (nav.membrosAbertos) 1f else 0f
