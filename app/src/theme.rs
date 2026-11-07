@@ -327,7 +327,7 @@ pub fn small_button(ui: &mut Ui, label: &str, fill: Color32) -> bool {
 /// Item da barra de servidores: quadrado arredondado de 40 px com a sigla, e uma pílula
 /// encostada na borda esquerda do painel (8 não lido, 20 hover, 40 selecionado).
 /// Hover e selecionado pintam o fundo de âmbar. `add` desenha o botão "adicionar" (só contorno).
-pub fn rail_item(ui: &mut Ui, label: &str, selected: bool, unread: bool, add: bool) -> Response {
+pub fn rail_item(ui: &mut Ui, label: &str, selected: bool, unread: bool, add: bool, badge: u32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click());
     let hov = anim(ui, resp.id.with("h"), resp.hovered() || selected, 0.15);
     let target = if selected { 40.0 } else if resp.hovered() { 20.0 } else if unread { 8.0 } else { 0.0 };
@@ -352,8 +352,33 @@ pub fn rail_item(ui: &mut Ui, label: &str, selected: bool, unread: bool, add: bo
         let size = [18.0, 18.0, 16.0, 16.0, 14.0, 12.0, 10.0][n.clamp(1, 7) - 1];
         p.text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(size), lerp(TEXT2, AMBER_INK, ease_out(hov)));
     }
+    if badge > 0 {
+        badge_pill(ui.painter(), rect.right_bottom() - vec2(2.0, 2.0), badge, L0);
+    }
     hand(ui, &resp);
     resp
+}
+
+/// Selo âmbar com a contagem (mínimo 16 px), ancorado pelo canto inferior direito; `ring` é o contorno.
+pub fn badge_pill(p: &egui::Painter, corner: egui::Pos2, n: u32, ring: Color32) {
+    let text = if n > 99 { "99+".to_string() } else { n.to_string() };
+    let w = if n < 10 { 16.0 } else if n < 100 { 22.0 } else { 28.0 };
+    let r = Rect::from_min_max(corner - vec2(w, 16.0), corner);
+    p.rect_filled(r.expand(2.0), 10.0, ring);
+    p.rect_filled(r, 8.0, AMBER);
+    p.text(r.center(), Align2::CENTER_CENTER, text, FontId::proportional(11.0), AMBER_INK);
+}
+
+/// Linha "NOVAS MENSAGENS": filete âmbar com uma etiqueta na ponta direita.
+pub fn new_messages_divider(ui: &mut Ui) -> Rect {
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+    let p = ui.painter();
+    p.hline(r.x_range(), r.center().y, Stroke::new(1.0, alpha(AMBER, 0.55)));
+    let g = p.layout_no_wrap("NOVAS MENSAGENS".to_string(), FontId::proportional(10.5), AMBER_INK);
+    let tag = Rect::from_min_size(egui::pos2(r.right() - g.size().x - 14.0, r.center().y - 8.0), vec2(g.size().x + 14.0, 16.0));
+    p.rect_filled(tag, 8.0, AMBER);
+    p.galley(tag.center() - g.size() / 2.0, g, AMBER_INK);
+    r
 }
 
 /// Seta de categoria: aponta para baixo (aberta) ou para a direita (recolhida).

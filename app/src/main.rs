@@ -134,6 +134,10 @@ struct Session {
     revealed: HashSet<(i64, u32)>,
     /// Já avisei o servidor que estou parado?
     idle_sent: bool,
+    /// Menções ainda não lidas por canal (do snapshot, mais as que chegam com o canal fechado).
+    mentions: HashMap<i64, u32>,
+    /// Divisor "novas mensagens": (canal, último id lido ao abrir, já rolei até ele).
+    marker: Option<(i64, i64, bool)>,
     /// Canais com uma página de mensagens antigas a caminho.
     older: HashSet<i64>,
     /// Canais que ainda têm mensagens mais antigas no servidor (a última página veio cheia).
@@ -211,6 +215,8 @@ impl Session {
             nonce_seq: 0,
             revealed: HashSet::new(),
             idle_sent: false,
+            mentions: HashMap::new(),
+            marker: None,
             older: HashSet::new(),
             has_more: HashMap::new(),
             jump_wanted: None,
@@ -236,7 +242,19 @@ impl Session {
             View::Chan { channel, .. } => Some(*channel),
         };
         if let Some(ch) = ch {
+            // onde eu tinha parado de ler (para o divisor), antes de marcar como lido
+            let (last, read) = self
+                .snap
+                .servers
+                .iter()
+                .flat_map(|s| s.channels.iter())
+                .find(|c| c.id == ch)
+                .map(|c| (c.last_message_id, c.last_read_id))
+                .or_else(|| self.snap.dms.iter().find(|d| d.channel_id == ch).map(|d| (d.last_message_id, d.last_read_id)))
+                .unwrap_or((0, 0));
+            self.marker = (last > read).then_some((ch, read, false));
             self.unread.remove(&ch);
+            self.mentions.remove(&ch);
             self.ack(ch);
             if self.requested.insert(ch) {
                 self.gw.send(C2S::History { channel_id: ch, before: None });
@@ -264,6 +282,12 @@ impl Session {
 
     /// Mostra a mensagem na hora (provisória) e manda ao servidor; se a conexão estiver fora, fica na fila.
     fn send_message(&mut self, ch: i64, content: String, reply: Option<p::Reply>) {
+        // "@nome" de quem está neste canal vira a menção `<@id>` (o chat mostra o nome atual)
+        let users: Vec<&p::User> = match self.snap.servers.iter().find(|s| s.channels.iter().any(|c| c.id == ch)) {
+            Some(sv) => sv.members.iter().collect(),
+            None => self.snap.dms.iter().filter(|d| d.channel_id == ch).map(|d| &d.user).collect(),
+        };
+        let content = mention_tokens(&content, &users);
         self.nonce_seq += 1;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -422,6 +446,13 @@ impl Session {
                             .filter(|(id, last, read)| last > read && Some(*id) != cur)
                             .map(|(id, _, _)| id)
                             .collect();
+                        self.mentions = sn
+                            .servers
+                            .iter()
+                            .flat_map(|s| s.channels.iter().map(|c| (c.id, c.mentions)))
+                            .chain(sn.dms.iter().map(|d| (d.channel_id, d.mentions)))
+                            .filter(|(id, n)| *n > 0 && Some(*id) != cur)
+                            .collect();
                         self.snap = sn;
                         self.fix_view();
                     }
@@ -429,6 +460,7 @@ impl Session {
                         let ch = m.channel_id;
                         let mine = m.author_id == self.me.id;
                         let (id, author) = (m.id, m.author_id);
+                        let content_for_mention = m.content.clone();
                         if mine && m.nonce != 0 {
                             self.pending.retain(|p| p.nonce != m.nonce);
                             if let Some(v) = self.msgs.get_mut(&ch) {
@@ -444,6 +476,9 @@ impl Session {
                                 self.gw.send(C2S::Ack { channel_id: ch, message_id: id });
                             } else {
                                 self.unread.insert(ch);
+                                if mentions_me(&content_for_mention, self.me.id) {
+                                    *self.mentions.entry(ch).or_insert(0) += 1;
+                                }
                             }
                         }
                     }
@@ -772,6 +807,41 @@ fn is_pending_or_own_echo(m: &p::Message, me: i64) -> bool {
     m.id < 0 || (m.author_id == me && m.nonce != 0)
 }
 
+/// A mensagem cita `me` (`<@id>`, `<@!id>`) ou todo mundo (`@everyone`, `@here`)?
+fn mentions_me(content: &str, me: i64) -> bool {
+    content.contains(&format!("<@{me}>")) || content.contains(&format!("<@!{me}>")) || content.contains("@everyone") || content.contains("@here")
+}
+
+/// Troca `@nome` (nome exato de alguém do canal, sem diferenciar maiúsculas) por `<@id>`.
+fn mention_tokens(content: &str, users: &[&p::User]) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(at) = rest.find('@') {
+        out.push_str(&rest[..at]);
+        let before_ok = !rest[..at].chars().next_back().is_some_and(|c| c.is_alphanumeric());
+        let after = &rest[at + 1..];
+        let run: String = after.chars().take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-')).collect();
+        // o nome mais longo que casa
+        let hit = users
+            .iter()
+            .filter(|u| after.to_lowercase().starts_with(&u.name.to_lowercase()))
+            .filter(|u| after[u.name.len().min(after.len())..].chars().next().map_or(true, |c| !c.is_alphanumeric()))
+            .max_by_key(|u| u.name.len());
+        match hit {
+            Some(u) if before_ok && !run.is_empty() => {
+                out.push_str(&format!("<@{}>", u.id));
+                rest = &after[u.name.len()..];
+            }
+            _ => {
+                out.push('@');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn take_plain_enter(ctx: &egui::Context) -> bool {
     ctx.input_mut(|i| {
         let pos = i.events.iter().position(|e| {
@@ -976,7 +1046,7 @@ impl App {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 let home = matches!(s.view, View::Home | View::Dm(_));
                 let dm_unread = s.snap.dms.iter().any(|d| s.unread.contains(&d.channel_id));
-                if rail_item(ui, "DM", home, dm_unread, false).on_hover_text("Mensagens diretas").clicked() {
+                if rail_item(ui, "DM", home, dm_unread, false, s.snap.dms.iter().map(|d| s.mentions.get(&d.channel_id).copied().unwrap_or(0)).sum()).on_hover_text("Mensagens diretas").clicked() {
                     acts.push(Act::Open(View::Home));
                 }
                 let (sep, _) = ui.allocate_exact_size(egui::vec2(32.0, 1.0), egui::Sense::hover());
@@ -986,11 +1056,11 @@ impl App {
                     for sv in &s.snap.servers {
                         let sel = matches!(&s.view, View::Chan { server, .. } if *server == sv.id);
                         let unread = sv.channels.iter().any(|c| s.unread.contains(&c.id));
-                        if rail_item(ui, &initials(&sv.name), sel, unread, false).on_hover_text(&sv.name).clicked() {
+                        if rail_item(ui, &initials(&sv.name), sel, unread, false, sv.channels.iter().map(|c| s.mentions.get(&c.id).copied().unwrap_or(0)).sum()).on_hover_text(&sv.name).clicked() {
                             acts.push(Act::OpenServer(sv.id));
                         }
                     }
-                    if rail_item(ui, "+", false, false, true).on_hover_text("Adicionar um servidor").clicked() {
+                    if rail_item(ui, "+", false, false, true, 0).on_hover_text("Adicionar um servidor").clicked() {
                         acts.push(Act::Modal(Modal::AddServer { create: true, name: String::new(), code: String::new() }));
                     }
                 });
@@ -1191,6 +1261,10 @@ impl App {
                     });
                 }
             });
+            if let Some(n) = s.mentions.get(&c.id).copied().filter(|n| *n > 0 && !selected) {
+                let rc = r.rect;
+                badge_pill(ui.painter(), egui::pos2(rc.right() - 8.0, rc.center().y + 8.0), n, if selected { L3 } else { L1 });
+            }
             if unread && !selected {
                 let rc = r.rect;
                 ui.painter().rect_filled(
@@ -1406,6 +1480,10 @@ impl App {
         let input_h = 82.0 + 22.0 + if replying_here { 38.0 } else { 0.0 };
         let h = (ui.available_height() - input_h).max(60.0);
         let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        // Esc dispensa o divisor "novas mensagens" (o canal já foi marcado como lido ao abrir)
+        if s.replying.is_none() && s.editing.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            s.marker = None;
+        }
         let prev_anchor = s.anchor.take().filter(|a| a.0 == ch);
         let scroll = egui::ScrollArea::vertical()
             .id_salt(("chat", ch))
@@ -1425,7 +1503,19 @@ impl App {
                     if new_day {
                         day_divider(ui, &fmt_day(m.ts));
                     }
-                    let grouped = !new_day
+                    // primeira mensagem de outra pessoa depois de onde eu tinha parado de ler
+                    let first_new = matches!(s.marker, Some((mch, mk, _)) if mch == ch && m.id > mk && m.author_id != me_id
+                        && (i == 0 || msgs[i - 1].id <= mk));
+                    if first_new {
+                        let r = new_messages_divider(ui);
+                        if let Some((_, _, scrolled)) = &mut s.marker {
+                            if !*scrolled {
+                                *scrolled = true;
+                                ui.scroll_to_rect(r, Some(Align::TOP));
+                            }
+                        }
+                    }
+                    let grouped = !new_day && !first_new
                         && msgs[i - 1].author_id == m.author_id
                         && m.ts - msgs[i - 1].ts < 5 * 60 * 1000
                         && m.reply.is_none();

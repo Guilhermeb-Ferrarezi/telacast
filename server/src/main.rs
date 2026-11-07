@@ -167,6 +167,7 @@ impl App {
                         position: c.5,
                         last_message_id: c.6,
                         last_read_id: c.7,
+                        mentions: c.8.max(0) as u32,
                     })
                     .collect(),
                 members: mems.iter().filter(|m| m.0 == id).map(|m| user(m.1, m.2.clone())).collect(),
@@ -192,11 +193,12 @@ impl App {
             .dms_of(me)
             .await?
             .into_iter()
-            .map(|(channel_id, id, name, last_message_id, last_read_id)| p::Dm {
+            .map(|(channel_id, id, name, last_message_id, last_read_id, mentions)| p::Dm {
                 channel_id,
                 user: user(id, name),
                 last_message_id,
                 last_read_id,
+                mentions: mentions.max(0) as u32,
             })
             .collect();
 
@@ -727,6 +729,9 @@ async fn handle_authed(
                 Ok(Some(mut msg)) => {
                     msg.nonce = nonce;
                     let id = msg.id;
+                    if let Err(e) = app.store.add_mentions(channel_id, me, &msg.content).await {
+                        error!("add_mentions: {e}");
+                    }
                     let to = app.store.participants(channel_id).await.unwrap_or_default();
                     let out = S2C::Message(msg);
                     for u in to {

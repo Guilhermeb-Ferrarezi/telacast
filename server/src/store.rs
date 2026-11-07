@@ -374,11 +374,35 @@ impl Store {
         Ok(r.map(|x| x.0))
     }
 
+    /// Conta a menção para quem foi citado (`<@id>`) ou para todos (`@everyone`/`@here`), menos o autor.
+    pub async fn add_mentions(&self, channel: i64, author: i64, content: &str) -> R<()> {
+        let (ids, everyone) = mention_targets(content);
+        if ids.is_empty() && !everyone {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO read_state(user_id, channel_id, last_read_id, mention_count)
+             SELECT p.user_id, $1, 0, 1 FROM (
+                 SELECT m.user_id FROM channels c JOIN members m ON m.server_id = c.server_id WHERE c.id = $1
+                 UNION SELECT user_id FROM channel_members WHERE channel_id = $1
+             ) p
+             WHERE p.user_id <> $2 AND (p.user_id = ANY($3) OR $4)
+             ON CONFLICT (user_id, channel_id) DO UPDATE SET mention_count = read_state.mention_count + 1",
+        )
+        .bind(channel)
+        .bind(author)
+        .bind(&ids)
+        .bind(everyone)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn ack(&self, user: i64, channel: i64, message: i64) -> R<()> {
         sqlx::query(
             "INSERT INTO read_state(user_id, channel_id, last_read_id) VALUES ($1, $2, $3)
              ON CONFLICT (user_id, channel_id) DO UPDATE
-             SET last_read_id = GREATEST(read_state.last_read_id, EXCLUDED.last_read_id)",
+             SET last_read_id = GREATEST(read_state.last_read_id, EXCLUDED.last_read_id), mention_count = 0",
         )
         .bind(user)
         .bind(channel)
@@ -529,11 +553,12 @@ impl Store {
     }
 
     /// (canal, outro usuário, nome)
-    pub async fn dms_of(&self, me: i64) -> R<Vec<(i64, i64, String, i64, i64)>> {
+    pub async fn dms_of(&self, me: i64) -> R<Vec<(i64, i64, String, i64, i64, i32)>> {
         sqlx::query_as(
             "SELECT c1.channel_id, u.id, u.display_name,
                     COALESCE((SELECT max(m.id) FROM messages m WHERE m.channel_id = c1.channel_id), 0),
-                    COALESCE((SELECT rs.last_read_id FROM read_state rs WHERE rs.user_id = $1 AND rs.channel_id = c1.channel_id), 0)
+                    COALESCE((SELECT rs.last_read_id FROM read_state rs WHERE rs.user_id = $1 AND rs.channel_id = c1.channel_id), 0),
+                    COALESCE((SELECT rs.mention_count FROM read_state rs WHERE rs.user_id = $1 AND rs.channel_id = c1.channel_id), 0)
              FROM channel_members c1
              JOIN channels ch ON ch.id = c1.channel_id AND ch.kind = 10
              JOIN channel_members c2 ON c2.channel_id = c1.channel_id AND c2.user_id <> $1
@@ -580,11 +605,12 @@ impl Store {
     }
 
     /// (servidor, canal, nome, tipo, categoria, posição) dos canais de texto e categorias.
-    pub async fn channels_in(&self, servers: &[i64], me: i64) -> R<Vec<(i64, i64, String, i16, Option<i64>, i32, i64, i64)>> {
+    pub async fn channels_in(&self, servers: &[i64], me: i64) -> R<Vec<(i64, i64, String, i16, Option<i64>, i32, i64, i64, i32)>> {
         sqlx::query_as(
             "SELECT c.server_id, c.id, c.name, c.kind, c.parent_id, c.position,
                     COALESCE((SELECT max(m.id) FROM messages m WHERE m.channel_id = c.id), 0),
-                    COALESCE((SELECT rs.last_read_id FROM read_state rs WHERE rs.user_id = $2 AND rs.channel_id = c.id), 0)
+                    COALESCE((SELECT rs.last_read_id FROM read_state rs WHERE rs.user_id = $2 AND rs.channel_id = c.id), 0),
+                    COALESCE((SELECT rs.mention_count FROM read_state rs WHERE rs.user_id = $2 AND rs.channel_id = c.id), 0)
              FROM channels c
              WHERE c.server_id = ANY($1) AND c.kind IN (0, 4) ORDER BY c.server_id, c.position, c.id",
         )
@@ -618,5 +644,38 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         Ok(r.into_iter().map(|x| x.0).collect())
+    }
+}
+
+/// Quem o texto menciona: ids de `<@id>`/`<@!id>` (no máximo 20) e se há `@everyone`/`@here`.
+pub fn mention_targets(content: &str) -> (Vec<i64>, bool) {
+    let mut ids: Vec<i64> = Vec::new();
+    let mut rest = content;
+    while let Some(p) = rest.find("<@") {
+        let after = &rest[p + 2..];
+        let after = after.strip_prefix('!').unwrap_or(after);
+        if let Some(end) = after.find('>') {
+            if let Ok(id) = after[..end].parse::<i64>() {
+                if !ids.contains(&id) && ids.len() < 20 {
+                    ids.push(id);
+                }
+            }
+        }
+        rest = &rest[p + 2..];
+    }
+    let everyone = content.contains("@everyone") || content.contains("@here");
+    (ids, everyone)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mention_targets;
+
+    #[test]
+    fn acha_mencoes() {
+        assert_eq!(mention_targets("oi <@12> e <@!34>, <@12> de novo"), (vec![12, 34], false));
+        assert_eq!(mention_targets("@everyone vamos"), (vec![], true));
+        assert_eq!(mention_targets("<@abc> <@>"), (vec![], false));
+        assert_eq!(mention_targets("sem nada"), (vec![], false));
     }
 }

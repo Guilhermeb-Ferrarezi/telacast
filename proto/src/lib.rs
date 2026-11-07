@@ -60,6 +60,9 @@ pub struct Channel {
     /// Id da última mensagem do canal (0 se vazio) e da última que `me` leu (0 se nunca leu).
     pub last_message_id: i64,
     pub last_read_id: i64,
+    /// Menções a você ainda não lidas neste canal.
+    #[serde(default)]
+    pub mentions: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -93,6 +96,8 @@ pub struct Dm {
     pub user: User,
     pub last_message_id: i64,
     pub last_read_id: i64,
+    #[serde(default)]
+    pub mentions: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

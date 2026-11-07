@@ -471,3 +471,46 @@ fn status_manual_e_ausente_automatico() {
     ana.send(C2S::SetStatus { status: Status::Offline });
     assert_eq!(ana.error_code().0, telacast_proto::ErrorCode::InvalidInput);
 }
+
+#[test]
+fn mencoes_contam_ate_ler() {
+    let env = Env::start();
+    let code = env.invite(3);
+    let mut ana = env.client();
+    ana.register("ana", &code);
+    let mut beto = env.client();
+    let (_, beto_id) = beto.register("beto", &code);
+    let mut carla = env.client();
+    carla.register("carla", &code);
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    let geral = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
+    for c in [&mut beto, &mut carla] {
+        c.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
+        c.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+    }
+    let mencoes = |env: &Env, user: &str| -> u32 {
+        let mut c = env.client();
+        c.send(C2S::Login { username: user.into(), password: "segredo-forte-1".into(), proto: telacast_proto::PROTO_VERSION });
+        let s = c.wait("snapshot do login", |m| if let S2C::Snapshot(s) = m { Some(s.clone()) } else { None });
+        s.servers[0].channels.iter().find(|c| c.id == geral).unwrap().mentions
+    };
+    ana.send(C2S::Send { channel_id: geral, content: format!("oi <@{beto_id}>"), reply_to: None, nonce: 0 });
+    ana.send(C2S::Send { channel_id: geral, content: "mensagem sem menção".into(), reply_to: None, nonce: 0 });
+    ana.send(C2S::Send { channel_id: geral, content: format!("de novo <@!{beto_id}>"), reply_to: None, nonce: 0 });
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(mencoes(&env, "beto"), 2, "o beto foi citado duas vezes");
+    assert_eq!(mencoes(&env, "carla"), 0, "a carla não foi citada");
+    ana.send(C2S::Send { channel_id: geral, content: "@everyone atenção".into(), reply_to: None, nonce: 0 });
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(mencoes(&env, "carla"), 1, "@everyone conta para todos");
+    assert_eq!(mencoes(&env, "beto"), 3);
+    assert_eq!(mencoes(&env, "ana"), 0, "o autor não conta a própria menção");
+    // ler zera
+    beto.send(C2S::Ack { channel_id: geral, message_id: i64::MAX / 2 });
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(mencoes(&env, "beto"), 0);
+}
