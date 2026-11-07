@@ -41,5 +41,5 @@ object Grafite {
     )
 
     fun tomDoUsuario(id: Long): Pair<Color, Color> =
-        TonsDeAvatar[(if (id < 0) -id else id).toInt() % TonsDeAvatar.size]
+        TonsDeAvatar[java.lang.Long.remainderUnsigned(if (id < 0) -id else id, TonsDeAvatar.size.toLong()).toInt()]
 }
