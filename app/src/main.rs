@@ -734,7 +734,9 @@ impl App {
             resuming: false,
         };
         let token = get("token");
-        if !token.is_empty() {
+        if !token.is_empty() && net::insecure_remote(&login.server) {
+            login.error = "Servidor remoto precisa de wss:// (conexão criptografada).".into();
+        } else if !token.is_empty() {
             login.gw = Some(gateway::open(&login.server, cc.egui_ctx.clone()));
             login.pending = Some(C2S::Resume { token: token.clone(), proto: p::PROTO_VERSION });
             login.resuming = true;
@@ -762,6 +764,10 @@ impl App {
     fn start_login(&mut self, ctx: &egui::Context) {
         let l = &mut self.login;
         l.error.clear();
+        if net::insecure_remote(&l.server) {
+            l.error = "Para um servidor fora da sua rede use wss:// (conexão criptografada). Com ws:// a senha viajaria em claro.".into();
+            return;
+        }
         l.gw = Some(gateway::open(&l.server, ctx.clone()));
         let (username, password, invite) = (l.user.trim().to_string(), l.pass.clone(), l.invite.clone());
         l.pending = Some(if l.register {
@@ -804,9 +810,8 @@ impl App {
                     self.login.gw = None;
                 }
                 Event::Closed(why) => {
-                    if !self.login.resuming {
-                        self.login.error = why;
-                    }
+                    // mostra o motivo também ao retomar a sessão (certificado recusado, servidor fora...)
+                    self.login.error = why;
                     self.login.resuming = false;
                     self.login.gw = None;
                 }

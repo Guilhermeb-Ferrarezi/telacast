@@ -7,7 +7,7 @@ use std::{
     },
     time::Duration,
 };
-use tungstenite::{connect, stream::MaybeTlsStream, Message};
+use tungstenite::Message;
 
 pub struct Handle {
     pub stop: Arc<AtomicBool>,
@@ -38,11 +38,9 @@ fn run(
     out: &Mutex<Option<ColorImage>>,
     ctx: &Context,
 ) -> anyhow::Result<()> {
-    let (mut ws, _) = connect(url)?;
+    let mut ws = crate::net::connect_ws(url)?;
     // Timeout de leitura para poder checar `stop`.
-    if let MaybeTlsStream::Plain(s) = ws.get_mut() {
-        s.set_read_timeout(Some(Duration::from_millis(200)))?;
-    }
+    crate::net::set_read_timeout(&mut ws, Duration::from_millis(200))?;
     let mut dec = Decoder::new()?;
     *status.lock().unwrap() = "assistindo".into();
     while !stop.load(Ordering::Relaxed) {

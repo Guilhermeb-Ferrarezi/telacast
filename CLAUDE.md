@@ -2,7 +2,7 @@
 
 Clone **próprio** do Discord em Rust: cliente desktop em egui, servidor axum + PostgreSQL 18, vídeo H.264 (captura X11 + NVENC) por WebSocket. Não usa a API nem os servidores do Discord. Idioma do produto e dos commits: **português do Brasil**.
 
-Planos: `ROADMAP.md` (fases 0 a 5, decisões, ordem), `docs/MOBILE-PLAN.md` (Android, **só depois do desktop terminar**), `docs/ui-spec/` (10 especificações de interface extraídas do cliente web do Discord; leia a da área em que for mexer), `docs/discord/` e `docs/review/` (pesquisa e pareceres).
+Implantação na VPS (Caddy + systemd + Postgres): `docs/DEPLOY.md`. Planos: `ROADMAP.md` (fases 0 a 5, decisões, ordem), `docs/MOBILE-PLAN.md` (Android, **só depois do desktop terminar**), `docs/ui-spec/` (10 especificações de interface extraídas do cliente web do Discord; leia a da área em que for mexer), `docs/discord/` e `docs/review/` (pesquisa e pareceres).
 
 ## Estrutura
 

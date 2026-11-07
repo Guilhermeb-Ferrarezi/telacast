@@ -10,7 +10,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tungstenite::{connect, Message};
+use tungstenite::Message;
 use x11rb::{
     connection::Connection,
     protocol::{randr::ConnectionExt as _, xproto::{ConnectionExt as _, ImageFormat}},
@@ -85,7 +85,7 @@ fn run(
     let root = conn.setup().roots[num].root;
     // H.264 exige dimensões pares.
     let (w, h) = ((mon.w & !1) as usize, (mon.h & !1) as usize);
-    let (mut ws, _) = connect(url)?;
+    let mut ws = crate::net::connect_ws(url)?;
 
     // Captura e codificação em threads separadas: o fps é limitado pelo
     // mais lento dos dois, não pela soma.

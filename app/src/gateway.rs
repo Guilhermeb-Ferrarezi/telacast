@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 use telacast_proto::{C2S, S2C};
-use tungstenite::{connect, stream::MaybeTlsStream, Message};
+use tungstenite::Message;
 
 pub enum Event {
     Connected,
@@ -40,10 +40,8 @@ pub fn open(server: &str, ctx: Context) -> Gateway {
 }
 
 fn run(url: &str, out: Receiver<C2S>, ev: &Sender<Event>, ctx: &Context) -> anyhow::Result<()> {
-    let (mut ws, _) = connect(url)?;
-    if let MaybeTlsStream::Plain(s) = ws.get_mut() {
-        s.set_read_timeout(Some(Duration::from_millis(50)))?;
-    }
+    let mut ws = crate::net::connect_ws(url)?;
+    crate::net::set_read_timeout(&mut ws, Duration::from_millis(50))?;
     let _ = ev.send(Event::Connected);
     ctx.request_repaint();
     // Relógio de parede: depois de o PC suspender, o salto de tempo derruba a conexão velha na hora.
