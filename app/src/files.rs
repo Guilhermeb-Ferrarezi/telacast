@@ -82,6 +82,12 @@ pub fn upload(base: &str, token: &str, channel: i64, path: &Path) -> Result<p::A
 }
 
 /// Abre o seletor de arquivos do sistema (kdialog ou zenity); `None` se cancelou ou não há nenhum instalado.
+#[cfg(windows)]
+pub fn pick_files() -> Vec<PathBuf> {
+    rfd::FileDialog::new().set_title("Anexar arquivos").pick_files().unwrap_or_default()
+}
+
+#[cfg(not(windows))]
 pub fn pick_files() -> Vec<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let tries: [(&str, Vec<String>); 2] = [

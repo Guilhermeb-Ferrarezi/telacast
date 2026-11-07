@@ -14,8 +14,6 @@ webpki-roots = "1"
 ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 x11rb = { version = "0.14.0", features = ["randr"] }
-nvidia-video-codec-sdk = { path = "../vendor/nvidia-video-codec-sdk" }
-cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12080"] }
 telacast-proto = { version = "0.1.0", path = "../proto" }
 serde_json = "1.0.154"
 chrono = "0.4.45"
@@ -27,3 +25,10 @@ rtrb = "0.3"
 nnnoiseless = { version = "0.5", default-features = false }
 telacast-md = { path = "../md" }
 telacast-qs = { path = "../qs" }
+
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.15", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+nvidia-video-codec-sdk = { path = "../vendor/nvidia-video-codec-sdk" }
+cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12080"] }

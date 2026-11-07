@@ -1,3 +1,4 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
 mod capture;
 mod gateway;
 mod files;
@@ -5355,6 +5356,9 @@ impl App {
                 modal(ctx, "Transmitir", 540.0, &mut dismissed, |ui| {
                     ui.set_width(500.0);
                     ui.label(RichText::new("Compartilhar uma tela ou janela").size(12.0).color(MUTED));
+                    if cfg!(windows) {
+                        ui.label(RichText::new("Compartilhar a tela ainda não está disponível no Windows (dá para assistir às transmissões dos outros).").size(12.5).color(AMBER));
+                    }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut gl.tab, 0, "Telas");
@@ -5498,7 +5502,7 @@ impl App {
                             go_stop = true;
                             close = true;
                         }
-                        let ready = cur.is_some() && gl.source.is_some();
+                        let ready = cur.is_some() && gl.source.is_some() && !cfg!(windows);
                         ui.add_enabled_ui(ready, |ui| {
                             if small_button(ui, if live { "Aplicar" } else { "Transmitir" }, BLURPLE) {
                                 go_publish = true;

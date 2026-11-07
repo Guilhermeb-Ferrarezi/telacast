@@ -165,11 +165,30 @@ pub fn install(verified: &std::path::Path) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(verified, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
     }
+    #[cfg(windows)]
+    {
+        // no Windows não dá para sobrescrever um .exe em uso, mas dá para renomeá-lo: o antigo sai do caminho
+        let old = exe.with_extension("old.exe");
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(&exe, &old).map_err(|e| format!("não consegui afastar o executável antigo ({e})"))?;
+        if let Err(e) = std::fs::rename(verified, &exe) {
+            let _ = std::fs::rename(&old, &exe); // desfaz
+            return Err(format!("não consegui instalar o executável novo ({e})"));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
     std::fs::rename(verified, &exe).map_err(|e| format!("não consegui trocar o executável ({e})"))
 }
 
 /// Abre a versão nova e fecha esta (a nova espera um instante para a trava de instância única soltar).
 pub fn restart() {
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        // a instância nova espera a trava de instância única soltar (ver `single::acquire`)
+        let _ = std::process::Command::new(exe).args(std::env::args().skip(1)).spawn();
+    }
+    #[cfg(not(windows))]
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new("sh")
             .arg("-c")

@@ -122,6 +122,8 @@ pub fn apply_theme(ctx: &egui::Context) {
     ] {
         w.corner_radius = r;
     }
+    // só existe o tema escuro: sem isto, um sistema em tema claro (Windows, por exemplo) trocaria para o estilo claro do egui
+    ctx.set_theme(egui::ThemePreference::Dark);
     ctx.set_visuals(v);
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = vec2(8.0, 6.0);
