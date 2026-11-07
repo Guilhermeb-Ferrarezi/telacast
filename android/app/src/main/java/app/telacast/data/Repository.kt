@@ -70,6 +70,9 @@ class Repository(
         _estado.value = AppState(conexao = _estado.value.conexao)
     }
 
+    /** Token da sessão atual (para guardar cifrado e usar no HTTP). */
+    val token: String? get() = gateway.token
+
     fun limparErroDeEntrada() = modificar { it.copy(erroDeEntrada = null) }
 
     // ------------------------------------------------------------------ navegação e leitura
@@ -161,6 +164,11 @@ class Repository(
     fun criarServidor(nome: String) { gateway.enviar(C2S.CreateServer(nome)) }
     fun entrarNoServidor(codigo: String) { gateway.enviar(C2S.JoinServer(codigo)) }
     fun abrirDm(usuario: Long) { gateway.enviar(C2S.OpenDm(usuario)) }
+    fun definirStatus(status: app.telacast.proto.Status) { gateway.enviar(C2S.SetStatus(status)) }
+    fun pedirAmizade(usuario: String) { gateway.enviar(C2S.FriendRequest(usuario.trim())) }
+    fun aceitarAmigo(usuario: Long) { gateway.enviar(C2S.FriendAccept(usuario)) }
+    /** Remove amigo, recusa ou cancela pedido. */
+    fun removerAmigo(usuario: Long) { gateway.enviar(C2S.FriendRemove(usuario)) }
     fun pedirSessoes() { gateway.enviar(C2S.ListSessions) }
 
     /** Manda `Typing` no máximo a cada [intervaloDigitandoMs] por canal. */

@@ -8,16 +8,17 @@ Plano: `docs/MOBILE-PLAN.md` (raiz do repositório). Este arquivo é o estado da
 
 ## Passo atual
 
-**A1 (esqueleto + tema): feito e commitado.** **A2 lado Kotlin (proto + contrato por fixtures) e A3 (Gateway + Repository + testes): feitos, aguardando revisão e commit.** Próximo: **A3b/B1 (login e navegação)**.
+A1, A2 e A3 estão commitados. **B1 (login e cadastro), B2 (navegação com gaveta) e B3 (canais e Início) feitos, aguardando revisão e commit.** Próximo: **B4 (lista de mensagens) e B5 (compositor e ações)**.
 
 ## Feito
 
-- A1: projeto Gradle (Kotlin DSL) em `android/`, módulo `app` (`app.telacast`, minSdk 26, compile/targetSdk 34); tema Grafite; `PaletaScreen`; PNG do Paparazzi em `docs/paleta.png`.
-- A2 (`app/src/main/java/app/telacast/proto/`): `Tipos.kt` (espelho de `proto/src/lib.rs`: ids `Long`, enums tolerantes), `C2S.kt` e `S2C.kt` (sealed classes com serializador "externamente etiquetado" do serde), `Proto.kt` (`lerS2C`, `escreverC2S`, ...). Variante S2C desconhecida vira `S2C.Desconhecida` (o Gateway descarta); `ErrorCode` desconhecido vira `Unknown`, `Status` desconhecido vira `Offline`; `FriendStatus` desconhecido derruba o Snapshot inteiro (igual ao Rust, contrato de hoje).
-- A2 teste: `ProtoFixturesTest` lê `../proto/fixtures/**` (c2s, s2c, http, extras) e confere por árvore JSON, mais "lista de variantes não diverge" nos dois sentidos.
-- A3 (`net/` e `data/`, puro Kotlin, sem Android): `Gateway` (OkHttp WebSocket por trás da interface `Transporte`; estados Conectando/Conectado/Reconectando/Desconectado; Login/Registro/Resume; recuo 1-2-4-8-15 s; `SessionExpired` e afins viram `Falha(sessaoInvalida)`), `Repository` (um `StateFlow<AppState>`: snapshot, mensagens por canal, não lidos e menções, digitando 8 s, envio otimista com nonce, eco, paginação, editar/apagar/reagir/fixar, reenvio e conciliação depois de reconectar), `Mencoes.kt`.
-- Cleartext: `app/src/debug/` tem `network_security_config` com texto claro liberado SÓ no debug; o release não tem (conferido no manifesto mesclado).
-- Verificado: 65 testes unitários (proto 21, gateway 13, OkHttp+MockWebServer 5, repository 25, snapshot 1) e 10 de integração contra o servidor real.
+- A1 a A3: projeto, tema Grafite, protocolo (fixtures), Gateway, Repository, integração contra o servidor real (ver "Achados" abaixo).
+- **B1 Login/cadastro** (`ui/Login.kt`, `estado/FormLogin.kt`, `AppViewModel`): servidor editável (padrão em `BuildConfig.SERVIDOR_PADRAO`: `10.0.2.2:8080` no debug, vazio no release), usuário, senha, convite (alterna Entrar / Registrar-se), "Entrando…", erros em português (`TextosDeErro`), retomada da sessão salva ("Entrando…" + "Usar outra conta"). Token cifrado com AES-GCM do Android Keystore (`armazenamento/CifraAesGcm.kt` + `CofreKeystore.kt`, SharedPreferences privadas; sem `security-crypto`); guarda também o último servidor e usuário. `sessaoInvalida` apaga o token e volta ao login.
+- **B2 Navegação** (`ui/Principal.kt`, `estado/Navegacao.kt`): gaveta à esquerda própria (trilho 72 dp + painel 240 dp, abre por botão ou arrastando; toque no escurecido fecha), painel de membros à direita (lista simples; por gesto ou botão), `BackHandler` na raiz (`ui/Raiz.kt`) fecha diálogo, menu, membros e gaveta, nessa ordem, antes de sair. Navegação por estado próprio (`Navegacao`, imutável, testado).
+- **B3 Canais** (`ui/Trilho.kt`, `ui/Painel.kt`, `ui/Sobreposicoes.kt`): trilho com pílula 8/40 dp, sigla, selo de menções (99+), botão "+"; cabeçalho do servidor em serifa com menu (Convidar pessoas; dono: Criar canal e Criar categoria); categorias recolhíveis (estado salvo; recolhida só mostra canal aberto, não lido ou com gente na voz); canais com `#`, não lido em negrito + barra, pílula de menções; voz com alto-falante e quem está nela ("Canais de voz chegam em breve" ao tocar); cartão do usuário com presença e menu de status (Online, Ausente, Não perturbe, Invisível, Sair da conta); diálogos criar servidor / entrar com convite, criar canal ou categoria, convidar (copiar código), confirmar saída.
+- **Início** (`ui/Centro.kt`): "Amigos" com abas Disponível, Todos, Pendente (aceitar, recusar, cancelar) e Adicionar amigo; na gaveta, "Amigos" e as mensagens diretas. DM e canal abrem com cabeçalho e um espaço para a lista (B4).
+- Imagens: `docs/telas/*.png` (24, ~1,2 MB), geradas por `TelasSnapshotTest` com `AppState` falso (`Amostras.kt`), sem rede.
+- Verificado: 118 testes unitários (proto 21, gateway 13, OkHttp 5, repository 25, ViewModel 15, navegação 6, formulário 4, cifra 4, 24 imagens de telas + paleta) e 10 de integração; `verifyPaparazziDebug` verde.
 
 ## Bloqueado
 
@@ -32,7 +33,8 @@ free -m                                   # precisa de >= 3000 MB em "available"
 scripts/gradle.sh assembleDebug           # APK: app/build/outputs/apk/debug/app-debug.apk
 scripts/gradle.sh testDebugUnitTest       # unitários (proto, gateway, repository, OkHttp+MockWebServer, snapshot); ~15 s
 scripts/gradle.sh verifyPaparazziDebug    # compara a paleta com app/src/test/snapshots
-scripts/paleta.sh                         # regrava o snapshot e copia para docs/paleta.png (só quando o tema mudar de propósito)
+scripts/paleta.sh                         # regrava só a paleta (docs/paleta.png)
+scripts/telas.sh                          # regrava TODOS os PNGs (paleta + docs/telas/); só quando o visual mudar de propósito
 scripts/it.sh                             # INTEGRAÇÃO contra o servidor real; ~55 s (a paginação respeita 12 envios por 10 s)
 scripts/it.sh --tests '*IntegracaoTest.digitando*'   # um teste só (argumentos extras vão para o Gradle)
 ```
@@ -65,10 +67,24 @@ AGP 8.5.2, Kotlin 2.0.21 (plugins do compilador Compose e de serialização), Gr
 - Limite de `Send` (12 por 10 s) estoura fácil em teste: uma `Send` recusada vira `Error RateLimited` e a pendente fica na fila; a tela do B-passos precisa de "reenviar/descartar" (o `Repository` já tem `reenviar` e `descartarPendente`).
 - Cadastro/login: 10 por 5 min por IP; a suíte de integração usa 8.
 
-## Sugestões para A3b/B1 (login e navegação)
+## Decisões do B1 a B3
 
-- `AppViewModel` fino (lifecycle-viewmodel) com um `Repository` criado no `Application` (DI manual); guardar o token com Android Keystore (AES-GCM) e abrir com `Credencial.Retomar`.
-- Tela de login/cadastro lê `AppState.erroDeEntrada` e `EstadoConexao`; se `sessaoInvalida`, apaga o token e volta ao login.
-- Faixa "Reconectando em Ns..." a partir de `EstadoConexao.Reconectando(tentativa, quandoMs)`.
-- Navegação: estado próprio (gaveta + canal) com `BackHandler`; ao abrir canal chamar `Repository.abrirCanal` (já faz `Ack` e `History`), ao sair `fecharCanal`; rolagem da lista com `carregarAnteriores` ao chegar no topo.
-- Texto claro (`ws://`) só no debug; o app precisa montar `wss://` em produção (`Gateway.urlDoGateway` já troca `https://` por `wss://`).
+- Linhas de canal com 40 dp (o desktop usa 34) e menus com itens de 44 dp: alvo de toque. Botões de formulário com 46 a 48 dp.
+- Gaveta própria em vez de `ModalNavigationDrawer`: controle total do visual (sem sombra, escurecido preto a 55%) e do que o Paparazzi desenha. Menus e diálogos são desenhados na própria composição (sem `Popup`/`Dialog`), porque o layoutlib não desenha janelas separadas.
+- Selo de menções do trilho pendurado no canto do ícone (o desktop o põe dentro do ícone, por cima da sigla).
+- "Sair do servidor" **não existe**: o protocolo não tem mensagem de sair de servidor (só `Logout` da conta). O menu do servidor tem Convidar, Criar canal e Criar categoria.
+- Início na gaveta: o botão "DM" do trilho troca o painel para Amigos + DMs sem mudar o centro; tocar num servidor do trilho troca o painel sem mudar o centro (como no Discord mobile).
+- Primeira tela depois do login: último canal aberto (salvo), senão o primeiro canal de texto do primeiro servidor, senão Amigos.
+
+## Pendências e fora do escopo (B4 em diante)
+
+- Lista de mensagens, compositor, ações de mensagem, markdown, perfil em folha inferior, painel de membros por cargo, ajustes (trocar senha, sessões) e voz.
+- Busca (`Search`) não tem estado nem tela.
+- Sem prova em aparelho: nada foi instalado; só imagens na JVM.
+
+## Sugestões para B4/B5
+
+- A lista de mensagens usa `AppState.lista(canal)` (reais em ordem + provisórias no fim); `Repository.carregarAnteriores(canal)` ao chegar no topo; `LazyColumn(reverseLayout = true)`.
+- Compositor: `Repository.enviarMensagem` já valida (vazio, 4000), faz o envio otimista e converte `@nome` em token; `reenviar`/`descartarPendente` para a mensagem que não saiu (limite de 12 envios por 10 s).
+- O ponto âmbar do botão da gaveta (`temNovidade`) e as barras de não lido já usam `naoLidos` e `mencoes` do `AppState`.
+- `imePadding()` já está na tela de login e nos diálogos; o compositor precisa dele também.

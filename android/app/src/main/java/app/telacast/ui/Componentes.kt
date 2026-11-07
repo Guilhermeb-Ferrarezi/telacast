@@ -20,6 +20,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -71,7 +74,10 @@ fun Avatar(nome: String, id: Long, tamanho: Dp = 40.dp, presenca: Presenca? = nu
 /** Bolinha de presença: online cheia, ausente em meia-lua, não perturbe com barra, offline vazada. */
 private fun androidx.compose.ui.graphics.drawscope.DrawScope.desenharPresenca(p: Presenca, fundo: Color, lado: Float) {
     val r = lado * 0.11f
-    val c = Offset(lado - lado * 0.12f - r, lado - lado * 0.12f - r)
+    desenharPonto(p, fundo, Offset(lado - lado * 0.12f - r, lado - lado * 0.12f - r), r)
+}
+
+internal fun androidx.compose.ui.graphics.drawscope.DrawScope.desenharPonto(p: Presenca, fundo: Color, c: Offset, r: Float) {
     drawCircle(fundo, r * 1.55f, c)
     when (p) {
         Presenca.Online -> drawCircle(Grafite.Ok, r, c)
@@ -90,11 +96,17 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.desenharPresenca(p:
     }
 }
 
+/** Só a bolinha (para menus e listas), 5 dp de raio. */
+@Composable
+fun PontoDePresenca(p: Presenca, fundo: Color, modifier: Modifier = Modifier) {
+    androidx.compose.foundation.Canvas(modifier.size(22.dp)) { desenharPonto(p, fundo, Offset(size.width / 2, size.height / 2), 5.dp.toPx()) }
+}
+
 enum class TipoBotao { Primario, Perigo, Quieto }
 
 /** Botão de 40 dp de altura, raio 9. Primário âmbar (esquenta ao toque), perigo vermelho, quieto com filete. */
 @Composable
-fun Botao(rotulo: String, tipo: TipoBotao = TipoBotao.Primario, modifier: Modifier = Modifier, aoClicar: () -> Unit = {}) {
+fun Botao(rotulo: String, tipo: TipoBotao = TipoBotao.Primario, modifier: Modifier = Modifier, altura: Dp = 40.dp, habilitado: Boolean = true, aoClicar: () -> Unit = {}) {
     val fonte = remember { MutableInteractionSource() }
     val tocado by fonte.collectIsPressedAsState()
     val (fundo, tinta, borda) = when (tipo) {
@@ -104,33 +116,49 @@ fun Botao(rotulo: String, tipo: TipoBotao = TipoBotao.Primario, modifier: Modifi
     }
     Box(
         modifier
-            .height(40.dp)
+            .height(altura)
             .clip(Formas.Botao)
-            .background(fundo)
+            .background(if (habilitado) fundo else Grafite.L3)
             .let { if (borda != null) it.border(borda, Formas.Botao) else it }
-            .clickable(interactionSource = fonte, indication = null, onClick = aoClicar)
+            .clickable(enabled = habilitado, interactionSource = fonte, indication = null, onClick = aoClicar)
             .padding(horizontal = 16.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(rotulo, style = Tipos.Botao.copy(color = tinta, fontSize = 14.sp), textAlign = TextAlign.Center)
+        Text(rotulo, style = Tipos.Botao.copy(color = if (habilitado) tinta else Grafite.Apagado, fontSize = if (altura < 40.dp) 13.sp else 14.sp), textAlign = TextAlign.Center)
     }
 }
 
 /** Campo de texto: camada 3, filete de 1 px (âmbar com foco), cursor âmbar. */
 @Composable
-fun Campo(valor: String, aoMudar: (String) -> Unit, dica: String, modifier: Modifier = Modifier, focado: Boolean = false) {
+fun Campo(
+    valor: String,
+    aoMudar: (String) -> Unit,
+    dica: String,
+    modifier: Modifier = Modifier,
+    focado: Boolean = false,
+    senha: Boolean = false,
+    teclado: androidx.compose.foundation.text.KeyboardOptions = androidx.compose.foundation.text.KeyboardOptions.Default,
+    aoEnviar: (() -> Unit)? = null,
+    habilitado: Boolean = true,
+) {
+    var comFoco by remember { mutableStateOf(false) }
     BasicTextField(
         value = valor,
         onValueChange = aoMudar,
         singleLine = true,
+        enabled = habilitado,
         textStyle = Tipos.Corpo,
         cursorBrush = SolidColor(Grafite.Ambar),
+        visualTransformation = if (senha) androidx.compose.ui.text.input.PasswordVisualTransformation('•') else androidx.compose.ui.text.input.VisualTransformation.None,
+        keyboardOptions = teclado,
+        keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = { aoEnviar?.invoke() }, onGo = { aoEnviar?.invoke() }, onSend = { aoEnviar?.invoke() }),
         modifier = modifier
             .fillMaxWidth()
-            .height(44.dp)
+            .height(48.dp)
+            .onFocusChanged { comFoco = it.isFocused }
             .clip(Formas.Botao)
             .background(Grafite.L3)
-            .border(1.dp, if (focado) Grafite.Ambar else Grafite.Linha2, Formas.Botao),
+            .border(1.dp, if (focado || comFoco) Grafite.Ambar else Grafite.Linha2, Formas.Botao),
         decorationBox = { interno ->
             Box(Modifier.padding(horizontal = 14.dp), contentAlignment = Alignment.CenterStart) {
                 if (valor.isEmpty()) Text(dica, style = Tipos.CorpoApagado)

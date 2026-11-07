@@ -1,0 +1,35 @@
+package app.telacast.armazenamento
+
+/** Preferências simples do app (nada secreto aqui). Puro Kotlin: o Android entra só em [PreferenciasAndroid]. */
+interface Preferencias {
+    /** Último servidor digitado (`host:porta` ou URL). */
+    var servidor: String
+    /** Último nome de usuário. */
+    var usuario: String
+    /** Categorias recolhidas na lista de canais (ids). */
+    var categoriasRecolhidas: Set<Long>
+    /** Último canal aberto (para reabrir o app onde parou); 0 = nenhum. */
+    var ultimoCanal: Long
+    var ultimoServidor: Long
+}
+
+/** Onde mora o token da sessão: cifrado em disco no app, em memória nos testes. */
+interface CofreDeSegredos {
+    fun guardar(texto: String)
+    fun ler(): String?
+    fun apagar()
+}
+
+class PreferenciasEmMemoria(
+    override var servidor: String = "",
+    override var usuario: String = "",
+    override var categoriasRecolhidas: Set<Long> = emptySet(),
+    override var ultimoCanal: Long = 0,
+    override var ultimoServidor: Long = 0,
+) : Preferencias
+
+class CofreEmMemoria(private var valor: String? = null) : CofreDeSegredos {
+    override fun guardar(texto: String) { valor = texto }
+    override fun ler(): String? = valor
+    override fun apagar() { valor = null }
+}

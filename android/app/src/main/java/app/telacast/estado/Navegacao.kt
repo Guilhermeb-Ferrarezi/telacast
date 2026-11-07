@@ -1,0 +1,75 @@
+package app.telacast.estado
+
+/** Para onde o centro da tela aponta. */
+sealed interface Destino {
+    /** Início: amigos (e, na gaveta, as mensagens diretas). */
+    data object Amigos : Destino
+    data class Dm(val canal: Long) : Destino
+    data class Canal(val servidor: Long, val canal: Long) : Destino
+}
+
+enum class AbaInicio(val rotulo: String) {
+    Disponivel("Disponível"), Todos("Todos"), Pendente("Pendente"), Adicionar("Adicionar amigo"),
+}
+
+/** Menus que abrem sobre a gaveta. */
+enum class MenuAberto { Servidor, Status }
+
+sealed interface Dialogo {
+    /** Botão "+" do trilho: criar um servidor ou entrar com um código de convite. */
+    data class AdicionarServidor(val criar: Boolean = true) : Dialogo
+    /** `categoria` = criar categoria em vez de canal; `pai` = categoria onde o canal nasce. */
+    data class CriarCanal(val servidor: Long, val categoria: Boolean = false, val pai: Long? = null) : Dialogo
+    data class Convidar(val codigo: String) : Dialogo
+    data object ConfirmarSair : Dialogo
+}
+
+/**
+ * Estado de navegação do app, por conta própria (sem biblioteca de navegação). Imutável; cada função devolve o novo
+ * estado, então dá para testar na JVM e desenhar qualquer combinação nos testes de imagem.
+ */
+data class Navegacao(
+    val destino: Destino = Destino.Amigos,
+    /** Servidor cuja lista de canais aparece na gaveta; `null` = Início (mensagens diretas). */
+    val servidorNoPainel: Long? = null,
+    val gavetaAberta: Boolean = false,
+    val membrosAbertos: Boolean = false,
+    val menu: MenuAberto? = null,
+    val dialogo: Dialogo? = null,
+    val abaInicio: AbaInicio = AbaInicio.Disponivel,
+) {
+    fun abrirGaveta() = copy(gavetaAberta = true, membrosAbertos = false, menu = null)
+    fun fecharGaveta() = copy(gavetaAberta = false, menu = null)
+    fun abrirMembros() = copy(membrosAbertos = true, gavetaAberta = false, menu = null)
+    fun fecharMembros() = copy(membrosAbertos = false)
+
+    /** Trocar o servidor da gaveta não muda o centro nem fecha a gaveta (como no Discord mobile). */
+    fun selecionarServidor(id: Long?) = copy(servidorNoPainel = id, menu = null)
+
+    /** Navega e fecha a gaveta. */
+    fun irPara(d: Destino): Navegacao {
+        val painel = when (d) {
+            is Destino.Canal -> d.servidor
+            else -> null
+        }
+        return copy(destino = d, servidorNoPainel = painel, gavetaAberta = false, membrosAbertos = false, menu = null)
+    }
+
+    fun abrirMenu(m: MenuAberto) = copy(menu = if (menu == m) null else m)
+    fun fecharMenu() = copy(menu = null)
+    fun abrirDialogo(d: Dialogo) = copy(dialogo = d, menu = null)
+    fun fecharDialogo() = copy(dialogo = null)
+    fun escolherAba(a: AbaInicio) = copy(abaInicio = a)
+
+    /** Algo que o botão Voltar do sistema fecha antes de sair do app? */
+    val podeVoltar: Boolean get() = dialogo != null || menu != null || membrosAbertos || gavetaAberta
+
+    /** Voltar do sistema: fecha, nesta ordem, diálogo, menu, painel de membros e gaveta. */
+    fun voltar(): Navegacao = when {
+        dialogo != null -> fecharDialogo()
+        menu != null -> fecharMenu()
+        membrosAbertos -> fecharMembros()
+        gavetaAberta -> fecharGaveta()
+        else -> this
+    }
+}

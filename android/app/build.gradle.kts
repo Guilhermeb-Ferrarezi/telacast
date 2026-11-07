@@ -16,17 +16,21 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+        // Servidor sugerido na tela de entrada (o campo continua editável). Em produção fica vazio até haver domínio.
+        buildConfigField("String", "SERVIDOR_PADRAO", "\"\"")
     }
 
     buildTypes {
         release { isMinifyEnabled = false }
+        // no emulador, 10.0.2.2 é o PC; no celular real use `adb reverse tcp:8080 tcp:8080` e localhost:8080
+        debug { buildConfigField("String", "SERVIDOR_PADRAO", "\"10.0.2.2:8080\"") }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
+    buildFeatures { compose = true; buildConfig = true }
     packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
 }
 
