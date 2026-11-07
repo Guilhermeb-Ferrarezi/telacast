@@ -535,3 +535,87 @@ pub fn day_divider(ui: &mut Ui, label: &str) {
     });
     ui.add_space(4.0);
 }
+
+// ---- ícones de voz (desenhados, sem depender de fonte)
+
+fn arc_points(c: egui::Pos2, r: f32, from_deg: f32, to_deg: f32, steps: usize) -> Vec<egui::Pos2> {
+    (0..=steps)
+        .map(|i| {
+            let a = (from_deg + (to_deg - from_deg) * i as f32 / steps as f32).to_radians();
+            c + vec2(a.cos(), a.sin()) * r
+        })
+        .collect()
+}
+
+/// Microfone; `slashed` risca com uma barra diagonal (mudo).
+pub fn mic_icon(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32, slashed: bool) {
+    let s = size;
+    let st = Stroke::new((s * 0.085).max(1.4), color);
+    let body = Rect::from_center_size(c + vec2(0.0, -0.12 * s), vec2(0.30 * s, 0.50 * s));
+    p.rect_filled(body, 0.15 * s, color);
+    p.add(egui::Shape::line(arc_points(c + vec2(0.0, -0.02 * s), 0.27 * s, 0.0, 180.0, 12), st));
+    p.line_segment([c + vec2(0.0, 0.25 * s), c + vec2(0.0, 0.40 * s)], st);
+    p.line_segment([c + vec2(-0.12 * s, 0.40 * s), c + vec2(0.12 * s, 0.40 * s)], st);
+    if slashed {
+        p.line_segment([c + vec2(-0.40 * s, -0.40 * s), c + vec2(0.40 * s, 0.40 * s)], Stroke::new((s * 0.11).max(1.8), RED));
+    }
+}
+
+/// Fone de ouvido; `slashed` risca com uma barra diagonal (surdo).
+pub fn headphone_icon(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32, slashed: bool) {
+    let s = size;
+    let st = Stroke::new((s * 0.085).max(1.4), color);
+    p.add(egui::Shape::line(arc_points(c + vec2(0.0, 0.06 * s), 0.34 * s, 180.0, 360.0, 14), st));
+    for sx in [-1.0, 1.0] {
+        let cup = Rect::from_center_size(c + vec2(sx * 0.34 * s, 0.16 * s), vec2(0.17 * s, 0.30 * s));
+        p.rect_filled(cup, 0.05 * s, color);
+    }
+    if slashed {
+        p.line_segment([c + vec2(-0.40 * s, -0.40 * s), c + vec2(0.40 * s, 0.40 * s)], Stroke::new((s * 0.11).max(1.8), RED));
+    }
+}
+
+/// Alto-falante (canal de voz).
+pub fn speaker_icon(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) {
+    let s = size;
+    let st = Stroke::new((s * 0.085).max(1.3), color);
+    p.rect_filled(Rect::from_center_size(c + vec2(-0.27 * s, 0.0), vec2(0.18 * s, 0.26 * s)), 0.02 * s, color);
+    p.add(egui::Shape::convex_polygon(
+        vec![c + vec2(-0.18 * s, -0.13 * s), c + vec2(0.10 * s, -0.36 * s), c + vec2(0.10 * s, 0.36 * s), c + vec2(-0.18 * s, 0.13 * s)],
+        color,
+        Stroke::NONE,
+    ));
+    p.add(egui::Shape::line(arc_points(c + vec2(0.10 * s, 0.0), 0.22 * s, -50.0, 50.0, 8), st));
+    p.add(egui::Shape::line(arc_points(c + vec2(0.10 * s, 0.0), 0.40 * s, -50.0, 50.0, 10), st));
+}
+
+/// Telefone desligado (botão de desconectar).
+pub fn hangup_icon(p: &egui::Painter, c: egui::Pos2, size: f32, color: Color32) {
+    let s = size;
+    let st = Stroke::new((s * 0.17).max(2.2), color);
+    let pts = vec![
+        c + vec2(-0.40 * s, 0.10 * s),
+        c + vec2(-0.30 * s, -0.04 * s),
+        c + vec2(-0.12 * s, -0.12 * s),
+        c + vec2(0.12 * s, -0.12 * s),
+        c + vec2(0.30 * s, -0.04 * s),
+        c + vec2(0.40 * s, 0.10 * s),
+    ];
+    p.add(egui::Shape::line(pts, st));
+    p.line_segment([c + vec2(-0.40 * s, 0.10 * s), c + vec2(-0.40 * s, 0.24 * s)], st);
+    p.line_segment([c + vec2(0.40 * s, 0.10 * s), c + vec2(0.40 * s, 0.24 * s)], st);
+}
+
+/// Sinal de conexão: 3 barras de 5, 9 e 13 px.
+pub fn signal_icon(p: &egui::Painter, c: egui::Pos2, color: Color32) {
+    for (i, h) in [5.0_f32, 9.0, 13.0].iter().enumerate() {
+        let x = c.x - 7.0 + i as f32 * 5.0;
+        p.rect_filled(Rect::from_min_max(egui::pos2(x, c.y + 6.5 - h), egui::pos2(x + 3.0, c.y + 6.5)), 1.0, color);
+    }
+}
+
+/// Anel de "falando" (verde) ao redor de um avatar de raio `r`, por dentro da borda.
+pub fn speaking_ring(p: &egui::Painter, c: egui::Pos2, r: f32, width: f32, surface: Color32) {
+    p.circle_stroke(c, r - width / 2.0, Stroke::new(width, OK));
+    p.circle_stroke(c, r - width - 0.5, Stroke::new(1.0, surface));
+}

@@ -138,6 +138,11 @@ enum Act {
     Copy(String),
     Toast(String),
     ToggleText(i64),
+    JoinVoice(i64),
+    LeaveVoice,
+    ToggleMute,
+    ToggleDeaf,
+    OpenVoiceView,
     OpenProfile { user: i64, name: String, anchor: egui::Rect, left: bool },
     Reply(i64, p::Reply),
     CancelReply,
@@ -239,6 +244,14 @@ struct Session {
     /// Autocompletar de `@`: linha escolhida e posição do `@` dispensado com Esc.
     ac_sel: usize,
     ac_off: Option<usize>,
+    /// Voz: quem está em cada canal, minhas escolhas de mudo/surdo e se a visão de voz ocupa o centro.
+    voice: Vec<p::VoiceState>,
+    voice_muted: bool,
+    voice_deaf: bool,
+    voice_view: bool,
+    voice_since: Option<Instant>,
+    /// Volume de cada pessoa que ouço (0.0 a 2.0; ausente = 1.0).
+    voice_volumes: HashMap<i64, f32>,
     /// Rolagem horizontal da bandeja de anexos e onde ela ficou na tela (para a roda do mouse).
     tray_x: f32,
     tray_rect: egui::Rect,
@@ -369,6 +382,12 @@ impl Session {
             profile: None,
             ac_sel: 0,
             ac_off: None,
+            voice: Vec::new(),
+            voice_muted: false,
+            voice_deaf: false,
+            voice_view: false,
+            voice_since: None,
+            voice_volumes: HashMap::new(),
             tray_x: 0.0,
             tray_rect: egui::Rect::NOTHING,
             upload_tx,
@@ -489,6 +508,38 @@ impl Session {
             self.gw.send(C2S::Send { channel_id: ch, content, reply_to, nonce, attachments: ids });
         }
         self.pending.push(pend);
+    }
+
+    /// Meu estado de voz (canal onde estou), se estiver conectado.
+    fn my_voice(&self) -> Option<&p::VoiceState> {
+        self.voice.iter().find(|v| v.user_id == self.me.id)
+    }
+
+    /// Quem está no canal de voz `ch`, na ordem de entrada.
+    fn voice_members(&self, ch: i64) -> Vec<&p::VoiceState> {
+        self.voice.iter().filter(|v| v.channel_id == ch).collect()
+    }
+
+    /// (nome do canal, nome do servidor) do canal de voz `ch`.
+    fn voice_place(&self, ch: i64) -> Option<(String, String)> {
+        self.snap.servers.iter().find_map(|sv| sv.channels.iter().find(|c| c.id == ch).map(|c| (c.name.clone(), sv.name.clone())))
+    }
+
+    /// Está falando agora? (o motor de áudio responde; por ora ninguém)
+    fn voice_speaking(&self, _user: i64) -> bool {
+        false
+    }
+
+    /// Nome de um usuário conhecido (ou "?").
+    fn user_name_of(&self, id: i64) -> String {
+        self.user_info(id).map(|u| u.name).unwrap_or_else(|| "?".into())
+    }
+
+    /// Manda ao servidor meu mudo/surdo (surdo implica mudo).
+    fn send_voice_set(&self) {
+        if self.my_voice().is_some() {
+            self.gw.send(C2S::VoiceSet { muted: self.voice_muted || self.voice_deaf, deafened: self.voice_deaf });
+        }
     }
 
     /// Dados de um usuário conhecido (você, membros dos servidores, amigos, DMs, bloqueados).
@@ -758,6 +809,7 @@ impl Session {
                 Event::Msg(m) => match m {
                     S2C::Snapshot(sn) => {
                         self.me = sn.me.clone();
+                        self.voice = sn.voice.clone();
                         // não lido = há mensagem mais nova que a última lida (fora o canal aberto)
                         let cur = self.current_channel();
                         self.unread = sn
@@ -926,7 +978,20 @@ impl Session {
                         }
                         self.toast = Some(("Senha alterada. As outras sessões foram encerradas.".into(), Instant::now()));
                     }
-                    S2C::VoiceUpdate(_) | S2C::VoiceLeft { .. } => {} // TODO(voz): UI
+                    S2C::VoiceUpdate(st) => {
+                        self.voice.retain(|v| v.user_id != st.user_id);
+                        if st.user_id == self.me.id && self.voice_since.is_none() {
+                            self.voice_since = Some(Instant::now());
+                        }
+                        self.voice.push(st);
+                    }
+                    S2C::VoiceLeft { user_id, channel_id } => {
+                        self.voice.retain(|v| !(v.user_id == user_id && v.channel_id == channel_id));
+                        if user_id == self.me.id {
+                            self.voice_view = false;
+                            self.voice_since = None;
+                        }
+                    }
                     S2C::Auth { .. } => {}
                 },
             }
@@ -1935,7 +2000,39 @@ impl App {
         let mut keep = true;
         for a in acts {
             match a {
-                Act::Open(v) => s.open(v),
+                Act::Open(v) => {
+                    s.voice_view = false;
+                    s.open(v);
+                }
+                Act::JoinVoice(ch) => {
+                    if s.my_voice().map(|v| v.channel_id) != Some(ch) {
+                        s.gw.send(C2S::VoiceJoin { channel_id: ch });
+                        s.voice_since = Some(Instant::now());
+                        if s.voice_muted || s.voice_deaf {
+                            s.send_voice_set();
+                        }
+                    }
+                    s.voice_view = true;
+                }
+                Act::LeaveVoice => {
+                    s.gw.send(C2S::VoiceLeave);
+                    s.voice_view = false;
+                }
+                Act::ToggleMute => {
+                    if s.voice_deaf {
+                        // ligar o microfone com o áudio desligado liga o áudio também (como no Discord)
+                        s.voice_deaf = false;
+                        s.voice_muted = false;
+                    } else {
+                        s.voice_muted = !s.voice_muted;
+                    }
+                    s.send_voice_set();
+                }
+                Act::ToggleDeaf => {
+                    s.voice_deaf = !s.voice_deaf;
+                    s.send_voice_set();
+                }
+                Act::OpenVoiceView => s.voice_view = true,
                 Act::OpenServer(id) => s.open_server(id),
                 Act::Send(m) => s.gw.send(m),
                 Act::Modal(m) => s.modal = m,
@@ -2146,7 +2243,8 @@ impl App {
             .exact_size(240.0)
             .show(ui, |ui| {
                 let w = ui.available_width();
-                let list_h = (ui.available_height() - 60.0).max(50.0);
+                let in_voice = s.my_voice().is_some();
+                let list_h = (ui.available_height() - 60.0 - if in_voice { 66.0 } else { 0.0 }).max(50.0);
                 ui.allocate_ui(egui::vec2(w, list_h), |ui| match &s.view {
                     View::Chan { server, channel } => {
                         let Some(sv) = s.snap.servers.iter().find(|x| x.id == *server) else { return };
@@ -2190,6 +2288,52 @@ impl App {
                         });
                     }
                 });
+                // "Voz conectada": só enquanto estou num canal de voz
+                if let Some(mv) = s.my_voice() {
+                    egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 8, top: 0, bottom: 6 }).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::Frame::new()
+                            .fill(L2)
+                            .stroke(egui::Stroke::new(1.0, LINE))
+                            .corner_radius(egui::CornerRadius::same(10))
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                let (place_ch, place_sv) = s.voice_place(mv.channel_id).unwrap_or_default();
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    let (sr, _) = ui.allocate_exact_size(egui::vec2(16.0, 36.0), egui::Sense::hover());
+                                    signal_icon(ui.painter(), sr.center(), OK);
+                                    let tr = ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 0.0;
+                                        ui.label(RichText::new("Voz conectada").size(13.0).strong().color(OK));
+                                        let sub = format!("{place_ch} / {place_sv}");
+                                        let sub: String = if sub.chars().count() > 22 { format!("{}…", sub.chars().take(21).collect::<String>()) } else { sub };
+                                        ui.label(RichText::new(sub).size(11.0).color(MUTED));
+                                    });
+                                    let tap = ui.interact(tr.response.rect, egui::Id::new("voice-panel-text"), egui::Sense::click());
+                                    if tap.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    if tap.clicked() {
+                                        acts.push(Act::OpenVoiceView);
+                                    }
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        let (r, resp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
+                                        let hot = resp.hovered();
+                                        ui.painter().rect_filled(r, 8.0, if hot { L4 } else { L3 });
+                                        hangup_icon(ui.painter(), r.center(), 18.0, if hot { RED } else { TEXT2 });
+                                        if hot {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
+                                        if resp.on_hover_text("Desconectar").clicked() {
+                                            acts.push(Act::LeaveVoice);
+                                        }
+                                    });
+                                });
+                            });
+                    });
+                }
                 // cartão do usuário
                 egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 0)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -2202,15 +2346,55 @@ impl App {
                             let my = if s.me.status == p::Status::Offline { p::Status::Online } else { s.me.status };
                             let bg = ui.painter().add(egui::Shape::Noop);
                             let row = ui.horizontal(|ui| {
-                                avatar(ui, &s.me.name, s.me.id, 32.0, Some(my), L2);
-                                ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 0.0;
-                                    ui.label(RichText::new(&s.me.name).strong().color(TEXT));
-                                    ui.label(RichText::new(status_label(my)).size(11.5).color(MUTED));
+                                let left = ui
+                                    .horizontal(|ui| {
+                                        avatar(ui, &s.me.name, s.me.id, 32.0, Some(my), L2);
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 0.0;
+                                            ui.label(RichText::new(&s.me.name).strong().color(TEXT));
+                                            ui.label(RichText::new(status_label(my)).size(11.5).color(MUTED));
+                                        });
+                                    })
+                                    .response
+                                    .rect;
+                                // microfone e fone (mudo/surdo); riscado e avermelhado quando desligado
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    let deaf = s.voice_deaf;
+                                    let muted = s.voice_muted || s.voice_deaf;
+                                    for (is_deaf, off) in [(true, deaf), (false, muted)] {
+                                        let (r, resp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
+                                        let hot = resp.hovered();
+                                        let pt = ui.painter();
+                                        if off {
+                                            pt.rect_filled(r, 8.0, alpha(RED, if hot { 0.22 } else { 0.14 }));
+                                        } else if hot {
+                                            pt.rect_filled(r, 8.0, L4);
+                                        }
+                                        let ink = if off { RED } else if hot { TEXT } else { TEXT2 };
+                                        if is_deaf {
+                                            headphone_icon(pt, r.center(), 18.0, ink, off);
+                                        } else {
+                                            mic_icon(pt, r.center(), 18.0, ink, off);
+                                        }
+                                        if hot {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
+                                        let tip = match (is_deaf, off) {
+                                            (true, true) => "Ativar áudio",
+                                            (true, false) => "Desativar áudio",
+                                            (false, true) => "Ativar microfone",
+                                            (false, false) => "Desativar microfone",
+                                        };
+                                        if resp.on_hover_text(tip).clicked() {
+                                            acts.push(if is_deaf { Act::ToggleDeaf } else { Act::ToggleMute });
+                                        }
+                                    }
                                 });
+                                left
                             });
-                            // clicar no cartão abre o menu de status
-                            let rc = row.response.rect.expand2(egui::vec2(6.0, 4.0)).intersect(ui.max_rect().expand2(egui::vec2(0.0, 4.0)));
+                            // clicar no cartão abre o menu de status (só a parte do nome, os botões ficam livres)
+                            let rc = row.inner.expand2(egui::vec2(6.0, 4.0)).intersect(ui.max_rect().expand2(egui::vec2(0.0, 4.0)));
                             let card = ui.interact(rc, egui::Id::new("me-card"), egui::Sense::click());
                             if card.hovered() {
                                 ui.painter().set(bg, egui::Shape::rect_filled(rc, 8.0, L3));
@@ -2312,15 +2496,19 @@ impl App {
             let mut v: Vec<&p::Channel> = sv
                 .channels
                 .iter()
-                .filter(|c| c.kind == 0 && match parent {
+                .filter(|c| (c.kind == 0 || c.kind == 1) && match parent {
                     Some(p) => c.parent == Some(p),
                     None => c.parent.map_or(true, |p| !cats.iter().any(|k| k.id == p)),
                 })
                 .collect();
-            v.sort_by_key(|c| (c.position, c.id));
+            v.sort_by_key(|c| (c.kind, c.position, c.id));
             v
         };
         let row = |ui: &mut egui::Ui, c: &p::Channel, acts: &mut Vec<Act>| {
+            if c.kind == 1 {
+                self.voice_channel_row(ui, s, c, acts);
+                return;
+            }
             let selected = c.id == current;
             let unread = s.unread.contains(&c.id);
             let live = s.snap.live.iter().any(|l| l.channel_id == c.id);
@@ -2392,11 +2580,185 @@ impl App {
                 acts.push(Act::ToggleCategory(cat.id));
             }
             for c in kids {
-                if collapsed && c.id != current && !s.unread.contains(&c.id) {
+                if collapsed && c.id != current && !s.unread.contains(&c.id) && s.voice_members(c.id).is_empty() {
                     continue;
                 }
                 row(ui, c, acts);
             }
+        }
+    }
+
+    /// Canal de voz na lista: alto-falante + nome (clique entra) e, embaixo, quem está nele.
+    fn voice_channel_row(&self, ui: &mut egui::Ui, s: &Session, c: &p::Channel, acts: &mut Vec<Act>) {
+        let mine = s.my_voice().map(|v| v.channel_id) == Some(c.id);
+        let selected = mine && s.voice_view;
+        let members = s.voice_members(c.id);
+        let r = list_row(ui, selected, |ui| {
+            let (ir, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+            speaker_icon(ui.painter(), ir.center(), 18.0, if mine { TEXT2 } else { MUTED });
+            ui.label(RichText::new(&c.name).color(if mine { TEXT } else { TEXT2 }));
+        });
+        if r.clicked() {
+            acts.push(Act::JoinVoice(c.id));
+        }
+        for v in members {
+            let name = s.user_name_of(v.user_id);
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::click());
+            if resp.hovered() {
+                ui.painter().rect_filled(rect, 6.0, lerp(L1, L2, 1.0));
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let pt = ui.painter();
+            let ac = egui::pos2(rect.left() + 28.0 + 11.0, rect.center().y);
+            let (bg, fg) = user_tint(v.user_id);
+            pt.circle_filled(ac, 11.0, bg);
+            pt.text(ac, Align2::CENTER_CENTER, name.chars().next().map(|x| x.to_uppercase().to_string()).unwrap_or_default(), egui::FontId::proportional(11.0), fg);
+            if s.voice_speaking(v.user_id) {
+                speaking_ring(pt, ac, 11.0, 2.0, SIDE);
+            }
+            pt.text(egui::pos2(rect.left() + 28.0 + 28.0, rect.center().y), Align2::LEFT_CENTER, &name, egui::FontId::proportional(13.5), if v.deafened || v.muted { MUTED } else { TEXT2 });
+            let ic = egui::pos2(rect.right() - 14.0, rect.center().y);
+            if v.deafened {
+                headphone_icon(pt, ic, 15.0, MUTED, true);
+            } else if v.muted {
+                mic_icon(pt, ic, 15.0, MUTED, true);
+            }
+            if resp.clicked() {
+                acts.push(Act::OpenProfile { user: v.user_id, name: name.clone(), anchor: rect, left: false });
+            }
+        }
+    }
+
+    /// Visão do canal de voz: grade de participantes (16:9, linha incompleta centralizada) e barra de controles.
+    fn voice_view_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &mut Session, acts: &mut Vec<Act>) {
+        let Some(mv) = s.my_voice().cloned() else { return };
+        let (ch_name, sv_name) = s.voice_place(mv.channel_id).unwrap_or_default();
+        ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 63.0), Layout::left_to_right(Align::Center), |ui| {
+            ui.add_space(20.0);
+            let (ir, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+            speaker_icon(ui.painter(), ir.center(), 24.0, MUTED);
+            ui.add_space(4.0);
+            ui.label(serif(&ch_name, 24.0));
+            ui.add_space(8.0);
+            ui.label(RichText::new(sv_name).size(13.0).color(MUTED));
+        });
+        let y = ui.cursor().top();
+        ui.painter().hline(ui.max_rect().x_range(), y, egui::Stroke::new(1.0, LINE));
+        let total = ui.available_rect_before_wrap();
+        ui.allocate_rect(total, egui::Sense::hover());
+        let controls_h = 72.0;
+        let stage = egui::Rect::from_min_max(total.min + egui::vec2(16.0, 16.0), egui::pos2(total.max.x - 16.0, total.max.y - controls_h - 8.0));
+        let members: Vec<p::VoiceState> = s.voice_members(mv.channel_id).into_iter().cloned().collect();
+        let n = members.len().max(1);
+        // grade: o número de colunas que dá o maior tile 16:9
+        let (gap, aspect) = (8.0_f32, 16.0 / 9.0);
+        let mut best = (1usize, 0.0_f32);
+        for cols in 1..=n {
+            let rows = n.div_ceil(cols);
+            let w = ((stage.width() - (cols - 1) as f32 * gap) / cols as f32).min(((stage.height() - (rows - 1) as f32 * gap) / rows as f32) * aspect);
+            if w > best.1 {
+                best = (cols, w);
+            }
+        }
+        let (cols, tw) = (best.0, best.1.clamp(120.0, 1280.0));
+        let th = tw / aspect;
+        let rows = n.div_ceil(cols);
+        let gh = rows as f32 * th + (rows - 1) as f32 * gap;
+        let top = stage.center().y - gh / 2.0;
+        for (i, v) in members.iter().enumerate() {
+            let (row, col) = (i / cols, i % cols);
+            let in_row = cols.min(members.len() - row * cols);
+            let rw = in_row as f32 * tw + (in_row - 1) as f32 * gap;
+            let x0 = stage.center().x - rw / 2.0;
+            let rect = egui::Rect::from_min_size(egui::pos2(x0 + col as f32 * (tw + gap), top + row as f32 * (th + gap)), egui::vec2(tw, th));
+            let name = s.user_name_of(v.user_id);
+            let (bg, fg) = user_tint(v.user_id);
+            let resp = ui.interact(rect, egui::Id::new(("voice-tile", v.user_id)), egui::Sense::click());
+            let speaking = s.voice_speaking(v.user_id);
+            let pt = ui.painter();
+            pt.rect_filled(rect, 8.0, bg);
+            let d = (th * 0.44).clamp(40.0, 128.0);
+            let c = rect.center();
+            pt.circle_filled(c, d / 2.0, lerp(bg, fg, 0.22));
+            pt.text(c, Align2::CENTER_CENTER, name.chars().next().map(|x| x.to_uppercase().to_string()).unwrap_or_default(), egui::FontId::proportional(d * 0.42), fg);
+            // pílula do nome com o estado (mudo/surdo) antes do nome
+            let galley = pt.layout_no_wrap(name.clone(), egui::FontId::proportional(12.5), TEXT);
+            let icon_w = if v.deafened || v.muted { 20.0 } else { 0.0 };
+            let pill = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 8.0, rect.bottom() - 8.0 - 22.0),
+                egui::vec2(galley.size().x + 16.0 + icon_w, 22.0),
+            );
+            pt.rect_filled(pill, 6.0, Color32::from_black_alpha(158));
+            if v.deafened {
+                headphone_icon(pt, egui::pos2(pill.left() + 16.0, pill.center().y), 14.0, TEXT2, true);
+            } else if v.muted {
+                mic_icon(pt, egui::pos2(pill.left() + 16.0, pill.center().y), 14.0, TEXT2, true);
+            }
+            pt.galley(egui::pos2(pill.left() + 8.0 + icon_w, pill.center().y - galley.size().y / 2.0), galley, TEXT);
+            if speaking {
+                pt.rect_stroke(rect, 8.0, egui::Stroke::new(3.0, OK), egui::StrokeKind::Inside);
+            }
+            if resp.clicked() {
+                acts.push(Act::OpenProfile { user: v.user_id, name: name.clone(), anchor: rect, left: false });
+            }
+            if v.user_id != s.me.id {
+                let uid = v.user_id;
+                egui::Popup::context_menu(&resp).width(230.0).show(|ui| {
+                    ui.set_min_width(220.0);
+                    ui.label(RichText::new(&name).strong());
+                    ui.add_space(4.0);
+                    ui.label(caps("Volume do usuário"));
+                    let mut vol = s.voice_volumes.get(&uid).copied().unwrap_or(1.0);
+                    if ui.add(egui::Slider::new(&mut vol, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)).show_value(true)).changed() {
+                        s.voice_volumes.insert(uid, vol);
+                    }
+                });
+            }
+        }
+        // barra de controles
+        let bar = egui::Rect::from_min_max(egui::pos2(total.min.x, total.max.y - controls_h), total.max);
+        let (bw, bh, bgap) = (44.0_f32, 44.0_f32, 8.0_f32);
+        let total_w = bw * 2.0 + 56.0 + bgap * 2.0;
+        let mut x = bar.center().x - total_w / 2.0;
+        let yb = bar.center().y - bh / 2.0;
+        let deaf = s.voice_deaf;
+        let muted = s.voice_muted || s.voice_deaf;
+        for (is_deaf, off) in [(false, muted), (true, deaf)] {
+            let r = egui::Rect::from_min_size(egui::pos2(x, yb), egui::vec2(bw, bh));
+            x += bw + bgap;
+            let resp = ui.interact(r, egui::Id::new(("voice-ctl", is_deaf)), egui::Sense::click());
+            let hot = resp.hovered();
+            let pt = ui.painter();
+            pt.rect_filled(r, 12.0, if off { alpha(RED, if hot { 0.24 } else { 0.16 }) } else if hot { L4 } else { L3 });
+            pt.rect_stroke(r, 12.0, egui::Stroke::new(1.0, LINE2), egui::StrokeKind::Inside);
+            let ink = if off { RED } else { TEXT };
+            if is_deaf {
+                headphone_icon(pt, r.center(), 22.0, ink, off);
+            } else {
+                mic_icon(pt, r.center(), 22.0, ink, off);
+            }
+            if hot {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let tip = match (is_deaf, off) {
+                (true, true) => "Ativar áudio",
+                (true, false) => "Desativar áudio",
+                (false, true) => "Ativar microfone",
+                (false, false) => "Desativar microfone",
+            };
+            if resp.on_hover_text(tip).clicked() {
+                acts.push(if is_deaf { Act::ToggleDeaf } else { Act::ToggleMute });
+            }
+        }
+        let r = egui::Rect::from_min_size(egui::pos2(x, yb), egui::vec2(56.0, bh));
+        let resp = ui.interact(r, egui::Id::new("voice-hangup"), egui::Sense::click());
+        ui.painter().rect_filled(r, 12.0, if resp.hovered() { lerp(RED, TEXT, 0.12) } else { RED });
+        hangup_icon(ui.painter(), r.center(), 24.0, L0);
+        if resp.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.on_hover_text("Desconectar").clicked() {
+            acts.push(Act::LeaveVoice);
         }
     }
 
@@ -2699,6 +3061,10 @@ impl App {
         if age < 1.0 {
             ui.set_opacity(0.15 + 0.85 * ease_out(age));
             ctx.request_repaint();
+        }
+        if s.voice_view && s.my_voice().is_some() {
+            self.voice_view_ui(ui, ctx, s, acts);
+            return;
         }
         match s.view.clone() {
             View::Home => {
@@ -3711,13 +4077,14 @@ impl App {
                 modal(ctx, if *kind == 4 { "Criar categoria" } else { "Criar canal" }, 360.0, &mut dismissed, |ui| {
                         ui.set_width(320.0);
                         ui.horizontal(|ui| {
-                            ui.selectable_value(kind, 0, "Canal de texto");
+                            ui.selectable_value(kind, 0, "Texto");
+                            ui.selectable_value(kind, 1, "Voz");
                             ui.selectable_value(kind, 4, "Categoria");
                         });
                         ui.add_space(6.0);
                         ui.label(caps(if *kind == 4 { "Nome da categoria" } else { "Nome do canal" }));
                         ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY));
-                        if *kind == 0 && !cats.is_empty() {
+                        if *kind != 4 && !cats.is_empty() {
                             ui.label(caps("Categoria"));
                             let shown = parent
                                 .and_then(|p| cats.iter().find(|c| c.0 == p).map(|c| c.1.clone()))
@@ -3735,7 +4102,7 @@ impl App {
                                 server_id: *server,
                                 name: name.clone(),
                                 kind: *kind,
-                                parent_id: if *kind == 0 { *parent } else { None },
+                                parent_id: if *kind != 4 { *parent } else { None },
                             }));
                             close = true;
                         }
