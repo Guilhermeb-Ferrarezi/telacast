@@ -48,3 +48,49 @@ class AgcTest {
         assertTrue(agc.ganhoDb < 0.5f)
     }
 }
+
+class PreAgcTest {
+    private fun seno(db: Float): ShortArray {
+        val a = Math.pow(10.0, db / 20.0) * 1.4142 * 32768
+        return ShortArray(QUADRO) { i -> (a * kotlin.math.sin(2 * Math.PI * 300 * i / 48000)).toInt().toShort() }
+    }
+
+    private fun ruido(db: Float, r: java.util.Random): ShortArray {
+        val a = Math.pow(10.0, db / 20.0) * 32768
+        return ShortArray(QUADRO) { (r.nextGaussian() * a).toInt().coerceIn(-32768, 32767).toShort() }
+    }
+
+    @Test
+    fun fala_baixa_sobe_para_perto_do_alvo_depois_do_fundo() {
+        val p = PreAgc(); val r = java.util.Random(1)
+        repeat(300) { p.processar(ruido(-62f, r)) } // fundo constante
+        var q = seno(-55f)
+        repeat(60) { q = seno(-55f); p.processar(q) }
+        assertTrue("ganho ${p.ganhoDb}", p.ganhoDb > 18f)
+        assertEquals(PreAgc.ALVO_DB, rmsDb(q), 4f)
+    }
+
+    @Test
+    fun ruido_constante_nao_vira_fala() {
+        val p = PreAgc(); val r = java.util.Random(2)
+        repeat(800) { p.processar(ruido(-50f, r)) }
+        assertTrue("ganho ${p.ganhoDb}", p.ganhoDb < 6f)
+    }
+
+    @Test
+    fun ganho_cai_devagar_no_silencio() {
+        val p = PreAgc(); val r = java.util.Random(3)
+        repeat(300) { p.processar(ruido(-62f, r)) }
+        repeat(60) { p.processar(seno(-50f)) }
+        val g = p.ganhoDb
+        repeat(25) { p.processar(ruido(-62f, r)) } // 0,5 s
+        assertTrue(p.ganhoDb < g && p.ganhoDb > g - 4f)
+    }
+
+    @Test
+    fun fala_normal_nao_e_amplificada() {
+        val p = PreAgc()
+        repeat(80) { p.processar(seno(-28f)) }
+        assertTrue(p.ganhoDb < 3f)
+    }
+}

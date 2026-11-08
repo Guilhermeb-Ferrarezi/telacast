@@ -74,6 +74,74 @@ class Agc {
     }
 }
 
+/**
+ * Ganho de entrada automático ANTES do supressor de ruído. O RNNoise trata fala baixa (ou longe do microfone) como ruído e a
+ * corta, e o VAD que depende dele fecha: por isso a voz precisa chegar ao RNNoise num nível normal. Aqui não há alvo de
+ * volume final (isso é do [Agc], depois): só se traz o sinal para perto de [ALVO_DB].
+ *
+ * - "evidência de fala" = nível acima do piso de ruído estimado + [MARGEM_DB] (e acima de [MINIMO_DB]); o piso desce rápido
+ *   e sobe devagar, então o ruído constante de fundo não conta como fala;
+ * - com evidência o ganho sobe depressa (~100 ms) até `ALVO_DB - nível` (no máximo [MAX_DB]); sem evidência desce devagar
+ *   ([QUEDA_DB_POR_QUADRO]), para o ruído do silêncio não ser amplificado por muito tempo;
+ * - o ganho muda de forma contínua dentro do quadro e termina num limitador suave.
+ */
+class PreAgc {
+    @Volatile var ligado = true
+    var ganhoDb = 0f
+        private set
+    var pisoDb = -70f
+        private set
+    // piso = mínimo do nível nos últimos 1,5 s (75 quadros): o ruído de fundo constante vira piso, a fala (com pausas) não
+    private val janela = FloatArray(JANELA)
+    private var preenchidos = 0
+    private var pos = 0
+
+    fun reiniciar() { ganhoDb = 0f; pisoDb = -70f; preenchidos = 0; pos = 0 }
+
+    /** Aplica o ganho a [q] (20 ms, no lugar). Devolve o nível (dBFS) medido ANTES do ganho. */
+    fun processar(q: ShortArray): Float {
+        val db = rmsDb(q)
+        if (!ligado) { ganhoDb = 0f; return db }
+        janela[pos] = db; pos = (pos + 1) % JANELA; if (preenchidos < JANELA) preenchidos++
+        var mn = Float.MAX_VALUE
+        for (i in 0 until preenchidos) if (janela[i] < mn) mn = janela[i]
+        pisoDb = mn.coerceIn(-90f, -35f)
+        val evidencia = db > MINIMO_DB && db > pisoDb + MARGEM_DB
+        val g0 = ganhoDb
+        ganhoDb = if (evidencia) {
+            val desejado = (ALVO_DB - db).coerceIn(0f, MAX_DB)
+            val k = if (desejado > g0) SUBIDA else DESCIDA
+            (g0 + (desejado - g0) * k).coerceIn(0f, MAX_DB)
+        } else {
+            max(0f, g0 - QUEDA_DB_POR_QUADRO)
+        }
+        val g1 = ganhoDb
+        if (g0 == 0f && g1 == 0f) return db
+        val l0 = Math.pow(10.0, g0 / 20.0).toFloat()
+        val l1 = Math.pow(10.0, g1 / 20.0).toFloat()
+        val n = max(q.size, 1).toFloat()
+        for (i in q.indices) {
+            val l = l0 + (l1 - l0) * ((i + 1) / n)
+            val x = q[i] / 32768f * l
+            val a = abs(x)
+            val y = if (a <= 0.85f) x else { val s = min(0.85f + 0.15f * tanh((a - 0.85f) / 0.15f), 1f); if (x < 0) -s else s }
+            q[i] = (y * 32767f).toInt().coerceIn(-32768, 32767).toShort()
+        }
+        return db
+    }
+
+    companion object {
+        const val JANELA = 75
+        const val ALVO_DB = -30f
+        const val MAX_DB = 30f
+        const val MINIMO_DB = -68f
+        const val MARGEM_DB = 6f
+        const val SUBIDA = 0.18f // ~100 ms
+        const val DESCIDA = 0.3f
+        const val QUEDA_DB_POR_QUADRO = 0.08f // ~4 dB/s
+    }
+}
+
 private fun lerp(a: Float, b: Float, t: Float) = a + (b - a) * t.coerceIn(0f, 1f)
 
 /**

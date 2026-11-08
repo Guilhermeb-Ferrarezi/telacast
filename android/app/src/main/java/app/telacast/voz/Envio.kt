@@ -15,6 +15,9 @@ class PipelineDeEnvio(
     val vad = Vad()
     /** AGC por software, depois do VAD (os limiares não dependem do ganho acumulado). */
     val agc = Agc()
+    /** Ganho de entrada automático antes do supressor: voz baixa/longe chega ao RNNoise num nível normal. */
+    val preAgc = PreAgc()
+    private var quadros = 0
     /** Ganho linear de entrada (1 = sem mudança). */
     @Volatile var ganho = 1f
     /** Só para testes com hardware. */
@@ -45,7 +48,7 @@ class PipelineDeEnvio(
 
     /** Esquece o estado (ao ficar mudo): fecha o VAD, zera o medidor e a pré-rolagem. */
     fun reiniciar() {
-        vad.reiniciar(); agc.reiniciar(); medidor.reiniciar(); preroll.clear(); nivel = 0f; falando = false
+        vad.reiniciar(); agc.reiniciar(); preAgc.reiniciar(); medidor.reiniciar(); preroll.clear(); nivel = 0f; falando = false
         if (supressao) supressor?.reiniciar()
         supressaoAnterior = supressao; probDeVoz = 0f
     }
@@ -73,6 +76,7 @@ class PipelineDeEnvio(
         if (quadro.size != QUADRO) return
         val g = if (ganho.isFinite()) ganho.coerceIn(0f, 8f) else 1f
         for (i in 0 until QUADRO) buf[i] = (quadro[i] * g).toInt().coerceIn(-32768, 32767).toShort()
+        val dbCru = preAgc.processar(buf)
         // Supressão de ruído; ao alternar, crossfade linear de um quadro entre o sinal cru e o limpo (sem estalo)
         var prob: Float? = null
         val sup = supressor
@@ -97,6 +101,7 @@ class PipelineDeEnvio(
         val aberto = vad.processarDbProb(db, prob) || forcarAberto
         nivel = medidor.atualizar(db)
         falando = aberto
+        if (++quadros % 100 == 0) runCatching { android.util.Log.i("TelacastVoz", "nivel cru=${dbCru.toInt()}dB pre=+${preAgc.ganhoDb.toInt()}dB piso=${preAgc.pisoDb.toInt()}dB pos=${db.toInt()}dB prob=${"%.2f".format(probDeVoz)} vad=${if (aberto) 1 else 0} agc=+${agc.ganhoDb.toInt()}dB") }
         agc.processar(buf, db, vad.evidencia)
         val pacote = codificador.codificar(buf) ?: return
         if (aberto) {

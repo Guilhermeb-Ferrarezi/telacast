@@ -30,7 +30,7 @@ class MotorDeVoz(
     fun definirSurdo(v: Boolean) { surdo = v }
     fun definirSensibilidade(s: Float) { envio.vad.sensibilidade = s }
     fun definirGanho(g: Float) { envio.ganho = g }
-    fun definirAgc(ligado: Boolean) { envio.agc.ligado = ligado }
+    fun definirAgc(ligado: Boolean) { envio.agc.ligado = ligado; envio.preAgc.ligado = ligado }
     /** Opção "Supressão de ruído": liga o RNNoise (se a biblioteca nativa existe). */
     fun definirSupressao(ligado: Boolean) { envio.supressao = ligado }
     /** Há RNNoise próprio (então o NoiseSuppressor do sistema deve ficar desligado). */
