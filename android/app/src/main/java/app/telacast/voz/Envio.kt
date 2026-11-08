@@ -15,6 +15,8 @@ class PipelineDeEnvio(
     val vad = Vad()
     /** AGC por software, depois do VAD (os limiares não dependem do ganho acumulado). */
     val agc = Agc()
+    /** AGC2 (igual ao do Discord), depois do RNNoise e do VAD; substitui o [Agc] simples na cadeia. */
+    val agc2 = Agc2()
     /** Ganho de entrada automático antes do supressor: voz baixa/longe chega ao RNNoise num nível normal. */
     val preAgc = PreAgc()
     private var quadros = 0
@@ -48,7 +50,7 @@ class PipelineDeEnvio(
 
     /** Esquece o estado (ao ficar mudo): fecha o VAD, zera o medidor e a pré-rolagem. */
     fun reiniciar() {
-        vad.reiniciar(); agc.reiniciar(); preAgc.reiniciar(); medidor.reiniciar(); preroll.clear(); nivel = 0f; falando = false
+        vad.reiniciar(); agc.reiniciar(); agc2.reiniciar(); preAgc.reiniciar(); medidor.reiniciar(); preroll.clear(); nivel = 0f; falando = false
         if (supressao) supressor?.reiniciar()
         supressaoAnterior = supressao; probDeVoz = 0f
     }
@@ -101,8 +103,8 @@ class PipelineDeEnvio(
         val aberto = vad.processarDbProb(db, prob) || forcarAberto
         nivel = medidor.atualizar(db)
         falando = aberto
-        if (++quadros % 100 == 0) runCatching { android.util.Log.i("TelacastVoz", "nivel cru=${dbCru.toInt()}dB pre=+${preAgc.ganhoDb.toInt()}dB piso=${preAgc.pisoDb.toInt()}dB pos=${db.toInt()}dB prob=${"%.2f".format(probDeVoz)} vad=${if (aberto) 1 else 0} agc=+${agc.ganhoDb.toInt()}dB") }
-        agc.processar(buf, db, vad.evidencia)
+        if (++quadros % 100 == 0) runCatching { android.util.Log.i("TelacastVoz", "nivel cru=${dbCru.toInt()}dB pre=+${preAgc.ganhoDb.toInt()}dB piso=${preAgc.pisoDb.toInt()}dB pos=${db.toInt()}dB prob=${"%.2f".format(probDeVoz)} vad=${if (aberto) 1 else 0} agc2=+${agc2.ganhoDb.toInt()}dB fala=${agc2.nivelDeFalaDb.toInt()} margem=${agc2.margemDb.toInt()} ruido=${agc2.ruidoDb.toInt()}") }
+        agc2.processar(buf, prob ?: if (vad.evidencia) 1f else 0f)
         val pacote = codificador.codificar(buf) ?: return
         if (aberto) {
             if (!estava) while (preroll.isNotEmpty()) enviar(seq++, preroll.removeFirst())
