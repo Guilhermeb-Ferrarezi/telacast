@@ -20,7 +20,7 @@ object Arquivos {
             s.startsWith("wss://") -> "https://" + s.removePrefix("wss://")
             s.startsWith("ws://") -> "http://" + s.removePrefix("ws://")
             s.startsWith("http://") || s.startsWith("https://") -> s
-            else -> "http://$s"
+            else -> (if (app.telacast.net.Endereco.publico(s)) "https://" else "http://") + s
         }
     }
 

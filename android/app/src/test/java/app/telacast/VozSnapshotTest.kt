@@ -49,13 +49,13 @@ class VozSnapshotTest {
         desdeMs = agora - 83_000, volumes = mapOf(Amostras.marina.id to 1.4f),
     )
 
-    private fun tela(nome: String, estado: AppState, nav: Navegacao, voz: EstadoDeVoz) {
+    private fun tela(nome: String, estado: AppState, nav: Navegacao, voz: EstadoDeVoz, estatisticas: Boolean = false) {
         paparazzi.snapshot(nome) {
             GrafiteTheme {
                 CompositionLocalProvider(LocalProvedorDeAnexos provides AmostrasDeConversa.provedor()) {
                     TelaPrincipal(
                         estado, nav, emptySet(), null, AcoesPrincipais(),
-                        conversa = DadosDaConversa(agoraMs = agora, zona = AmostrasDeConversa.zona), voz = DadosDeVoz(voz, agora),
+                        conversa = DadosDaConversa(agoraMs = agora, zona = AmostrasDeConversa.zona), voz = DadosDeVoz(voz, agora, estatisticas),
                     )
                 }
             }
@@ -63,6 +63,11 @@ class VozSnapshotTest {
     }
 
     @Test fun voz_conectada() = tela("voz_conectada", estado(*sala), naTela, conectada())
+    @Test fun voz_estatisticas() = tela(
+        "voz_estatisticas", estado(*sala), naTela,
+        conectada().copy(estatisticas = app.telacast.voz.EstatisticasDeVoz(perdaPct = 1.8f, jitterMs = 7f, alvoMs = 100, bufferMs = 118f, cortesPorMin = 2, subfluxos = 1, nivelMic = 0.45f, ganhoEntradaDb = 0f, agcDb = 11.5f, probDeVoz = 0.87f, esticados = 3, comprimidos = 9, pacotesEnviados = 1840, usuarios = 2)),
+        estatisticas = true,
+    )
     @Test fun voz_eu_mudo() = tela("voz_eu_mudo", estado(*sala), naTela, conectada().copy(mudo = true, euFalando = false, nivel = 0f))
     @Test fun voz_eu_surdo() = tela("voz_eu_surdo", estado(*sala), naTela, conectada().copy(mudo = true, surdo = true, euFalando = false, nivel = 0f, rota = RotaDeAudio.Fone))
     @Test fun voz_conectando() = tela("voz_conectando", estado(v(Amostras.marina.id), v(Amostras.joao.id, mudo = true)), naTela, EstadoDeVoz(fase = FaseDaVoz.Entrando, canal = Amostras.SALA))

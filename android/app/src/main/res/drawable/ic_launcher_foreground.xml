@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "T" serifado do Telacast (como app/assets/icon.png do desktop), na zona segura do ícone adaptativo (66 dp centrais de 108). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#E9B35E" android:pathData="M33,31 H75 V47 H70.5 V37.5 H58.5 V71 H64.5 V77 H43.5 V71 H49.5 V37.5 H37.5 V47 H33 Z" />
+</vector>

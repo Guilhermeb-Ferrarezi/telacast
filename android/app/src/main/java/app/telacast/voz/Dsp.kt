@@ -266,3 +266,33 @@ class MedidorDeNivel {
 
     fun reiniciar() { nivel = 0f }
 }
+
+/**
+ * Filtro passa-alta de 80 Hz (biquad Butterworth de 2ª ordem) na captura, ANTES do ganho de entrada: tira ronco, vento e o "pop" de
+ * manusear o celular, que gastam bitrate do Opus e enganam o VAD e o AGC. Guarda o estado entre quadros (sem estalo na emenda).
+ */
+class PassaAlta(frequencia: Double = 80.0, taxa: Double = TAXA_DE_AMOSTRAGEM.toDouble()) {
+    private val b0: Float; private val b1: Float; private val b2: Float; private val a1: Float; private val a2: Float
+    private var x1 = 0f; private var x2 = 0f; private var y1 = 0f; private var y2 = 0f
+
+    init {
+        val w0 = 2 * PI * frequencia / taxa
+        val alfa = Math.sin(w0) / (2 * 0.70710678)
+        val c = cos(w0)
+        val a0 = 1 + alfa
+        b0 = ((1 + c) / 2 / a0).toFloat(); b1 = (-(1 + c) / a0).toFloat(); b2 = b0
+        a1 = (-2 * c / a0).toFloat(); a2 = ((1 - alfa) / a0).toFloat()
+    }
+
+    fun reiniciar() { x1 = 0f; x2 = 0f; y1 = 0f; y2 = 0f }
+
+    /** Filtra `entrada` para `saida` (podem ser o mesmo array). */
+    fun aplicar(entrada: ShortArray, saida: ShortArray) {
+        for (i in entrada.indices) {
+            val x = entrada[i].toFloat()
+            val y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+            x2 = x1; x1 = x; y2 = y1; y1 = if (y.isFinite()) y else 0f
+            saida[i] = y1.toInt().coerceIn(-32768, 32767).toShort()
+        }
+    }
+}

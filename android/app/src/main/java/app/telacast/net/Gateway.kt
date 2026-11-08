@@ -244,14 +244,14 @@ class Gateway(
         /** Códigos que dizem "esta sessão não vale mais" (docs/PROTOCOL.md, seção 4). */
         val SESSAO_INVALIDA = setOf(ErrorCode.SessionExpired, ErrorCode.NotAuthenticated, ErrorCode.VersionMismatch, ErrorCode.InvalidCredentials)
 
-        /** `host:porta`, `http(s)://...` ou `ws(s)://...` viram `ws(s)://.../ws`. Sem esquema vale `ws://`. */
+        /** `host:porta`, `http(s)://...` ou `ws(s)://...` viram `ws(s)://.../ws`. Sem esquema: domínio público vale `wss://`, o resto `ws://` (ver [Endereco]). */
         fun urlDoGateway(servidor: String): String {
             var s = servidor.trim().trimEnd('/')
             s = when {
                 s.startsWith("http://") -> "ws://" + s.removePrefix("http://")
                 s.startsWith("https://") -> "wss://" + s.removePrefix("https://")
                 s.startsWith("ws://") || s.startsWith("wss://") -> s
-                else -> "ws://$s"
+                else -> (if (Endereco.publico(s)) "wss://" else "ws://") + s
             }
             return if (s.endsWith("/ws")) s else "$s/ws"
         }

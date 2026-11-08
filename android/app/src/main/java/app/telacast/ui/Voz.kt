@@ -23,6 +23,7 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -40,7 +41,7 @@ import app.telacast.voz.FaseDaVoz
 import app.telacast.voz.RotaDeAudio
 
 /** O que as telas precisam saber da voz; `agoraMs == null` = relógio de verdade (os testes de imagem fixam um instante). */
-class DadosDeVoz(val estado: EstadoDeVoz = EstadoDeVoz(), val agoraMs: Long? = null)
+class DadosDeVoz(val estado: EstadoDeVoz = EstadoDeVoz(), val agoraMs: Long? = null, val estatisticasAbertas: Boolean = false)
 
 /** "sala de reunião · Turma do Telacast". */
 fun localDaVoz(estado: app.telacast.data.AppState, canal: Long?): String {
@@ -119,6 +120,10 @@ fun TelaDeVoz(
     acoes: AcoesDeVoz,
     modifier: Modifier = Modifier,
     novidade: Boolean = false,
+    aoVivo: Set<Long> = emptySet(),
+    transmissao: app.telacast.tela.EstadoDaTransmissao = app.telacast.tela.EstadoDaTransmissao(),
+    acoesTela: AcoesDeTela = AcoesDeTela(),
+    estatisticasAbertas: Boolean = false,
 ) {
     val naChamadaDeste = voz.naChamada && voz.canal == canalId
     Column(modifier.fillMaxSize().background(Grafite.L2)) {
@@ -136,6 +141,7 @@ fun TelaDeVoz(
             Spacer(Modifier.width(8.dp))
             Text(txt, style = Tipos.Corpo.copy(fontSize = 13.5.sp, color = cor, fontWeight = FontWeight.Medium))
         }
+        if (naChamadaDeste) PainelDeEstatisticas(voz.estatisticas, estatisticasAbertas)
         if (voz.erro != null) {
             Text(voz.erro, style = Tipos.Corpo.copy(fontSize = 13.sp, color = Grafite.Vermelho, lineHeight = 18.sp), modifier = Modifier.padding(horizontal = 16.dp).padding(bottom = 8.dp))
         }
@@ -153,11 +159,25 @@ fun TelaDeVoz(
                     // o meu estado vem do controlador (instantâneo); o dos outros, do servidor
                     val mudo = if (p.userId == euId) voz.mudo || voz.surdo else p.muted
                     val surdo = if (p.userId == euId) voz.surdo else p.deafened
-                    TileDeParticipante(nomeDe(p.userId), p.userId, falando, mudo, surdo, voz.volumeDe(p.userId), p.userId == euId) { if (p.userId != euId) acoes.aoEscolherVolume(p.userId) }
+                    TileDeParticipante(nomeDe(p.userId), p.userId, falando, mudo, surdo, voz.volumeDe(p.userId), p.userId == euId, p.userId in aoVivo, { acoesTela.aoAssistir(p.userId) }) { if (p.userId != euId) acoes.aoEscolherVolume(p.userId) }
                 }
             }
         }
         if (naChamadaDeste) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (transmissao.ativa) {
+                    Botao("Parar transmissão", TipoBotao.Perigo, Modifier.weight(1f), 44.dp, aoClicar = acoesTela.aoPararTransmissao)
+                    Botao("Qualidade", TipoBotao.Quieto, Modifier.weight(1f), 44.dp, aoClicar = acoesTela.aoAbrirOpcoes)
+                } else {
+                    Botao("Transmitir minha tela", TipoBotao.Quieto, Modifier.fillMaxWidth(), 44.dp, aoClicar = acoesTela.aoAbrirOpcoes)
+                }
+            }
+            if (transmissao.fase != app.telacast.tela.FaseDaTransmissao.Inativa) {
+                val (t, c) = textoDaTransmissao(transmissao)
+                Text(t, style = Tipos.Pequeno.copy(fontSize = 12.sp, color = c), modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp))
+            } else if (transmissao.mensagem != null) {
+                Text(transmissao.mensagem, style = Tipos.Pequeno.copy(fontSize = 12.sp, color = Grafite.Apagado), modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp))
+            }
             Box(Modifier.padding(horizontal = 24.dp, vertical = 6.dp).fillMaxWidth().height(4.dp).background(Grafite.L4, Formas.Selo)) {
                 Box(Modifier.fillMaxWidth(if (voz.mudo || voz.surdo) 0f else voz.nivel.coerceIn(0f, 1f)).height(4.dp).background(Grafite.Ambar, Formas.Selo))
             }
@@ -176,15 +196,17 @@ fun TelaDeVoz(
 }
 
 @Composable
-private fun TileDeParticipante(nome: String, id: Long, falando: Boolean, mudo: Boolean, surdo: Boolean, volume: Float, eu: Boolean, aoClicar: () -> Unit) {
-    Toque(aoClicar, Modifier.fillMaxWidth().height(132.dp).border(if (falando) 2.dp else 1.dp, if (falando) Grafite.Ok else Grafite.Linha2, Formas.Cartao), Formas.Cartao, fundo = Grafite.L3, fundoPressionado = Grafite.L4) {
+private fun TileDeParticipante(nome: String, id: Long, falando: Boolean, mudo: Boolean, surdo: Boolean, volume: Float, eu: Boolean, aoVivo: Boolean, aoAssistir: () -> Unit, aoClicar: () -> Unit) {
+    Toque(aoClicar, Modifier.fillMaxWidth().height(if (aoVivo && !eu) 176.dp else 132.dp).border(if (falando) 2.dp else 1.dp, if (falando) Grafite.Ok else Grafite.Linha2, Formas.Cartao), Formas.Cartao, fundo = Grafite.L3, fundoPressionado = Grafite.L4) {
         Box(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize().padding(10.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                 Avatar(nome, id, 64.dp, null, Grafite.L3, falando = falando)
                 Spacer(Modifier.height(8.dp))
                 Text(nome + if (eu) " (você)" else "", style = Tipos.Corpo.copy(fontSize = 14.sp, fontWeight = FontWeight.SemiBold), maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center)
+                if (aoVivo) { Spacer(Modifier.height(6.dp)); if (eu) SeloAoVivo(texto = "VOCÊ ESTÁ AO VIVO") else Botao("Assistir", TipoBotao.Primario, altura = 30.dp, aoClicar = aoAssistir) }
                 if (!eu && volume != 1f) Text("${(volume * 100).toInt()}%", style = Tipos.Pequeno.copy(fontSize = 11.sp, color = Grafite.Apagado))
             }
+            if (aoVivo && !eu) SeloAoVivo(Modifier.align(Alignment.TopStart).padding(8.dp))
             Row(Modifier.align(Alignment.TopEnd).padding(8.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 if (surdo) IconeFones(Grafite.Apagado, cortado = true, tamanho = 18.dp) else if (mudo) IconeMicrofone(Grafite.Apagado, cortado = true, tamanho = 18.dp)
             }
@@ -278,3 +300,47 @@ fun CartaoDeVoz(voz: EstadoDeVoz, local: String, agoraMs: Long?, acoes: AcoesDeV
 }
 
 private data class Quad(val rotulo: String, val ativo: Boolean, val clique: () -> Unit, val icone: @Composable (Color) -> Unit)
+
+private fun textoDaTransmissao(t: app.telacast.tela.EstadoDaTransmissao): Pair<String, Color> = when (t.fase) {
+    app.telacast.tela.FaseDaTransmissao.PedindoPermissao -> "Aguardando a permissão do Android…" to Grafite.Ambar
+    app.telacast.tela.FaseDaTransmissao.Conectando -> "Conectando a transmissão…" to Grafite.Ambar
+    app.telacast.tela.FaseDaTransmissao.Transmitindo -> "Você está transmitindo · ${if (t.espectadores == 1) "1 assistindo" else "${t.espectadores} assistindo"}${t.tamanho?.let { " · ${it.first}x${it.second}" } ?: ""}" to Grafite.Ambar
+    app.telacast.tela.FaseDaTransmissao.Reconectando -> "Sem conexão. Reconectando a transmissão…" to Grafite.Ambar
+    app.telacast.tela.FaseDaTransmissao.Erro -> (t.mensagem ?: "A transmissão parou.") to Grafite.Vermelho
+    app.telacast.tela.FaseDaTransmissao.Inativa -> "" to Grafite.Apagado
+}
+
+/** "Estatísticas" da chamada (2 vezes por segundo): rede, buffer, cortes, subfluxos e o que a captura está fazendo. Recolhido por padrão. */
+@Composable
+fun PainelDeEstatisticas(e: app.telacast.voz.EstatisticasDeVoz, abertoInicial: Boolean = false) {
+    var aberto by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(abertoInicial) }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+        Toque({ aberto = !aberto }, Modifier.fillMaxWidth().height(32.dp)) {
+            Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Estatísticas da chamada", style = Tipos.Pequeno.copy(fontSize = 12.sp, color = Grafite.Apagado), modifier = Modifier.weight(1f))
+                Text(if (aberto) "ocultar" else "mostrar", style = Tipos.Pequeno.copy(fontSize = 12.sp, color = Grafite.Ambar))
+            }
+        }
+        if (aberto) {
+            val linhas = listOf(
+                "Perda" to "${"%.1f".format(e.perdaPct).replace('.', ',')}%",
+                "Jitter" to "${e.jitterMs.toInt()} ms",
+                "Buffer (alvo / agora)" to "${e.alvoMs} / ${e.bufferMs.toInt()} ms",
+                "Cortes por minuto" to "${e.cortesPorMin}",
+                "Subfluxos do alto-falante" to "${e.subfluxos}",
+                "Ajustes de ritmo (−/+)" to "${e.esticados} / ${e.comprimidos}",
+                "Nível do microfone" to "${(e.nivelMic * 100).toInt()}%",
+                "Ganho de entrada" to "${"%+.1f".format(e.ganhoEntradaDb).replace('.', ',')} dB",
+                "Ganho automático (AGC)" to "${"%+.1f".format(e.agcDb).replace('.', ',')} dB",
+                "Probabilidade de voz (RNNoise)" to "${(e.probDeVoz * 100).toInt()}%",
+                "Pacotes enviados" to "${e.pacotesEnviados}",
+            )
+            Column(Modifier.fillMaxWidth().background(Grafite.L3, Formas.Botao).border(1.dp, Grafite.Linha2, Formas.Botao).padding(horizontal = 12.dp, vertical = 8.dp)) {
+                for ((k, v) in linhas) Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                    Text(k, style = Tipos.Pequeno.copy(fontSize = 12.sp, color = Grafite.Texto2), modifier = Modifier.weight(1f))
+                    Text(v, style = Tipos.Pequeno.copy(fontSize = 12.sp, color = Grafite.Texto, fontFamily = app.telacast.tema.Mono))
+                }
+            }
+        }
+    }
+}

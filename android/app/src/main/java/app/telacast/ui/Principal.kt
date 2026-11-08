@@ -46,6 +46,7 @@ import app.telacast.estado.MenuAberto
 import app.telacast.estado.Navegacao
 import app.telacast.net.EstadoConexao
 import app.telacast.proto.Status
+import app.telacast.tela.FaseDaTransmissao
 import app.telacast.tema.Grafite
 import app.telacast.tema.Tipos
 import kotlin.math.roundToInt
@@ -74,6 +75,8 @@ class AcoesPrincipais(
     val aoAbrirAjustes: () -> Unit = {},
     val aoAbrirPerfil: (Long, String) -> Unit = { _, _ -> },
     val voz: AcoesDeVoz = AcoesDeVoz(),
+    val tela: AcoesDeTela = AcoesDeTela(),
+    val atualizacao: AcoesDeAtualizacao = AcoesDeAtualizacao(),
 )
 
 /**
@@ -91,6 +94,8 @@ fun TelaPrincipal(
     modifier: Modifier = Modifier,
     conversa: DadosDaConversa = DadosDaConversa(),
     voz: DadosDeVoz = DadosDeVoz(),
+    dadosDeTela: DadosDeTela = DadosDeTela(),
+    atualizacao: app.telacast.atualizacao.EstadoDaAtualizacao = app.telacast.atualizacao.EstadoDaAtualizacao(),
 ) {
     BoxWithConstraints(modifier.fillMaxSize().background(Grafite.L2)) {
         val larguraGaveta = minOf((LARGURA_TRILHO + LARGURA_PAINEL).dp, maxWidth - 56.dp)
@@ -135,15 +140,17 @@ fun TelaPrincipal(
             },
         ) {
             Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.statusBars)) {
+                FaixaDeAtualizacao(atualizacao, acoes.atualizacao)
                 (estado.conexao as? EstadoConexao.Reconectando)?.let { FaixaDeReconexao(it.tentativa) }
                 // enquanto você está numa chamada e não está na tela dela, a faixa fica no topo do centro
                 val naTelaDaVoz = (nav.destino as? Destino.Voz)?.canal == voz.estado.canal
+                if (dadosDeTela.transmissao.ativa && dadosDeTela.transmissao.fase != FaseDaTransmissao.PedindoPermissao && !naTelaDaVoz) FaixaDeTransmissao(dadosDeTela.transmissao, acoes.tela) { acoes.voz.aoAbrirTela() }
                 if (voz.estado.naChamada && !naTelaDaVoz) FaixaDeVoz(voz.estado, localDaVoz(estado, voz.estado.canal), voz.agoraMs, acoes.voz)
-                Box(Modifier.weight(1f)) { Centro(estado, nav, acoes, conversa, voz) }
+                Box(Modifier.weight(1f)) { Centro(estado, nav, acoes, conversa, voz, dadosDeTela) }
             }
 
             CamadaLateral(pEsq, aEsquerda = true, largura = larguraGaveta, aoFechar = acoes.aoFecharGaveta) {
-                Gaveta(estado, nav, recolhidas, acoes, larguraGaveta, voz)
+                Gaveta(estado, nav, recolhidas, acoes, larguraGaveta, voz, dadosDeTela)
             }
             CamadaLateral(pDir, aEsquerda = false, largura = larguraMembros, aoFechar = acoes.aoFecharMembros) {
                 val sv = (nav.destino as? Destino.Canal)?.let { d -> estado.snapshot?.servers?.firstOrNull { it.id == d.servidor } }
@@ -154,9 +161,13 @@ fun TelaPrincipal(
             when (val d = nav.dialogo) {
                 null -> Unit
                 Dialogo.Fixadas, Dialogo.Busca, Dialogo.Ajustes -> TelaCheiaDoDialogo(d, estado, conversa, acoes, voz)
+                is Dialogo.Assistir -> TelaDoPlayer(estado.usuario(d.usuario)?.name ?: "Transmissão", dadosDeTela.player, dadosDeTela, acoes.tela)
                 else -> DialogoAtual(d, acoes.dialogo)
             }
             nav.perfil?.let { PerfilDaPrincipal(estado, it, acoes) }
+            if (atualizacao.fase == app.telacast.atualizacao.FaseDaAtualizacao.PrecisaDePermissao) FolhaDeFonteDesconhecida(acoes.atualizacao)
+            else if (atualizacao.folhaPendente && (atualizacao.fase == app.telacast.atualizacao.FaseDaAtualizacao.Disponivel || atualizacao.fase == app.telacast.atualizacao.FaseDaAtualizacao.Pronta)) FolhaDeAtualizacao(atualizacao, acoes.atualizacao)
+            if (nav.transmitirAberto) FolhaDeTransmissao(dadosDeTela.transmissao.opcoes, dadosDeTela.transmissao.fpsDisponiveis, dadosDeTela.transmissao.tamanho ?: TAMANHO_PADRAO_DA_TELA, dadosDeTela.transmissao.ativa && dadosDeTela.transmissao.fase != FaseDaTransmissao.PedindoPermissao, acoes.tela)
             nav.volume?.let { u ->
                 val nome = estado.usuario(u)?.name ?: "?"
                 FolhaDeVolume(nome, voz.estado.volumeDe(u), { acoes.voz.aoMudarVolume(u, it) }, acoes.voz.aoFecharVolume)
@@ -179,7 +190,7 @@ private fun FaixaDeReconexao(tentativa: Int) {
 }
 
 @Composable
-private fun Centro(estado: AppState, nav: Navegacao, acoes: AcoesPrincipais, conversa: DadosDaConversa, voz: DadosDeVoz) {
+private fun Centro(estado: AppState, nav: Navegacao, acoes: AcoesPrincipais, conversa: DadosDaConversa, voz: DadosDeVoz, tela: DadosDeTela) {
     val sn = estado.snapshot
     when (val d = nav.destino) {
         is Destino.Canal -> {
@@ -200,6 +211,7 @@ private fun Centro(estado: AppState, nav: Navegacao, acoes: AcoesPrincipais, con
                 TelaDeVoz(
                     voz.estado, canal.name, servidor.name, canal.id, estado.voz.filter { it.channelId == canal.id },
                     nomeDe = { nomes[it] ?: estado.usuario(it)?.name ?: "?" }, euId = estado.eu?.id ?: 0L, agoraMs = voz.agoraMs,
+                    aoVivo = sn.live.filter { it.channelId == canal.id }.map { it.userId }.toSet(), transmissao = tela.transmissao, acoesTela = acoes.tela, estatisticasAbertas = voz.estatisticasAbertas,
                     aoMenu = acoes.aoAbrirGaveta, acoes = acoes.voz, novidade = temNovidade(estado),
                 )
             } else TelaDeAmigos(estado, nav.abaInicio, acoes.aoAbrirGaveta, acoes.amigos)
@@ -210,7 +222,7 @@ private fun Centro(estado: AppState, nav: Navegacao, acoes: AcoesPrincipais, con
 
 /** Gaveta: trilho de servidores à esquerda, painel de canais (ou do Início) ao lado, e os menus por cima do painel. */
 @Composable
-private fun Gaveta(estado: AppState, nav: Navegacao, recolhidas: Set<Long>, acoes: AcoesPrincipais, largura: Dp, voz: DadosDeVoz) {
+private fun Gaveta(estado: AppState, nav: Navegacao, recolhidas: Set<Long>, acoes: AcoesPrincipais, largura: Dp, voz: DadosDeVoz, tela: DadosDeTela) {
     val sv = nav.servidorNoPainel?.let { id -> estado.snapshot?.servers?.firstOrNull { it.id == id } }
     Row(Modifier.fillMaxSize().background(Grafite.L1).windowInsetsPadding(WindowInsets.statusBars).windowInsetsPadding(WindowInsets.navigationBars)) {
         TrilhoDeServidores(estado, nav.servidorNoPainel, acoes.aoAbrirInicio, acoes.aoSelecionarServidor, acoes.aoAdicionarServidor)
@@ -223,7 +235,7 @@ private fun Gaveta(estado: AppState, nav: Navegacao, recolhidas: Set<Long>, acoe
                     aoAbrirMenuStatus = acoes.painel.aoAbrirMenuStatus, aoCriarCanal = acoes.painel.aoCriarCanal,
                     aoAbrirAmigos = acoes.painel.aoAbrirAmigos, aoAbrirDm = acoes.painel.aoAbrirDm,
                 ),
-                largura = largura - LARGURA_TRILHO.dp, voz = voz, acoesVoz = acoes.voz,
+                largura = largura - LARGURA_TRILHO.dp, voz = voz, acoesVoz = acoes.voz, transmissao = tela.transmissao, acoesTela = acoes.tela,
             )
             if (nav.menu != null) {
                 // toque fora do menu fecha
@@ -304,3 +316,6 @@ private fun PerfilDaPrincipal(estado: AppState, p: app.telacast.estado.PerfilAbe
     val dono = sn?.servers?.any { sv -> sv.owner == u.id && sv.channels.any { it.id == estado.canalAberto } } == true
     FolhaDePerfil(u, relacao, bloqueado, euMesmo = u.id == estado.eu?.id, dono = dono, a = acoes.perfil)
 }
+
+/** Tamanho de tela de referência (retrato, 720 x 1560) quando ainda não há captura para medir. */
+private val TAMANHO_PADRAO_DA_TELA = 720 to 1560

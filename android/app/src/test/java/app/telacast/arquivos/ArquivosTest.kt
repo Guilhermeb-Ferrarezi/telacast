@@ -45,6 +45,8 @@ class ArquivosTest {
         assertEquals("http://10.0.2.2:8080", Arquivos.urlHttp("10.0.2.2:8080"))
         assertEquals("http://h:1", Arquivos.urlHttp("ws://h:1/ws"))
         assertEquals("https://exemplo.com", Arquivos.urlHttp("wss://exemplo.com/"))
+        assertEquals("https://telecast.guilhermebf.dev", Arquivos.urlHttp("telecast.guilhermebf.dev"))
+        assertEquals("http://h", Arquivos.urlHttp("h"))
         assertEquals("http://h/files/7/foto%20da%20praia.png?token=T", Arquivos.url("http://h", anexo(7, "foto da praia.png"), "T"))
         assertEquals("http://h/upload?token=T&channel=5&name=relat%C3%B3rio.pdf", Arquivos.urlDeUpload("http://h", "T", 5, "relatório.pdf"))
     }

@@ -137,6 +137,7 @@ class DispositivoAndroid(
         Log.w(TAG, "alto-falante: write=$erro, reabrindo (${reaberturasSaida.get()}/$MAX_REABERTURAS)")
         synchronized(travaDeReabertura) {
             if (!rodando) return null
+            subfluxosAnteriores += runCatching { toca?.underrunCount }.getOrNull() ?: 0
             runCatching { toca?.stop() }; toca?.release(); toca = null
             Thread.sleep(PAUSA_DE_REABERTURA_MS)
             runCatching { aplicarRota() }
@@ -215,6 +216,9 @@ class DispositivoAndroid(
             }
         }
     }
+
+    private var subfluxosAnteriores = 0
+    override fun subfluxos(): Int = subfluxosAnteriores + (runCatching { toca?.underrunCount }.getOrNull() ?: 0)
 
     override fun definirRota(rota: RotaDeAudio) { this.rota = rota; aplicarRota() }
 

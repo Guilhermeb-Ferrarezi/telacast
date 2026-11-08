@@ -224,7 +224,7 @@ class EnvioERecepcaoTest {
 
     @Test fun aoAbrirManda5DePreRolagemEDepoisCadaQuadroEOHangover() {
         val enviados = ArrayList<Pair<Int, Int>>()
-        val p = PipelineDeEnvio(CodecFalso().codificador(), 1000)
+        val p = PipelineDeEnvio(CodecFalso().codificador(), 1000).also { it.filtroPassaAlta = false } // o filtro apagaria a marca da 1ª amostra
         // 10 quadros de silêncio marcados (valor 1..10 na 1ª amostra, nível baixo) e depois fala
         repeat(10) { i -> val q = ShortArray(QUADRO); q[0] = (i + 1).toShort(); p.processar(q) { s, b -> enviados += s to b[1].toInt() } }
         assertTrue(enviados.isEmpty())

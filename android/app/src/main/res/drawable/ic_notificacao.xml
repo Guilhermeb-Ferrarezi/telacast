@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Ícone pequeno das notificações: só a silhueta do "T" (o Android a pinta de branco e usa a cor âmbar do app). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:fillColor="#FFFFFF" android:pathData="M4,4 H20 V10 H18.3 V6.5 H13.5 V17.5 H15.7 V20 H8.3 V17.5 H10.5 V6.5 H5.7 V10 H4 Z" />
+</vector>

@@ -27,6 +27,14 @@ class PreferenciasAndroid(contexto: Context) : Preferencias {
         get() = p.getLong("ultimo_servidor", 0)
         set(v) { p.edit().putLong("ultimo_servidor", v).apply() }
 
+    override var ultimaDm: Long
+        get() = p.getLong("ultima_dm", 0)
+        set(v) { p.edit().putLong("ultima_dm", v).apply() }
+
+    override var versaoVista: String
+        get() = p.getString("versao_vista", "") ?: ""
+        set(v) { p.edit().putString("versao_vista", v).apply() }
+
     override var tamanhoDoTexto: Int
         get() = p.getInt("tamanho_texto", 1)
         set(v) { p.edit().putInt("tamanho_texto", v.coerceIn(0, 2)).apply() }

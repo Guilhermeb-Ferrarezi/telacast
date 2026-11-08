@@ -13,6 +13,10 @@ interface Preferencias {
     /** Último canal aberto (para reabrir o app onde parou); 0 = nenhum. */
     var ultimoCanal: Long
     var ultimoServidor: Long
+    /** Última conversa direta aberta (0 = a última foi um canal): o app reabre onde parou depois de o processo morrer. */
+    var ultimaDm: Long
+    /** Última versão nova cuja folha "O que mudou" já foi mostrada. */
+    var versaoVista: String
     /** Tamanho do texto das mensagens: 0 pequeno, 1 normal, 2 grande. */
     var tamanhoDoTexto: Int
     /** Opções de voz (supressão de ruído, eco, ganho, sensibilidade). */
@@ -39,6 +43,8 @@ class PreferenciasEmMemoria(
     override var categoriasRecolhidas: Set<Long> = emptySet(),
     override var ultimoCanal: Long = 0,
     override var ultimoServidor: Long = 0,
+    override var ultimaDm: Long = 0,
+    override var versaoVista: String = "",
     override var tamanhoDoTexto: Int = 1,
     override var opcoesDeVoz: OpcoesDeVoz = OpcoesDeVoz(),
     override var tokenDePush: String = "",

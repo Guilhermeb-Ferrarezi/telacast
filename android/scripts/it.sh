@@ -48,6 +48,13 @@ PY
 PORTA="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
 if [ "$PORTA" = "8080" ]; then echo "porta 8080 é do servidor de uso; abortando" >&2; exit 4; fi
 
+# atualização do app: chave de teste, um "APK" falso e o manifesto assinado para o teste de integração conferir
+export TELACAST_UPDATES_DIR="$TMP/updates"; mkdir -p "$TELACAST_UPDATES_DIR"
+CHAVE_PUBLICA="$("$BIN" update-keygen --out "$TMP/update.key" 2>&1 | tail -1 | tr -d '[:space:]')"
+head -c 262144 /dev/urandom > "$TMP/falso.apk"
+TELACAST_UPDATE_KEY_FILE="$TMP/update.key" "$BIN" publish-update --file "$TMP/falso.apk" --version 9.9.9 --platform android-arm64 --notes "Teste de integração: nada mudou." >/dev/null 2>&1 || echo "aviso: não consegui publicar a atualização de teste" >&2
+export TELACAST_IT_UPDATE_PUBKEY="$CHAVE_PUBLICA" TELACAST_IT_UPDATE_SHA="$(sha256sum "$TMP/falso.apk" | cut -d' ' -f1)"
+
 DATABASE_URL="$DB_URL" TELACAST_ADDR="127.0.0.1:$PORTA" RUST_LOG=warn TELACAST_FILES_DIR="$TMP/files" \
   "$BIN" serve >"$TMP/servidor.log" 2>&1 &
 SERVER_PID=$!

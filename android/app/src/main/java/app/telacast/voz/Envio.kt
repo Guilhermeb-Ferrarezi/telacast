@@ -25,6 +25,9 @@ class PipelineDeEnvio(
     /** Só para testes com hardware. */
     @Volatile var forcarAberto = false
     private val medidor = MedidorDeNivel()
+    /** Passa-alta de 80 Hz antes do ganho (a captura de celular traz ronco e vento). */
+    private val passaAlta = PassaAlta()
+    @Volatile var filtroPassaAlta = true
     private val preroll = ArrayDeque<ByteArray>(PREROLL + 1)
     private var seq = semente
     @Volatile var nivel = 0f
@@ -77,7 +80,8 @@ class PipelineDeEnvio(
     fun processar(quadro: ShortArray, enviar: (Int, ByteArray) -> Unit) {
         if (quadro.size != QUADRO) return
         val g = if (ganho.isFinite()) ganho.coerceIn(0f, 8f) else 1f
-        for (i in 0 until QUADRO) buf[i] = (quadro[i] * g).toInt().coerceIn(-32768, 32767).toShort()
+        if (filtroPassaAlta) passaAlta.aplicar(quadro, buf) else System.arraycopy(quadro, 0, buf, 0, QUADRO)
+        if (g != 1f) for (i in 0 until QUADRO) buf[i] = (buf[i] * g).toInt().coerceIn(-32768, 32767).toShort()
         val dbCru = preAgc.processar(buf)
         // Supressão de ruído; ao alternar, crossfade linear de um quadro entre o sinal cru e o limpo (sem estalo)
         var prob: Float? = null

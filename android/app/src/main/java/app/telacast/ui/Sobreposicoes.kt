@@ -157,7 +157,7 @@ fun DialogoAtual(d: Dialogo, a: AcoesDialogo) {
             }
         }
         // telas cheias com dados próprios: desenhadas em TelaPrincipal
-        Dialogo.Fixadas, Dialogo.Busca, Dialogo.Ajustes -> Unit
+        Dialogo.Fixadas, Dialogo.Busca, Dialogo.Ajustes, is Dialogo.Assistir -> Unit
         is Dialogo.Imagem -> VisualizadorDeImagem(d.anexo, a.aoFechar) { a.aoBaixarAnexo(d.anexo) }
         is Dialogo.Texto -> VisualizadorDeTexto(d.anexo, a.aoFechar) { a.aoBaixarAnexo(d.anexo) }
         is Dialogo.ConfirmarApagar -> Janela("Apagar mensagem?", a.aoFechar) {

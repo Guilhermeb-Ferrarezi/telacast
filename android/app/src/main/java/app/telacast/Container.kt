@@ -31,6 +31,9 @@ import app.telacast.net.Transporte
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 
 /**
  * Contêiner de injeção de dependência manual (sem Hilt, KSP nem kapt): vive no `Application`.
@@ -57,6 +60,18 @@ class Container(
     provedorDeToken: ProvedorDeToken = SemToken,
     /** RNNoise da voz (no app: `SupressorRnnoise`); `null` nos testes. */
     fabricaDeSupressor: app.telacast.voz.FabricaDeSupressor? = null,
+    /** Captura de tela e decodificador de vídeo (no app: `FonteAndroid`, `DecodificadorAndroid`); nos testes, os sem tela. */
+    fabricaDeFonte: app.telacast.tela.FabricaDeFonte = app.telacast.tela.FabricaDeFonte { app.telacast.tela.FonteSemCaptura },
+    fabricaDeDecodificador: app.telacast.tela.FabricaDeDecodificador = app.telacast.tela.FabricaDeDecodificador { app.telacast.tela.DecodificadorSemVideo },
+    transporteDeVideo: app.telacast.tela.TransporteDeVideo = app.telacast.tela.OkHttpTransporteDeVideo(),
+    /** Atualização pelo app: chave pública (hex) do servidor; vazia = atualização desligada. */
+    chaveDeAtualizacao: String = "",
+    versaoDoApp: String = "0.0.0",
+    instaladorDeApk: app.telacast.atualizacao.InstaladorDeApk = app.telacast.atualizacao.SemInstalador,
+    pastaDeAtualizacao: java.io.File = java.io.File(System.getProperty("java.io.tmpdir") ?: ".", "telacast-atualizacao"),
+    apiDeAtualizacao: app.telacast.atualizacao.ApiDeAtualizacao? = null,
+    /** Relatório do último crash (no app, o arquivo privado). */
+    val relatorioDeCrash: app.telacast.diagnostico.RelatorioDeCrash? = null,
 ) {
     val gateway = Gateway(escopo, transporte, relogio)
     val repositorio = Repository(escopo, gateway, relogio)
@@ -79,4 +94,22 @@ class Container(
     val push = GerenciadorDePush(repositorio, escopo, provedorDeToken, preferencias)
     val foco = ControladorDeFoco(repositorio, escopo)
     val receptorDePush = ReceptorDePush(notificador, { foco.emPrimeiroPlano }, relogio)
+
+    /** Tela compartilhada (C5): transmitir a do celular (`/publish`) e assistir à dos outros (`/watch`). Só vale com a pessoa num canal de voz. */
+    private val canalDaVoz = voz.estado.map { if (it.naChamada) it.canal else null }.stateIn(escopo, SharingStarted.Eagerly, null)
+    val transmissao = app.telacast.tela.ControladorDeTransmissao(
+        escopo, repositorio.estado, canalDaVoz, transporteDeVideo, fabricaDeFonte,
+        { id -> repositorio.token?.let { app.telacast.tela.urlDeVideo(baseHttp(), "publish", id, it) } }, relogio,
+    )
+    val player = app.telacast.tela.ControladorDoPlayer(
+        escopo, repositorio.estado, transporteDeVideo, fabricaDeDecodificador,
+        { id -> repositorio.token?.let { app.telacast.tela.urlDeVideo(baseHttp(), "watch", id, it) } },
+    )
+
+    /** Atualização pelo próprio app (APK assinado pelo servidor, verificado antes de instalar). */
+    val atualizacao = app.telacast.atualizacao.ControladorDeAtualizacao(
+        escopo, apiDeAtualizacao ?: app.telacast.atualizacao.OkHttpAtualizacao({ baseHttp() }),
+        app.telacast.atualizacao.VerificadorDeAtualizacao(app.telacast.atualizacao.hexParaBytes(chaveDeAtualizacao)),
+        instaladorDeApk, versaoDoApp, pastaDeAtualizacao, { preferencias.versaoVista }, { preferencias.versaoVista = it }, relogio,
+    )
 }

@@ -60,12 +60,15 @@ fun TelaDeLogin(form: FormLogin, acoes: AcoesLogin, modifier: Modifier = Modifie
             Spacer(Modifier.height(18.dp))
 
             val livre = !form.entrando
-            Rotulo("Servidor", Modifier.padding(bottom = 6.dp))
-            Campo(
-                form.servidor, { v -> acoes.aoEditar { it.copy(servidor = v) } }, "endereço.do.servidor:8080",
-                habilitado = livre, teclado = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next, autoCorrectEnabled = false),
-            )
-            Spacer(Modifier.height(14.dp))
+            // o servidor já vem preenchido: só aparece em "Avançado" (ou se estiver vazio, para não travar a entrada)
+            if (form.avancado || form.servidor.isBlank()) {
+                Rotulo("Servidor", Modifier.padding(bottom = 6.dp))
+                Campo(
+                    form.servidor, { v -> acoes.aoEditar { it.copy(servidor = v) } }, "endereço.do.servidor",
+                    habilitado = livre, teclado = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next, autoCorrectEnabled = false),
+                )
+                Spacer(Modifier.height(14.dp))
+            }
             Rotulo("Usuário", Modifier.padding(bottom = 6.dp))
             Campo(
                 form.usuario, { v -> acoes.aoEditar { it.copy(usuario = v) } }, "seu_nome",
@@ -105,6 +108,12 @@ fun TelaDeLogin(form: FormLogin, acoes: AcoesLogin, modifier: Modifier = Modifie
                     if (form.registrar) "Entrar" else "Registrar-se",
                     style = Tipos.Corpo.copy(color = if (livre) Grafite.Ambar else Grafite.Apagado, fontWeight = FontWeight.SemiBold),
                     modifier = Modifier.clickable(enabled = livre, interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = acoes.aoAlternarModo).padding(vertical = 10.dp),
+                )
+            }
+            if (!form.avancado && form.servidor.isNotBlank()) {
+                Text(
+                    "Avançado", style = Tipos.Pequeno.copy(color = Grafite.Apagado), textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().clickable(enabled = livre, interactionSource = remember { MutableInteractionSource() }, indication = null) { acoes.aoEditar { it.copy(avancado = true) } }.padding(vertical = 8.dp),
                 )
             }
             if (!form.registrar) {

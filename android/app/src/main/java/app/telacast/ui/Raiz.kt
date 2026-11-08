@@ -9,6 +9,7 @@ import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -32,6 +33,23 @@ import app.telacast.net.EstadoConexao
 /** Liga o [AppViewModel] às telas sem estado. Também é onde mora o `BackHandler`. */
 @Composable
 fun RaizDoApp(vm: AppViewModel) {
+    val crash by vm.relatorioDeCrash.collectAsState()
+    val ctx = LocalContext.current
+    val area = LocalClipboardManager.current
+    androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.fillMaxSize()) {
+        ConteudoDoApp(vm)
+        crash?.let { rel ->
+            JanelaDeCrash(
+                rel, aoCopiar = { area.setText(AnnotatedString(rel)); vm.mostrarAviso("Relatório copiado") },
+                aoCompartilhar = { runCatching { ctx.startActivity(android.content.Intent.createChooser(android.content.Intent(android.content.Intent.ACTION_SEND).setType("text/plain").putExtra(android.content.Intent.EXTRA_TEXT, rel), "Compartilhar relatório").addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) } },
+                aoFechar = vm::dispensarCrash,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ConteudoDoApp(vm: AppViewModel) {
     val fase by vm.fase.collectAsState()
     val estado by vm.estado.collectAsState()
     when (fase) {
@@ -54,6 +72,28 @@ fun RaizDoApp(vm: AppViewModel) {
             val tamanhoTexto by vm.tamanhoDoTexto.collectAsState()
             val senhaTrocada by vm.senhaTrocada.collectAsState()
             val vozEstado by vm.voz.collectAsState()
+            val telaTransmissao by vm.transmissao.collectAsState()
+            val atualizacaoEstado by vm.atualizacao.collectAsState()
+            val telaPlayer by vm.player.collectAsState()
+            // permissão de captura da tela: o Android pede de novo a cada transmissão (diálogo próprio dele)
+            val ctxTela = LocalContext.current
+            val pedirProjecao = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r -> vm.permissaoDeTela(r.resultCode, r.data) }
+            LaunchedEffect(telaTransmissao.fase) {
+                if (telaTransmissao.fase == app.telacast.tela.FaseDaTransmissao.PedindoPermissao) {
+                    val mpm = ctxTela.getSystemService(android.media.projection.MediaProjectionManager::class.java)
+                    runCatching { pedirProjecao.launch(mpm.createScreenCaptureIntent()) }.onFailure { vm.permissaoDeTela(0, null) }
+                }
+            }
+            // player: livre para girar; "tela cheia" força paisagem e esconde as barras do sistema
+            var telaCheia by remember { mutableStateOf(false) }
+            val assistindo = nav.dialogo is Dialogo.Assistir
+            val janela = (ctxTela as? android.app.Activity)
+            androidx.compose.runtime.DisposableEffect(assistindo, telaCheia) {
+                janela?.requestedOrientation = when { assistindo && telaCheia -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE; assistindo -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR; else -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
+                val ctrl = janela?.window?.let { androidx.core.view.WindowCompat.getInsetsController(it, it.decorView) }
+                if (assistindo && telaCheia) ctrl?.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+                onDispose { ctrl?.show(androidx.core.view.WindowInsetsCompat.Type.systemBars()); if (!assistindo) telaCheia = false }
+            }
             val contexto = LocalContext.current
             // POST_NOTIFICATIONS (Android 13+): pedida uma vez ao entrar na conta; se negar, não insistimos
             val pedirNotificacoes = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
@@ -119,9 +159,27 @@ fun RaizDoApp(vm: AppViewModel) {
             CompositionLocalProvider(LocalProvedorDeAnexos provides provedor, LocalEscalaDoTexto provides escalaDoTexto(tamanhoTexto)) {
                 TelaPrincipal(
                     estado, nav, recolhidas, aviso,
-                    acoesDe(vm, copiar = { area.setText(AnnotatedString(it)) }, abrirLink = { runCatching { links.openUri(it) } }, anexar = { seletor.launch("*/*") }, baixar = baixar, aoAbrirVoz = abrirVoz, aoEntrarNaVoz = entrarNaVoz),
+                    acoesDe(vm, copiar = { area.setText(AnnotatedString(it)) }, abrirLink = { runCatching { links.openUri(it) } }, anexar = { seletor.launch("*/*") }, baixar = baixar, aoAbrirVoz = abrirVoz, aoEntrarNaVoz = entrarNaVoz, aoTelaCheia = { telaCheia = !telaCheia }),
                     conversa = DadosDaConversa(compositor, anexos, spoilers, textos, reveladas, agora, consultaDaBusca = consulta, buscaNoCanal = buscaNoCanal, tamanhoDoTexto = tamanhoTexto, senhaTrocada = senhaTrocada),
                     voz = DadosDeVoz(vozEstado),
+                    atualizacao = atualizacaoEstado,
+                    dadosDeTela = DadosDeTela(
+                        telaTransmissao, telaPlayer, telaCheia = telaCheia,
+                        superficie = { m ->
+                            androidx.compose.ui.viewinterop.AndroidView(
+                                factory = { ctx ->
+                                    android.view.SurfaceView(ctx).apply {
+                                        holder.addCallback(object : android.view.SurfaceHolder.Callback {
+                                            override fun surfaceCreated(h: android.view.SurfaceHolder) = vm.definirSuperficieDoPlayer(h.surface)
+                                            override fun surfaceChanged(h: android.view.SurfaceHolder, f: Int, w: Int, a: Int) = Unit
+                                            override fun surfaceDestroyed(h: android.view.SurfaceHolder) = vm.definirSuperficieDoPlayer(null)
+                                        })
+                                    }
+                                },
+                                modifier = m,
+                            )
+                        },
+                    ),
                 )
             }
         }
@@ -136,6 +194,7 @@ private fun acoesDe(
     baixar: (app.telacast.proto.Attachment) -> Unit,
     aoAbrirVoz: (Long, Long) -> Unit,
     aoEntrarNaVoz: (Long) -> Unit,
+    aoTelaCheia: () -> Unit,
 ) = AcoesPrincipais(
     painel = AcoesPainel(
         aoAbrirCanal = vm::abrirCanal,
@@ -236,6 +295,19 @@ private fun acoesDe(
     ),
     aoAbrirAjustes = vm::abrirAjustes,
     aoAbrirPerfil = vm::abrirPerfil,
+    atualizacao = AcoesDeAtualizacao(
+        aoAtualizar = vm::atualizar, aoInstalar = vm::instalarAtualizacao, aoDispensarFolha = vm::dispensarFolhaDeAtualizacao,
+        aoAbrirPermissao = vm::abrirPermissaoDeInstalacao, aoCancelarPermissao = vm::cancelarPermissaoDeInstalacao,
+    ),
+    tela = AcoesDeTela(
+        aoAbrirOpcoes = vm::abrirOpcoesDeTransmissao,
+        aoFecharOpcoes = vm::fecharOpcoesDeTransmissao,
+        aoTransmitir = vm::transmitir,
+        aoPararTransmissao = vm::pararTransmissao,
+        aoAssistir = vm::assistir,
+        aoFecharPlayer = vm::fecharDialogo,
+        aoTelaCheia = aoTelaCheia,
+    ),
     voz = AcoesDeVoz(
         aoEntrar = aoEntrarNaVoz,
         aoSair = vm::sairDaVoz,

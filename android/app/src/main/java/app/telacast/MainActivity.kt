@@ -7,6 +7,7 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.compose.ui.graphics.toArgb
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -25,6 +26,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        installSplashScreen() // troca o tema de splash pelo Theme.Telacast
         // só tema escuro: barras de sistema sempre escuras, ícones claros
         val escuro = SystemBarStyle.dark(Grafite.L2.toArgb())
         enableEdgeToEdge(statusBarStyle = escuro, navigationBarStyle = escuro)
@@ -40,7 +42,13 @@ class MainActivity : ComponentActivity() {
         tratarToque(intent)
     }
 
+    override fun onStart() {
+        super.onStart()
+        vm.aoVoltarParaFrente()
+    }
+
     private fun tratarToque(intent: Intent?) {
+        if (intent?.action == app.telacast.atualizacao.ACAO_INSTALAR_ATUALIZACAO) { vm.instalarAtualizacao(); return }
         destinoDoIntent(intent)?.let { vm.abrirPorNotificacao(it) }
     }
 }

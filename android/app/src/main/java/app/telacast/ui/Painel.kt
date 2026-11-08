@@ -74,6 +74,8 @@ fun PainelDeCanais(
     largura: androidx.compose.ui.unit.Dp = LARGURA_PAINEL.dp,
     voz: DadosDeVoz = DadosDeVoz(),
     acoesVoz: AcoesDeVoz = AcoesDeVoz(),
+    transmissao: app.telacast.tela.EstadoDaTransmissao = app.telacast.tela.EstadoDaTransmissao(),
+    acoesTela: AcoesDeTela = AcoesDeTela(),
 ) {
     Column(modifier.width(largura).fillMaxHeight().background(Grafite.L1)) {
         Column(Modifier.weight(1f)) {
@@ -84,6 +86,7 @@ fun PainelDeCanais(
                 ListaDeMensagensDiretas(estado, destino, acoes, Modifier.weight(1f))
             }
         }
+        if (transmissao.ativa && transmissao.fase != app.telacast.tela.FaseDaTransmissao.PedindoPermissao) CartaoDeTransmissao(transmissao, acoesTela)
         if (voz.estado.naChamada) CartaoDeVoz(voz.estado, localDaVoz(estado, voz.estado.canal), voz.agoraMs, acoesVoz)
         CartaoDoUsuario(estado, acoes.aoAbrirMenuStatus)
     }
@@ -186,6 +189,7 @@ private fun LinhaDeCanal2(estado: AppState, sv: ServerInfo, c: Channel, atual: L
 private fun LinhaDeVoz(estado: AppState, sv: ServerInfo, c: Channel, acoes: AcoesPainel, voz: EstadoDeVoz, selecionado: Boolean, euId: Long) {
     val membros = estado.voz.filter { it.channelId == c.id }
     val nesteCanal = voz.naChamada && voz.canal == c.id
+    val aoVivo = estado.snapshot?.live.orEmpty().filter { it.channelId == c.id }.map { it.userId }.toSet()
     Toque({ acoes.aoCliqueEmVoz(sv.id, c.id) }, Modifier.fillMaxWidth().height(ALTURA_LINHA.dp), Formas.Linha, fundo = if (selecionado) Grafite.L3 else Grafite.L1, fundoPressionado = Grafite.L2) {
         Row(Modifier.fillMaxSize().padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.width(20.dp), contentAlignment = Alignment.CenterStart) { IconeAltoFalante(if (nesteCanal) Grafite.Ok else Grafite.Apagado) }
@@ -202,6 +206,7 @@ private fun LinhaDeVoz(estado: AppState, sv: ServerInfo, c: Channel, acoes: Acoe
             Avatar(nome, v.userId, 22.dp, fundo = Grafite.L1, falando = falando)
             Spacer(Modifier.width(8.dp))
             Text(nome, style = Tipos.Corpo.copy(fontSize = 13.5.sp, color = if (mudo) Grafite.Apagado else Grafite.Texto2), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            if (v.userId in aoVivo) { SeloAoVivo(); Spacer(Modifier.width(6.dp)) }
             if (if (eu && nesteCanal) voz.surdo else v.deafened) IconeFones(Grafite.Apagado, cortado = true, tamanho = 14.dp)
             else if (mudo) IconeMicrofone(Grafite.Apagado, cortado = true, tamanho = 14.dp)
         }

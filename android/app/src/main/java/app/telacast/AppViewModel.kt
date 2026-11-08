@@ -83,9 +83,14 @@ class AppViewModel(private val c: Container) : ViewModel() {
     init {
         escopo.launch { repo.estado.collect { aoMudarEstado(it) } }
         escopo.launch { repo.avisos.collect { aoReceberAviso(it) } }
+        // o player abre e fecha junto com o diálogo "Assistir" (inclusive pelo botão Voltar)
+        escopo.launch { _nav.map { (it.dialogo as? Dialogo.Assistir)?.canal }.distinctUntilChanged().collect { canal -> if (canal != null) c.player.abrir(canal) else c.player.parar() } }
+        // erro ou fim da transmissão viram aviso curto em qualquer tela
+        escopo.launch { c.transmissao.estado.map { if (it.fase == app.telacast.tela.FaseDaTransmissao.Erro || it.fase == app.telacast.tela.FaseDaTransmissao.Inativa) it.mensagem else null }.distinctUntilChanged().collect { m -> if (m != null) mostrarAviso(m) } }
         // erros da voz (permissão negada, microfone ocupado, queda) também viram aviso curto, mesmo fora da tela da voz
         escopo.launch { c.voz.estado.map { it.erro }.distinctUntilChanged().filterNotNull().collect { mostrarAviso(it) } }
         retomarSessaoSalva()
+        c.atualizacao.verificar(forcar = true) // a cada abertura do app; falha de rede é silenciosa
     }
 
     // ------------------------------------------------------------------ entrada
@@ -186,7 +191,8 @@ class AppViewModel(private val c: Container) : ViewModel() {
             val sv = servidores.firstOrNull { sv -> sv.channels.any { it.kind == Channel.TEXTO } }
             if (sv == null) 0L to 0L else sv.id to sv.channels.filter { it.kind == Channel.TEXTO }.sortedBy { it.position }.first().id
         }
-        if (canal != 0L) abrirCanal(servidor, canal) else _nav.update { it.selecionarServidor(null) }
+        val dm = s.snapshot?.dms?.firstOrNull { it.channelId == c.preferencias.ultimaDm }
+        if (dm != null) abrirDm(dm.channelId) else if (canal != 0L) abrirCanal(servidor, canal) else _nav.update { it.selecionarServidor(null) }
     }
 
     /** Se o canal aberto sumiu do snapshot (apagado, saí do servidor), volta ao Início. */
@@ -226,6 +232,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
         c.compositor.abrirCanal(canal)
         c.preferencias.ultimoServidor = servidor
         c.preferencias.ultimoCanal = canal
+        c.preferencias.ultimaDm = 0
     }
 
     fun abrirDm(canal: Long) {
@@ -233,6 +240,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
         repo.abrirCanal(canal)
         c.notificador.limparCanal(canal)
         c.compositor.abrirCanal(canal)
+        c.preferencias.ultimaDm = canal
     }
 
     fun abrirAmigos() {
@@ -432,6 +440,50 @@ class AppViewModel(private val c: Container) : ViewModel() {
         val sv = repo.estado.value.snapshot?.servers?.firstOrNull { s -> s.channels.any { it.id == canal } } ?: return
         abrirVoz(sv.id, canal)
     }
+
+    // ------------------------------------------------------------------ atualização do app e relatório de crash (C7)
+
+    val atualizacao: StateFlow<app.telacast.atualizacao.EstadoDaAtualizacao> = c.atualizacao.estado
+    fun atualizar() = c.atualizacao.atualizar()
+    fun instalarAtualizacao() = c.atualizacao.instalar()
+    fun dispensarFolhaDeAtualizacao() = c.atualizacao.dispensarFolha()
+    fun abrirPermissaoDeInstalacao() = c.atualizacao.abrirPermissao()
+    fun cancelarPermissaoDeInstalacao() = c.atualizacao.cancelarPermissao()
+    /** Ao voltar para a frente: consulta de novo (no máximo a cada 10 min) e continua a instalação se a permissão acabou de ser dada. */
+    fun aoVoltarParaFrente() { c.atualizacao.verificar(); c.atualizacao.retomar() }
+
+    private val _crash = MutableStateFlow(c.relatorioDeCrash?.pendente())
+    /** Texto do relatório do último crash (`null` = não houve ou já foi dispensado). */
+    val relatorioDeCrash: StateFlow<String?> = _crash.asStateFlow()
+    fun dispensarCrash() { c.relatorioDeCrash?.descartar(); _crash.value = null }
+
+    // ------------------------------------------------------------------ tela compartilhada (C5)
+
+    val transmissao: StateFlow<app.telacast.tela.EstadoDaTransmissao> = c.transmissao.estado
+    val player: StateFlow<app.telacast.tela.EstadoDoPlayer> = c.player.estado
+
+    fun abrirOpcoesDeTransmissao() { if (c.voz.estado.value.naChamada) _nav.update { it.abrirTransmitir() } else mostrarAviso("Entre num canal de voz para transmitir a tela.") }
+    fun fecharOpcoesDeTransmissao() = _nav.update { it.fecharTransmitir() }
+
+    /** Confirmou o diálogo: no ar, só aplica; senão começa (a interface abre a permissão do Android quando a fase for PedindoPermissao). */
+    fun transmitir(opcoes: app.telacast.tela.OpcoesDeTransmissao) {
+        _nav.update { it.fecharTransmitir() }
+        val t = c.transmissao.estado.value
+        if (t.ativa && t.fase != app.telacast.tela.FaseDaTransmissao.PedindoPermissao) { c.transmissao.aplicarOpcoes(opcoes); return }
+        val canal = c.voz.estado.value.canal ?: run { mostrarAviso("Entre num canal de voz para transmitir a tela."); return }
+        c.transmissao.pedir(canal, opcoes)
+    }
+
+    fun permissaoDeTela(codigo: Int, dados: android.content.Intent?) {
+        if (codigo == android.app.Activity.RESULT_OK && dados != null) c.transmissao.permissaoConcedida(app.telacast.tela.ConcessaoDeTela(codigo, dados)) else c.transmissao.permissaoNegada()
+    }
+
+    fun pararTransmissao() = c.transmissao.parar()
+    fun assistir(usuario: Long) {
+        val canal = c.voz.estado.value.canal ?: repo.estado.value.snapshot?.live?.firstOrNull { it.userId == usuario }?.channelId ?: return
+        _nav.update { it.abrirDialogo(Dialogo.Assistir(canal, usuario)) }
+    }
+    fun definirSuperficieDoPlayer(s: Any?) = c.player.definirSuperficie(s)
 
     fun entrarNaVoz(canal: Long) = c.voz.entrar(canal)
     fun sairDaVoz() = c.voz.sair()

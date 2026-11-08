@@ -36,6 +36,28 @@ data class OpcoesDeVoz(
     val ganhoDeEntrada: Float = 1f,
 )
 
+/** Painel de estatísticas da voz (atualizado 2 vezes por segundo enquanto a chamada está conectada). */
+data class EstatisticasDeVoz(
+    /** Perda de pacotes recebidos, em % (PLC e descartes). */
+    val perdaPct: Float = 0f,
+    /** Jitter de chegada (RFC 3550), em ms. */
+    val jitterMs: Float = 0f,
+    val alvoMs: Int = 0,
+    val bufferMs: Float = 0f,
+    /** Cortes audíveis (PLC ou buffer esvaziado) no último minuto. */
+    val cortesPorMin: Int = 0,
+    /** Vezes que o AudioTrack ficou sem áudio para tocar (underrun). */
+    val subfluxos: Int = 0,
+    val nivelMic: Float = 0f,
+    val ganhoEntradaDb: Float = 0f,
+    val agcDb: Float = 0f,
+    val probDeVoz: Float = 0f,
+    val esticados: Int = 0,
+    val comprimidos: Int = 0,
+    val pacotesEnviados: Int = 0,
+    val usuarios: Int = 0,
+)
+
 /** Tudo o que a interface de voz mostra. */
 data class EstadoDeVoz(
     val fase: FaseDaVoz = FaseDaVoz.Fora,
@@ -55,6 +77,7 @@ data class EstadoDeVoz(
     /** Volume individual de quem ouço, 0 a 2 (padrão 1). */
     val volumes: Map<Long, Float> = emptyMap(),
     val opcoes: OpcoesDeVoz = OpcoesDeVoz(),
+    val estatisticas: EstatisticasDeVoz = EstatisticasDeVoz(),
 ) {
     val naChamada: Boolean get() = fase != FaseDaVoz.Fora
     fun volumeDe(usuario: Long): Float = volumes[usuario] ?: 1f
@@ -67,6 +90,8 @@ interface DispositivoDeAudio {
     fun parar()
     fun definirRota(rota: RotaDeAudio)
     fun aplicarOpcoes(opcoes: OpcoesDeVoz)
+    /** Quantas vezes o alto-falante ficou sem áudio (`AudioTrack.getUnderrunCount`); 0 se não souber. */
+    fun subfluxos(): Int = 0
 }
 
 fun interface FabricaDeDispositivo {
@@ -287,7 +312,10 @@ class ControladorDeVoz(
         }
     }
 
+    private var ciclos = 0
+
     private fun iniciarMedidor() {
+        ciclos = 0
         jobMedidor?.cancel()
         jobMedidor = escopo.launch {
             while (isActive) {
@@ -300,8 +328,9 @@ class ControladorDeVoz(
                     val euFalando = m.euFalando
                     val nivel = m.nivelDoMicrofone
                     val atual = _estado.value
-                    if (atual.falando != falando || atual.euFalando != euFalando || Math.abs(atual.nivel - nivel) > 0.02f) {
-                        _estado.value = atual.copy(falando = falando, euFalando = euFalando, nivel = nivel)
+                    val novasStats = if (++ciclos % 5 == 0) m.estatisticas(dispositivo?.subfluxos() ?: 0) else atual.estatisticas
+                    if (atual.falando != falando || atual.euFalando != euFalando || Math.abs(atual.nivel - nivel) > 0.02f || novasStats != atual.estatisticas) {
+                        _estado.value = atual.copy(falando = falando, euFalando = euFalando, nivel = nivel, estatisticas = novasStats)
                     }
                 }
             }

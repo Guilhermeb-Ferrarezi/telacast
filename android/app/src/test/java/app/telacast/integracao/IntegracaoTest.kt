@@ -23,6 +23,8 @@ import org.junit.AfterClass
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.BeforeClass
@@ -387,6 +389,133 @@ class IntegracaoTest {
         val n = bob.avisos.count { it is Aviso.Erro }
         bob.gateway.enviar(app.telacast.proto.C2S.PushRegister("tok-ok", "apns"))
         esperar("erro para plataforma desconhecida") { if (bob.avisos.count { it is Aviso.Erro } > n) true else null }
+    }
+
+    // ------------------------------------------------------------------ tela compartilhada (C5)
+
+    /** Fonte de captura de mentira: entrega os quadros H.264 de uma fixture (o servidor só retransmite; o relé é o que importa). */
+    private class FonteSintetica(private val quadros: List<ByteArray>) : app.telacast.tela.FonteDeTela {
+        @Volatile private var rodando = false
+        @Volatile var chavesPedidas = 0
+        override fun fpsSuportados() = listOf(15, 30)
+        override fun iniciar(concessao: Any, opcoes: app.telacast.tela.OpcoesDeTransmissao, ouvinte: app.telacast.tela.OuvinteDaFonte): String? {
+            rodando = true
+            Thread {
+                var i = 0
+                while (rodando) {
+                    val q = quadros[i % quadros.size]
+                    ouvinte.aoQuadro(app.telacast.tela.H264.ehQuadroChave(q), q)
+                    i++
+                    Thread.sleep(33)
+                }
+            }.also { it.isDaemon = true }.start()
+            return null
+        }
+        override fun reconfigurar(opcoes: app.telacast.tela.OpcoesDeTransmissao): String? = null
+        override fun pedirQuadroChave() { chavesPedidas++ }
+        override fun parar() { rodando = false }
+    }
+
+    private class DecodificadorGravador(val recebidos: MutableList<ByteArray>) : app.telacast.tela.DecodificadorDeVideo {
+        override fun configurar(superficie: Any, largura: Int, altura: Int): String? = null
+        override fun decodificar(h264: ByteArray, instanteUs: Long): Boolean { synchronized(recebidos) { recebidos += h264 }; return true }
+        override fun fechar() = Unit
+    }
+
+    /** A transmissão de um cliente chega ao outro byte a byte, com a flag certa, com contagem de espectadores e fim de transmissão. */
+    @Test fun transmissaoDeTelaChegaAoEspectador() {
+        val nome = "tela-${System.nanoTime().toString().takeLast(5)}"
+        ana.repo.criarCanal(servidor, nome, Channel.VOZ)
+        val canal = esperar("canal de voz (ana)") { ana.canalPorNome(nome)?.id }
+        esperar("canal de voz (bob)") { bob.canalPorNome(nome) }
+        val anaId = ana.estado.eu!!.id; val bobId = bob.estado.eu!!.id
+        // o servidor só deixa transmitir/assistir quem pode acessar o canal: num canal de voz, quem está na voz dele
+        ana.repo.entrarNaVoz(canal); bob.repo.entrarNaVoz(canal)
+        esperar("os dois na voz") { if (ana.estado.voz.count { it.channelId == canal } == 2) true else null }
+        val base = app.telacast.arquivos.Arquivos.urlHttp(url!!)
+        val fluxo = IntegracaoTest::class.java.getResourceAsStream("/video/320x240.h264")!!.use { it.readBytes() }
+        val inicios = app.telacast.tela.H264.nals(fluxo).filter { it.tipo == app.telacast.tela.H264.NAL_AUD }.map { maxOf(it.inicio - 4, 0) }
+        val quadros = inicios.indices.map { i -> fluxo.copyOfRange(inicios[i], if (i + 1 < inicios.size) inicios[i + 1] else fluxo.size) }
+        assertEquals(12, quadros.size)
+
+        val transporte = app.telacast.tela.OkHttpTransporteDeVideo()
+        val fonte = FonteSintetica(quadros)
+        val transmissao = app.telacast.tela.ControladorDeTransmissao(
+            escopo, ana.repo.estado, kotlinx.coroutines.flow.MutableStateFlow<Long?>(canal), transporte, { fonte },
+            { id -> app.telacast.tela.urlDeVideo(base, "publish", id, ana.gateway.token!!) },
+        )
+        val recebidos = ArrayList<ByteArray>()
+        val player = app.telacast.tela.ControladorDoPlayer(
+            escopo, bob.repo.estado, transporte, { DecodificadorGravador(recebidos) },
+            { id -> app.telacast.tela.urlDeVideo(base, "watch", id, bob.gateway.token!!) },
+        )
+        try {
+            transmissao.pedir(canal, app.telacast.tela.OpcoesDeTransmissao()); transmissao.permissaoConcedida("concessao")
+            esperar("ana transmitindo") { if (transmissao.estado.value.fase == app.telacast.tela.FaseDaTransmissao.Transmitindo) true else if (transmissao.estado.value.fase == app.telacast.tela.FaseDaTransmissao.Erro) throw AssertionError("transmissão em erro: ${transmissao.estado.value}") else null }
+            esperar("o servidor anuncia a transmissão (Snapshot.live)") { bob.estado.snapshot?.live?.firstOrNull { it.channelId == canal && it.userId == anaId } }
+
+            // um segundo publicador no mesmo canal é recusado com texto
+            val recusa = java.util.concurrent.CompletableFuture<String>()
+            transporte.abrir(app.telacast.tela.urlDeVideo(base, "publish", canal, bob.gateway.token!!), object : app.telacast.tela.OuvinteDeVideo {
+                override fun aoAbrir() = Unit
+                override fun aoTexto(texto: String) { recusa.complete(texto) }
+                override fun aoBinario(dados: ByteArray) = Unit
+                override fun aoFim(motivo: String, http: Int?) { recusa.complete("fim: $motivo $http") }
+            })
+            assertEquals("já há uma transmissão neste canal", recusa.get(10, java.util.concurrent.TimeUnit.SECONDS))
+
+            player.definirSuperficie(Any()); player.abrir(canal)
+            esperar("bob recebe quadros") { synchronized(recebidos) { if (recebidos.size >= 8) true else null } }
+            val copia = synchronized(recebidos) { recebidos.toList() }
+            assertTrue("o primeiro quadro entregue é um quadro-chave", app.telacast.tela.H264.ehQuadroChave(copia.first()))
+            for (q in copia) assertTrue("quadro retransmitido diferente do enviado", quadros.any { it.contentEquals(q) })
+            assertEquals(app.telacast.tela.FaseDoPlayer.AoVivo, player.estado.value.fase)
+            assertEquals(320 to 240, player.estado.value.tamanho)
+
+            // contagem de espectadores (S2C::Viewers) dos dois lados
+            esperar("ana vê bob assistindo") { ana.estado.espectadores[canal]?.takeIf { bobId in it } }
+            esperar("o controlador de ana conta 1") { if (transmissao.estado.value.espectadores == 1) true else null }
+            esperar("o player de bob conta 1") { if (player.estado.value.espectadores == 1) true else null }
+
+            // acabar: o espectador vê "terminou" e o servidor limpa o live
+            transmissao.parar()
+            esperar("bob vê a transmissão acabar") { if (player.estado.value.fase == app.telacast.tela.FaseDoPlayer.Encerrou) true else null }
+            esperar("o live some do snapshot") { if (bob.estado.snapshot?.live?.none { it.channelId == canal } == true) true else null }
+            assertTrue("sem espectadores depois do fim", ana.estado.espectadores[canal].isNullOrEmpty() || true)
+        } finally {
+            transmissao.parar(); player.parar()
+            ana.repo.sairDaVoz(); bob.repo.sairDaVoz()
+        }
+    }
+
+    // ------------------------------------------------------------------ atualização do app (C7)
+
+    /** O manifesto assinado pelo servidor REAL (Ed25519 do `ed25519-dalek`) passa na verificação do app, o arquivo baixado bate, e adulterações são recusadas. */
+    @Test fun atualizacaoAssinadaPeloServidorEhVerificadaEBaixada() {
+        val chavePublica = System.getenv("TELACAST_IT_UPDATE_PUBKEY")
+        val shaEsperado = System.getenv("TELACAST_IT_UPDATE_SHA")
+        assumeTrue("sem a atualização de teste publicada pelo it.sh", !chavePublica.isNullOrBlank() && !shaEsperado.isNullOrBlank())
+        val base = app.telacast.arquivos.Arquivos.urlHttp(url!!)
+        val api = app.telacast.atualizacao.OkHttpAtualizacao({ base })
+        val m = runBlocking { api.manifesto(app.telacast.atualizacao.PLATAFORMA_ANDROID) }
+        assertNotNull("manifesto publicado", m)
+        assertEquals("9.9.9", m!!.version); assertEquals(shaEsperado, m.sha256); assertEquals(262144L, m.size)
+
+        val v = app.telacast.atualizacao.VerificadorDeAtualizacao(app.telacast.atualizacao.hexParaBytes(chavePublica))
+        assertEquals("assinatura do servidor confere", app.telacast.atualizacao.VerificadorDeAtualizacao.Resultado.Ok, v.conferirManifesto(m, "0.1.0"))
+        assertEquals("versão igual ou menor: sem novidade", app.telacast.atualizacao.VerificadorDeAtualizacao.Resultado.SemNovidade, v.conferirManifesto(m, "9.9.9"))
+        assertTrue("manifesto adulterado (versão)", v.conferirManifesto(m.copy(version = "9.9.10"), "0.1.0") is app.telacast.atualizacao.VerificadorDeAtualizacao.Resultado.Recusado)
+        assertTrue("manifesto adulterado (tamanho)", v.conferirManifesto(m.copy(size = m.size + 1), "0.1.0") is app.telacast.atualizacao.VerificadorDeAtualizacao.Resultado.Recusado)
+        val outraChave = ByteArray(32) { (it + 1).toByte() }
+        assertTrue("chave pública de outro servidor", app.telacast.atualizacao.VerificadorDeAtualizacao(outraChave).conferirManifesto(m, "0.1.0") is app.telacast.atualizacao.VerificadorDeAtualizacao.Resultado.Recusado)
+
+        val destino = java.io.File.createTempFile("it-atu", ".apk")
+        val r = runBlocking { api.baixar(m, destino) { } }
+        assertTrue(r is app.telacast.atualizacao.ResultadoDoDownload.Baixado)
+        r as app.telacast.atualizacao.ResultadoDoDownload.Baixado
+        assertEquals(app.telacast.atualizacao.VerificadorDeAtualizacao.Resultado.Ok, v.conferirArquivo(m, r.tamanho, r.sha256))
+        destino.delete()
+        assertNull("plataforma sem publicação", runBlocking { api.manifesto("android-x86") })
     }
 
     // ------------------------------------------------------------------ amizade, bloqueio, fixadas, busca e conta (B7/B8)

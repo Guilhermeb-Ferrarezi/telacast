@@ -1,6 +1,7 @@
 package app.telacast.voz
 
 import io.github.jaredmdobson.concentus.OpusApplication
+import io.github.jaredmdobson.concentus.OpusBandwidth
 import io.github.jaredmdobson.concentus.OpusDecoder
 import io.github.jaredmdobson.concentus.OpusEncoder
 import io.github.jaredmdobson.concentus.OpusSignal
@@ -11,7 +12,8 @@ const val TAXA_DE_AMOSTRAGEM = 48_000
 const val QUADRO = 960
 /** Maior pacote Opus aceito pelo servidor (`VOICE_MAX_PACKET`). */
 const val MAX_PACOTE = 400
-const val BITRATE = 32_000
+/** 48 kbps (VBR restrito, banda total): ~120 bytes por pacote em média e nunca mais que [MAX_PACOTE] (o servidor descarta quadros maiores). */
+const val BITRATE = 48_000
 
 /** Codifica um quadro de 20 ms (960 amostras de 16 bits) em um pacote Opus. */
 interface CodificadorOpus {
@@ -43,6 +45,8 @@ class ConcentusOpus(private val complexidade: Int = 5) : FabricaDeOpus {
         enc.useVBR = true
         enc.useConstrainedVBR = true
         enc.signalType = OpusSignal.OPUS_SIGNAL_VOICE
+        enc.bandwidth = OpusBandwidth.OPUS_BANDWIDTH_FULLBAND // banda total (até 20 kHz): voz com ar, em vez de abafada
+        enc.maxBandwidth = OpusBandwidth.OPUS_BANDWIDTH_FULLBAND
         enc.useInbandFEC = false
         enc.useDTX = false
         enc.complexity = complexidade

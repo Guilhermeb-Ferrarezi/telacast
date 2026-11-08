@@ -3,6 +3,8 @@
     <!-- Só existe o tema escuro (Grafite). Cores iguais às de app/src/theme.rs. -->
     <color name="grafite_l0">#0A0A0B</color>
     <color name="grafite_l2">#151517</color>
+    <color name="ic_launcher_background">#131315</color>
+    <color name="ambar">#E9B35E</color>
 
     <style name="Theme.Telacast" parent="@android:style/Theme.Material.NoActionBar">
         <item name="android:windowBackground">@color/grafite_l2</item>
@@ -10,6 +12,14 @@
         <item name="android:statusBarColor">@color/grafite_l2</item>
         <item name="android:navigationBarColor">@color/grafite_l2</item>
         <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
         <item name="android:colorAccent">#E9B35E</item>
+    </style>
+
+    <!-- Splash simples (API 31+ nativo; antes, a biblioteca androidx): fundo Grafite e o "T" âmbar, sem animação nem gradiente. -->
+    <style name="Theme.Telacast.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/grafite_l2</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <item name="postSplashScreenTheme">@style/Theme.Telacast</item>
     </style>
 </resources>

@@ -37,6 +37,16 @@ class MotorDeVoz(
     val supressorProprio: Boolean get() = envio.supressorProprio
     /** Probabilidade de voz do RNNoise no último quadro. */
     val probDeVoz: Float get() = envio.probDeVoz
+    /** Painel de estatísticas da voz (perda, jitter, buffer, cortes, subfluxos, nível, ganhos, probabilidade de voz). */
+    fun estatisticas(subfluxos: Int): EstatisticasDeVoz {
+        val r = recepcao.resumo()
+        return EstatisticasDeVoz(
+            perdaPct = r.perdaPct, jitterMs = r.jitterMs, alvoMs = r.alvoMs, bufferMs = r.bufferMs, cortesPorMin = r.cortesPorMin, subfluxos = subfluxos,
+            nivelMic = nivelDoMicrofone, ganhoEntradaDb = (20 * Math.log10(envio.ganho.toDouble().coerceAtLeast(1e-3))).toFloat(), agcDb = envio.agc.ganhoDb,
+            probDeVoz = envio.probDeVoz, esticados = r.esticados, comprimidos = r.comprimidos, pacotesEnviados = pacotesEnviados, usuarios = r.usuarios,
+        )
+    }
+
     /** Libera o RNNoise nativo. Chame depois de parar a captura. */
     override fun close() { envio.close() }
     fun definirVolume(usuario: Long, volume: Float) = recepcao.definirVolume(usuario, volume)

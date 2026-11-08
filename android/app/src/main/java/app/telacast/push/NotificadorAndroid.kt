@@ -44,7 +44,7 @@ class NotificadorAndroid(private val ctx: Context) : Notificador {
     override fun mostrar(modelo: ModeloDeNotificacao) {
         if (!nm.areNotificationsEnabled()) return // sem a permissão (Android 13+) ou desligadas nos Ajustes
         val b = NotificationCompat.Builder(ctx, modelo.canal.id)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setSmallIcon(app.telacast.R.drawable.ic_notificacao).setColor(0xFFE9B35E.toInt())
             .setContentIntent(aoTocar(modelo))
             .setAutoCancel(true)
             .setWhen(modelo.ts).setShowWhen(true)

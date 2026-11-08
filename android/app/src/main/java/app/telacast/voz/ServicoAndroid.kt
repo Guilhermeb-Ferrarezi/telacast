@@ -66,7 +66,7 @@ class ServicoAndroidDeVoz : Service() {
         val abrir = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP), PendingIntent.FLAG_IMMUTABLE)
         val sair = PendingIntent.getService(this, 1, Intent(this, ServicoAndroidDeVoz::class.java).setAction(ACAO_SAIR), PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, CANAL)
-            .setSmallIcon(android.R.drawable.stat_sys_phone_call).setContentTitle(titulo).setContentText(texto)
+            .setSmallIcon(app.telacast.R.drawable.ic_notificacao).setColor(0xFFE9B35E.toInt()).setContentTitle(titulo).setContentText(texto)
             .setOngoing(true).setCategory(Notification.CATEGORY_CALL).setContentIntent(abrir)
             .addAction(Notification.Action.Builder(null, "Sair da voz", sair).build()).build()
     }

@@ -38,6 +38,11 @@ class GatewayTest {
         assertEquals("wss://exemplo.com/ws", Gateway.urlDoGateway("https://exemplo.com"))
         assertEquals("ws://x/ws", Gateway.urlDoGateway(" http://x/ws "))
         assertEquals("wss://x/ws", Gateway.urlDoGateway("wss://x/ws"))
+        assertEquals("domínio público sem esquema é seguro", "wss://telecast.guilhermebf.dev/ws", Gateway.urlDoGateway("telecast.guilhermebf.dev"))
+        assertEquals("ws://192.168.0.5:8080/ws", Gateway.urlDoGateway("192.168.0.5:8080"))
+        assertEquals("ws://localhost/ws", Gateway.urlDoGateway("localhost"))
+        assertEquals("ws://meu-servidor/ws", Gateway.urlDoGateway("meu-servidor"))
+        assertEquals("ws://exemplo.com:8080/ws", Gateway.urlDoGateway("exemplo.com:8080"))
     }
 
     @Test fun fluxoDeLogin() = runTest {

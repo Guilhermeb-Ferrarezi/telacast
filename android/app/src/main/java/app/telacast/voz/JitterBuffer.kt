@@ -41,6 +41,9 @@ class JitterBuffer(alvoInicial: Int = ALVO_INICIAL) {
     /** Pacotes descartados desde a última chamada. */
     fun descartados(): Int { val d = descartes; descartes = 0; return d }
 
+    /** Pacotes guardados esperando a vez (a ocupação do buffer, em quadros de 20 ms). */
+    fun ocupacao(): Int = pacotes.size
+
     /** Quadros de áudio à frente do ponto de reprodução. */
     fun profundidade(): Int = pacotes.maxOfOrNull { it.first - proximo }?.let { (maxOf(it, -1) + 1) } ?: 0
 

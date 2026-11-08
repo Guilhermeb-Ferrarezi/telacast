@@ -12,6 +12,8 @@ data class FormLogin(
     val registrar: Boolean = false,
     val entrando: Boolean = false,
     val erro: String? = null,
+    /** Mostra o campo do servidor (o padrão vem pré-preenchido e escondido: o amigo não precisa digitar nada). */
+    val avancado: Boolean = false,
 ) {
     /** Mensagem do primeiro campo inválido, ou `null` se pode enviar (o servidor valida de novo). */
     fun validar(): String? = when {

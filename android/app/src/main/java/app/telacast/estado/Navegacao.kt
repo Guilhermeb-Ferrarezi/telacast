@@ -35,6 +35,8 @@ sealed interface Dialogo {
     data object Fixadas : Dialogo
     /** Busca de mensagens (no servidor ou neste canal). */
     data object Busca : Dialogo
+    /** Player de uma transmissão de tela (`/watch/{canal}`) de `usuario`. */
+    data class Assistir(val canal: Long, val usuario: Long) : Dialogo
     /** Ajustes: conta (senha, sessões), aparência. */
     data object Ajustes : Dialogo
     data class ConfirmarBloquear(val usuario: Long, val nome: String) : Dialogo
@@ -63,6 +65,8 @@ data class Navegacao(
     val perfil: PerfilAberto? = null,
     /** Folha de volume de um participante da voz. */
     val volume: Long? = null,
+    /** Folha de opções do Transmitir (tela). */
+    val transmitirAberto: Boolean = false,
     val abaInicio: AbaInicio = AbaInicio.Disponivel,
 ) {
     fun abrirGaveta() = copy(gavetaAberta = true, membrosAbertos = false, menu = null)
@@ -90,16 +94,19 @@ data class Navegacao(
     fun fecharPerfil() = copy(perfil = null)
     fun abrirVolume(usuario: Long) = copy(volume = usuario, menu = null, folha = null)
     fun fecharVolume() = copy(volume = null)
+    fun abrirTransmitir() = copy(transmitirAberto = true, menu = null, folha = null)
+    fun fecharTransmitir() = copy(transmitirAberto = false)
     fun abrirFolha(mensagem: Long, emojis: Boolean = false) = copy(folha = FolhaDeMensagem(mensagem, emojis), menu = null)
     fun fecharFolha() = copy(folha = null)
     fun fecharDialogo() = copy(dialogo = null)
     fun escolherAba(a: AbaInicio) = copy(abaInicio = a)
 
     /** Algo que o botão Voltar do sistema fecha antes de sair do app? */
-    val podeVoltar: Boolean get() = volume != null || perfil != null || dialogo != null || folha != null || menu != null || membrosAbertos || gavetaAberta
+    val podeVoltar: Boolean get() = transmitirAberto || volume != null || perfil != null || dialogo != null || folha != null || menu != null || membrosAbertos || gavetaAberta
 
     /** Voltar do sistema: fecha, nesta ordem, volume, perfil, diálogo, folha, menu, painel de membros e gaveta. */
     fun voltar(): Navegacao = when {
+        transmitirAberto -> fecharTransmitir()
         volume != null -> fecharVolume()
         perfil != null -> fecharPerfil()
         dialogo != null -> fecharDialogo()
