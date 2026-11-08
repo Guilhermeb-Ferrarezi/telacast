@@ -4792,6 +4792,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "libc",
  "nnnoiseless",
  "nvidia-video-codec-sdk",
  "openh264",
