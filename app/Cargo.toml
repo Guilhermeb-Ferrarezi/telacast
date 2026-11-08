@@ -28,6 +28,14 @@ telacast-qs = { path = "../qs" }
 
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.15", default-features = false }
+# toast do Windows: o `windows` já está na árvore (wgpu, accesskit); só liga os módulos de notificação
+windows = { version = "0.62", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation", "Win32_System_Registry", "Win32_Foundation"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# notificação por D-Bus: o zbus já vem com o eframe (accesskit_unix); estes três só repetem o que já está no Cargo.lock
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+futures-lite = "2"
+async-channel = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

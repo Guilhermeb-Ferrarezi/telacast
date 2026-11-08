@@ -81,3 +81,10 @@ Achado que muda o plano: o mesmo app, depois de ~25 min de uso, tinha 115 MB de 
 em sessão longa (~80 MB) é o problema maior**, e vem de cache sem limite e de fragmentação, não do driver. O teto de imagens e o
 `M_ARENA_MAX` atacam isso, mas só uma sessão longa mostra o efeito: reabrir o app depois de algumas horas e comparar com os 115 MB.
 Ainda sem limite: histórico de mensagens por canal e `Texts`.
+
+## Notificações do sistema (2026-11-07)
+
+`app/src/notif.rs` + `notif_os.rs` (ver `docs/NOTIFICACOES.md`). A/B com o mesmo binário-base, 75 s depois de abrir, Xvfb/lavapipe (só o delta vale):
+PSS 80,1 MB sem a funcionalidade, 80,4 MB com ela, 80,8 MB depois da primeira notificação (thread `notif` + executor do zbus, +2 threads).
+Binário Linux +1,04 MB (o zbus já estava no binário pelo `accesskit_unix`). O `Limiter` guarda um `HashMap` por canal e uma fila de no máximo 10
+instantes: limitado. Nota: as primeiras medições do dia deram ~120 MB de PSS nos dois binários (não identifiquei a causa; logo depois voltou a ~80 MB nos dois); o par intercalado acima é o confiável.

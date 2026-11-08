@@ -3,6 +3,8 @@ mod capture;
 mod gateway;
 mod files;
 mod gpu;
+mod notif;
+mod notif_os;
 mod md_view;
 mod memoria;
 mod net;
@@ -256,6 +258,9 @@ enum Act {
     OpenGoLive(Option<i64>),
     OpenVoiceSettings,
     SetVoiceOptions { ns: bool, monitor: bool, low: bool },
+    SetNotif(notif::Prefs),
+    /// Mostra uma notificação de teste agora (ignora foco e anti-spam).
+    TestNotif,
     SetVoiceDevices { input: Option<String>, output: Option<String> },
     OpenProfile { user: i64, name: String, anchor: egui::Rect, left: bool },
     Reply(i64, p::Reply),
@@ -411,6 +416,14 @@ struct Session {
     jump_wanted: Option<(i64, i64, u8)>,
     /// (canal, id e posição na tela da primeira mensagem da lista), para manter a rolagem ao carregar antigas.
     anchor: Option<(i64, i64, f32)>,
+    /// Notificações do sistema: preferências, quem entrega, anti-spam e o estado da janela neste quadro.
+    notif: notif::Prefs,
+    notifier: notif_os::Notifier,
+    limiter: notif::Limiter,
+    win_focused: bool,
+    win_minimized: bool,
+    /// Pedidos de amizade recebidos já vistos (`None` até o primeiro snapshot: o que já existia não notifica).
+    known_incoming: Option<HashSet<i64>>,
 }
 
 /// Painel de busca de mensagens (Ctrl+F).
@@ -472,6 +485,7 @@ impl Session {
         let http_base = files::http_base(&server);
         let (upload_tx, upload_rx) = std::sync::mpsc::channel();
         let (picked_tx, picked_rx) = std::sync::mpsc::channel();
+        let notifier = notif_os::Notifier::new(ctx.clone());
         Self {
             server,
             ctx,
@@ -554,7 +568,142 @@ impl Session {
             has_more: HashMap::new(),
             jump_wanted: None,
             anchor: None,
+            notif: notif::Prefs::default(),
+            notifier,
+            limiter: notif::Limiter::default(),
+            win_focused: true,
+            win_minimized: false,
+            known_incoming: None,
         }
+    }
+
+    // ---------------------------------------------------------- notificações do sistema
+
+    /// O usuário está olhando para o app (janela em foco e não minimizada)?
+    fn watching(&self) -> bool {
+        self.win_focused && !self.win_minimized
+    }
+
+    fn notif_env(&self) -> notif::Env {
+        notif::Env { focused: self.win_focused, minimized: self.win_minimized, dnd: self.me.status == p::Status::Dnd, me: self.me.id }
+    }
+
+    /// Mensagem nova ao vivo: vira notificação se as regras de `notif.rs` deixarem.
+    fn notify_message(&mut self, m: &p::Message) {
+        if !self.limiter.is_new(m.channel_id, m.id) {
+            return;
+        }
+        // (servidor, nome do canal, nome do servidor); `None` no servidor = DM; canal que não conheço = ignora
+        let place = self
+            .snap
+            .servers
+            .iter()
+            .find_map(|sv| sv.channels.iter().find(|c| c.id == m.channel_id).map(|c| (Some(sv.id), c.name.clone(), sv.name.clone())))
+            .or_else(|| self.snap.dms.iter().find(|d| d.channel_id == m.channel_id).map(|_| (None, String::new(), String::new())));
+        let Some((server_id, channel_name, server_name)) = place else { return };
+        let me = &self.me;
+        let reply_to_me = m.reply.as_ref().is_some_and(|r| {
+            match self.msgs.get(&m.channel_id).and_then(|v| v.iter().find(|x| x.id == r.id)) {
+                Some(orig) => orig.author_id == me.id,
+                None => r.author == me.name,
+            }
+        });
+        let names: Vec<&str> = m.attachments.iter().map(|a| a.name.as_str()).collect();
+        let incoming = notif::Incoming {
+            live: true,
+            channel_id: m.channel_id,
+            server_id,
+            author_id: m.author_id,
+            author: &m.author,
+            channel_name: &channel_name,
+            server_name: &server_name,
+            content: &m.content,
+            kind: m.kind,
+            attachments: &names,
+            reply_to_me,
+            author_blocked: self.snap.blocked.iter().any(|b| b.id == m.author_id),
+        };
+        if let Ok(n) = notif::judge_message(self.notif, self.notif_env(), &incoming, &SnapNames(&self.snap)) {
+            self.emit(n);
+        }
+    }
+
+    /// Pedidos de amizade que apareceram neste snapshot (o primeiro só marca o que já existia).
+    fn notify_new_friend_requests(&mut self, sn: &p::Snapshot) {
+        let now: HashSet<i64> = sn.friends.iter().filter(|f| f.status == p::FriendStatus::Incoming).map(|f| f.user.id).collect();
+        if let Some(prev) = self.known_incoming.take() {
+            let env = notif::Env { dnd: sn.me.status == p::Status::Dnd, ..self.notif_env() };
+            for f in sn.friends.iter().filter(|f| f.status == p::FriendStatus::Incoming && !prev.contains(&f.user.id)) {
+                let blocked = sn.blocked.iter().any(|b| b.id == f.user.id);
+                if let Ok(n) = notif::judge_friend(self.notif, env, &f.user.name, blocked) {
+                    self.emit(n);
+                }
+            }
+        }
+        self.known_incoming = Some(now);
+    }
+
+    /// Passa pelo anti-spam e entrega; o que ficou retido sai em `notif_tick`.
+    fn emit(&mut self, n: notif::Notice) {
+        let now = Instant::now();
+        match self.limiter.offer(now, n) {
+            Some(n) => self.notifier.show(&n),
+            None => self.schedule_held(now),
+        }
+    }
+
+    fn schedule_held(&self, now: Instant) {
+        if let Some(t) = self.limiter.next_due() {
+            self.ctx.request_repaint_after(t.saturating_duration_since(now) + Duration::from_millis(20));
+        }
+    }
+
+    /// Uma vez por quadro: janela, notificações retidas, cliques e foco recuperado.
+    fn notif_tick(&mut self, ctx: &egui::Context) {
+        let (focused, minimized) = ctx.input(|i| (i.viewport().focused.unwrap_or(true), i.viewport().minimized.unwrap_or(false)));
+        let was_watching = self.watching();
+        self.win_focused = focused;
+        self.win_minimized = minimized;
+        let now = Instant::now();
+        for n in self.limiter.due(now) {
+            self.notifier.show(&n);
+        }
+        self.schedule_held(now);
+        // voltei para a janela: o canal aberto, que ficou não lido enquanto eu estava fora, passa a lido
+        if !was_watching && self.watching() {
+            if let Some(ch) = self.current_channel() {
+                self.unread.remove(&ch);
+                self.mentions.remove(&ch);
+                self.ack(ch);
+            }
+        }
+        for target in self.notifier.clicks() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.voice_view = false;
+            match target {
+                notif::Target::Dm(channel) if self.snap.dms.iter().any(|d| d.channel_id == channel) => self.open(View::Dm(channel)),
+                notif::Target::Channel { server, channel }
+                    if self.snap.servers.iter().any(|s| s.id == server && s.channels.iter().any(|c| c.id == channel)) =>
+                {
+                    self.open(View::Chan { server, channel })
+                }
+                notif::Target::Pending => {
+                    self.tab = HomeTab::Pending;
+                    self.open(View::Home);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Título da janela do sistema (e da barra de título própria): com contador de não lidas fora de foco.
+    fn os_title(&self) -> String {
+        let dm_ids: HashSet<i64> = self.snap.dms.iter().map(|d| d.channel_id).collect();
+        let mentions: u32 = self.mentions.values().sum();
+        let unread_dms = self.unread.iter().filter(|c| dm_ids.contains(c) && !self.mentions.contains_key(c)).count() as u32;
+        let unread_other = self.unread.iter().any(|c| !dm_ids.contains(c));
+        notif::window_title(self.watching(), mentions, unread_dms, unread_other)
     }
 
     fn current_channel(&self) -> Option<i64> {
@@ -1137,6 +1286,7 @@ impl Session {
                 Event::Msg(m) => match m {
                     S2C::Snapshot(sn) => {
                         self.me = sn.me.clone();
+                        self.notify_new_friend_requests(&sn);
                         self.voice = sn.voice.clone();
                         if self.my_voice().is_none() && self.engine.is_some() {
                             self.stop_voice_engine();
@@ -1175,16 +1325,20 @@ impl Session {
                                 v.retain(|x| x.id != -(m.nonce as i64));
                             }
                         }
+                        if !mine {
+                            self.notify_message(&m);
+                        }
                         if self.requested.contains(&ch) {
                             self.msgs.entry(ch).or_default().push(m);
                         }
                         self.typing.remove(&(ch, author));
                         if !mine {
-                            if self.current_channel() == Some(ch) {
+                            if self.current_channel() == Some(ch) && self.watching() {
                                 self.gw.send(C2S::Ack { channel_id: ch, message_id: id });
                             } else {
+                                // outro canal, ou o canal aberto com a janela fora de foco: fica não lida até eu voltar
                                 self.unread.insert(ch);
-                                if mentions_me(&content_for_mention, self.me.id) {
+                                if notif::mentions_me(&content_for_mention, self.me.id) {
                                     *self.mentions.entry(ch).or_insert(0) += 1;
                                 }
                             }
@@ -1368,6 +1522,9 @@ struct App {
     voice_out: Option<String>,
     voice_ns: bool,
     voice_ll: bool,
+    /// Notificações do sistema (guardadas no storage) e o último título de janela enviado ao sistema.
+    notif: notif::Prefs,
+    os_title: String,
     monitors: Vec<String>,
     monitor: usize,
     golive: GoLive,
@@ -1423,6 +1580,8 @@ impl App {
             token_saved: token,
             voice_ns: get("voice_ns") != "0",
             voice_ll: get("voice_ll") != "0",
+            notif: notif::Prefs { on: get("notif_on") != "0", only_dm_mentions: get("notif_only") != "0" },
+            os_title: "Telacast".into(),
             voice_in: Some(get("voice_in")).filter(|v| !v.is_empty()),
             voice_out: Some(get("voice_out")).filter(|v| !v.is_empty()),
             fps: get("fps").parse().unwrap_or(60),
@@ -1486,6 +1645,7 @@ impl App {
                     sess.voice_out = self.voice_out.clone();
                     sess.voice_ns = self.voice_ns;
                     sess.voice_ll = self.voice_ll;
+                    sess.notif = self.notif;
                     self.session = Some(sess);
                     return;
                 }
@@ -1549,6 +1709,8 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("voice_ll", if self.voice_ll { "1" } else { "0" }.into());
         storage.set_string("voice_ns", if self.voice_ns { "1" } else { "0" }.into());
+        storage.set_string("notif_on", if self.notif.on { "1" } else { "0" }.into());
+        storage.set_string("notif_only", if self.notif.only_dm_mentions { "1" } else { "0" }.into());
         storage.set_string("voice_in", self.voice_in.clone().unwrap_or_default());
         storage.set_string("voice_out", self.voice_out.clone().unwrap_or_default());
         storage.set_string("server", self.login.server.clone());
@@ -1577,6 +1739,7 @@ impl eframe::App for App {
                 for img in &pasted {
                     s.paste_image(img);
                 }
+                s.notif_tick(&ctx);
                 if let Some(why) = s.pump() {
                     self.logout(&why);
                     self.login_ui(ui, &ctx);
@@ -1590,6 +1753,12 @@ impl eframe::App for App {
                 }
             }
             None => self.login_ui(ui, &ctx),
+        }
+        // título da janela no sistema (barra de tarefas): "(N) Telacast" com não lidas e a janela fora de foco
+        let title = self.session.as_ref().map_or_else(|| "Telacast".to_string(), |s| s.os_title());
+        if title != self.os_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.os_title = title;
         }
     }
 }
@@ -1629,7 +1798,11 @@ impl App {
     /// Barra de título própria, como a do Discord: ← → à esquerda, título no centro, minimizar/maximizar/fechar à direita.
     fn titlebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let (title, can_back, can_fwd) = match &self.session {
-            Some(s) => (s.window_title(), s.nav_i > 0, s.nav_i + 1 < s.nav.len()),
+            Some(s) => {
+                // com não lidas e a janela fora de foco a barra mostra o mesmo texto do sistema: "(N) Telacast"
+                let os = s.os_title();
+                (if os == "Telacast" { s.window_title() } else { os }, s.nav_i > 0, s.nav_i + 1 < s.nav.len())
+            }
             None => ("Telacast".to_string(), false, false),
         };
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -2305,13 +2478,25 @@ fn text_card(ui: &mut egui::Ui, a: &p::Attachment, text: &str, lines: usize, byt
     });
 }
 
-fn is_pending_or_own_echo(m: &p::Message, me: i64) -> bool {
-    m.id < 0 || (m.author_id == me && m.nonce != 0)
+/// Nomes para o texto das notificações (`<@id>` e `<#id>`), tirados do snapshot.
+struct SnapNames<'a>(&'a p::Snapshot);
+
+impl notif::Names for SnapNames<'_> {
+    fn user(&self, id: i64) -> Option<String> {
+        let sn = self.0;
+        (sn.me.id == id)
+            .then(|| sn.me.name.clone())
+            .or_else(|| sn.servers.iter().flat_map(|s| s.members.iter()).find(|u| u.id == id).map(|u| u.name.clone()))
+            .or_else(|| sn.dms.iter().find(|d| d.user.id == id).map(|d| d.user.name.clone()))
+            .or_else(|| sn.friends.iter().find(|f| f.user.id == id).map(|f| f.user.name.clone()))
+    }
+    fn channel(&self, id: i64) -> Option<String> {
+        self.0.servers.iter().flat_map(|s| s.channels.iter()).find(|c| c.id == id).map(|c| c.name.clone())
+    }
 }
 
-/// A mensagem cita `me` (`<@id>`, `<@!id>`) ou todo mundo (`@everyone`, `@here`)?
-fn mentions_me(content: &str, me: i64) -> bool {
-    content.contains(&format!("<@{me}>")) || content.contains(&format!("<@!{me}>")) || content.contains("@everyone") || content.contains("@here")
+fn is_pending_or_own_echo(m: &p::Message, me: i64) -> bool {
+    m.id < 0 || (m.author_id == me && m.nonce != 0)
 }
 
 /// Troca `@nome` (nome exato de alguém do canal, sem diferenciar maiúsculas) por `<@id>`.
@@ -2667,6 +2852,16 @@ impl App {
                     s.modal = Modal::VoiceSettings(voice::list_devices());
                     s.start_test_engine();
                 }
+                Act::SetNotif(prefs) => {
+                    s.notif = prefs;
+                    self.notif = prefs;
+                }
+                Act::TestNotif => s.notifier.show(&notif::Notice {
+                    key: notif::Key::Friends,
+                    title: "Telacast".into(),
+                    body: "As notificações estão funcionando.".into(),
+                    target: notif::Target::Pending,
+                }),
                 Act::SetVoiceOptions { ns, monitor, low } => {
                     let low_changed = s.voice_ll != low;
                     s.voice_ll = low;
@@ -5257,8 +5452,26 @@ impl App {
             }
             Modal::Account { old, new, again } => {
                 let sessions = s.sessions.clone();
+                let mut np = s.notif;
+                let mut test = false;
                 modal(ctx, "Minha conta", 440.0, &mut dismissed, |ui| {
                     ui.set_width(400.0);
+                    let max_h = (ctx.content_rect().height() - 140.0).max(240.0);
+                    egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                        ui.set_width(ui.available_width() - 14.0); // sobra para a barra de rolagem
+                    ui.label(caps("NOTIFICAÇÕES"));
+                    ui.checkbox(&mut np.on, "Notificações do sistema");
+                    ui.label(RichText::new("Avisa quando a janela não está em foco. Nada em \"Não perturbe\".").size(12.0).color(MUTED));
+                    ui.add_enabled_ui(np.on, |ui| {
+                        ui.checkbox(&mut np.only_dm_mentions, "Só mensagens diretas, menções e pedidos de amizade");
+                    });
+                    if np.on && !np.only_dm_mentions {
+                        ui.label(RichText::new("Toda mensagem de canal vai avisar (no máximo 1 por canal a cada 3 s).").size(12.0).color(AMBER));
+                    }
+                    if np.on && small_button(ui, "Enviar notificação de teste", FIELD) {
+                        test = true;
+                    }
+                    ui.add_space(10.0);
                     ui.label(caps("TROCAR SENHA"));
                     ui.add(egui::TextEdit::singleline(old).password(true).hint_text("Senha atual").desired_width(f32::INFINITY));
                     ui.add(egui::TextEdit::singleline(new).password(true).hint_text("Nova senha (8 a 128 caracteres)").desired_width(f32::INFINITY));
@@ -5298,10 +5511,18 @@ impl App {
                     if sessions.iter().any(|x| !x.current) && small_button(ui, "Encerrar todas as outras", FIELD) {
                         acts.push(Act::Send(C2S::RevokeOtherSessions));
                     }
+                    });
+                    ui.add_space(6.0);
                     if small_button(ui, "Fechar", FIELD) {
                         close = true;
                     }
                 });
+                if np != s.notif {
+                    acts.push(Act::SetNotif(np));
+                }
+                if test {
+                    acts.push(Act::TestNotif);
+                }
             }
             Modal::ConfirmBlock { user_id, name } => {
                 modal(ctx, "Bloquear usuário", 360.0, &mut dismissed, |ui| {
