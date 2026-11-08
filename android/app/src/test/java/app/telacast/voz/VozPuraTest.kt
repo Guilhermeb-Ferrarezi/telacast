@@ -118,7 +118,7 @@ class JitterBufferTest {
         assertEquals("-", j.ler())
         assertEquals("-", j.ler())
         j.entregar(1, p(1))
-        val r = List(6) { j.ler() }
+        val r = List(JitterBuffer.MAX + 3) { j.ler() }
         assertTrue("começa a tocar depois de esperar até MAX quadros", r.contains("q0"))
     }
 
@@ -139,10 +139,10 @@ class JitterBufferTest {
         assertEquals(listOf("q0", "q1", "P", "q3", "q4"), List(5) { j.ler() })
     }
 
-    @Test fun esvaziarDa2QuadrosDePlcEDepoisSilencio() {
+    @Test fun esvaziarDa3QuadrosDePlcEDepoisSilencio() {
         val j = JitterBuffer(2)
         j.entregar(0, p(0)); j.entregar(1, p(1))
-        assertEquals(listOf("q0", "q1", "P", "P", "-", "-"), List(6) { j.ler() })
+        assertEquals(listOf("q0", "q1", "P", "P", "P", "-", "-"), List(7) { j.ler() })
     }
 
     @Test fun buracoGrandeEPuladoDeUmaVez() {
@@ -159,6 +159,14 @@ class JitterBufferTest {
         assertEquals(ResultadoDoPush.Ressincronizou, j.entregar(5, p(5)))
         j.entregar(6, p(6))
         assertEquals(listOf("q5", "q6"), List(2) { j.ler() })
+    }
+
+    @Test fun rajadaDeDezPacotesNaoCortaAudio() {
+        val j = JitterBuffer(5)
+        for (i in 0 until 10) j.entregar(i, p(i))
+        val r = List(10) { j.ler() }
+        assertEquals((0 until 10).map { "q$it" }, r)
+        assertTrue("o alvo subiu para absorver a rajada", j.alvo > 5)
     }
 
     @Test fun viraDoContadorDe32Bits() {

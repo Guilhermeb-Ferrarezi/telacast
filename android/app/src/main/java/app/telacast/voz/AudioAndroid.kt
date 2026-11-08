@@ -51,6 +51,7 @@ class DispositivoAndroid(
     private var foco: AudioFocusRequest? = null
     private var modoAnterior = AudioManager.MODE_NORMAL
     @Volatile private var rodando = false
+    private var subfluxos = 0
     private var threadMic: Thread? = null
     private var threadSaida: Thread? = null
     /** Reaberturas seguidas do microfone / do alto-falante (zera depois de ~1 s de áudio fluindo). */
@@ -177,6 +178,10 @@ class DispositivoAndroid(
         while (rodando) {
             motor.reproduzir(saida)
             val n = track.write(saida, 0, QUADRO) // bloqueia até haver espaço: é o relógio de 20 ms
+            if (Build.VERSION.SDK_INT >= 24) {
+                val u = track.underrunCount
+                if (u != subfluxos) { subfluxos = u; runCatching { android.util.Log.w("TelacastVoz", "AudioTrack subfluxo #$u (o sistema ficou sem áudio para tocar)") } }
+            }
             if (n < 0) {
                 track = reabrirTrilha(n) ?: run { falhar("O alto-falante parou de responder."); return }
                 estaveis = 0

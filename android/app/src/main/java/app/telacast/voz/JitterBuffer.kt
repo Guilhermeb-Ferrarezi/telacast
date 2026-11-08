@@ -18,7 +18,7 @@ enum class ResultadoDoPush { Aceito, Duplicado, Atrasado, Ressincronizou }
  *
  * - Ordena por `seq` (aritmética de 32 bits com virada), descarta duplicados e pacotes que chegaram depois do seu
  *   quadro já ter passado.
- * - Começa a tocar quando há `alvo` quadros; o alvo (2 a 5 quadros = 40 a 100 ms) sobe com subfluxo ou atraso e
+ * - Começa a tocar quando há `alvo` quadros; o alvo (3 a 12 quadros = 60 a 240 ms) sobe com subfluxo ou atraso e
  *   desce depois de 5 s sem problemas.
  * - Perda no meio da fala vira [Reproducao.Perdido] (PLC); buffer esvaziado vira 2 quadros de PLC e depois silêncio.
  */
@@ -50,7 +50,7 @@ class JitterBuffer(alvoInicial: Int = ALVO_INICIAL) {
         pacotes.add(seq to dados)
     }
 
-    private fun sobeAlvo() { alvo = minOf(alvo + 1, MAX); calma = 0 }
+    private fun sobeAlvo() { alvo = minOf(alvo + 2, MAX); calma = 0 }
 
     fun entregar(seq: Int, dados: ByteArray): ResultadoDoPush {
         if (!iniciado) { recomeca(seq, dados); return ResultadoDoPush.Aceito }
@@ -102,6 +102,9 @@ class JitterBuffer(alvoInicial: Int = ALVO_INICIAL) {
             }
         }
         // recupera latência acumulada (rajada, relógio do remetente mais rápido)
+        // rajada (o WebSocket/TCP segurou os pacotes e soltou tudo de uma vez): em vez de cortar áudio, sobe o alvo até o
+        // máximo e só descarta o que passar disso
+        if (pacotes.size > alvo + EXCESSO && alvo < MAX) { alvo = minOf(MAX, pacotes.size - EXCESSO); calma = 0 }
         while (pacotes.size > alvo + EXCESSO) pulaUm()
 
         val p = proximo
@@ -130,15 +133,15 @@ class JitterBuffer(alvoInicial: Int = ALVO_INICIAL) {
 
     companion object {
         const val MIN = 2
-        const val MAX = 5
-        const val ALVO_INICIAL = 3
-        const val MAX_PACOTES = 32
+        const val MAX = 12
+        const val ALVO_INICIAL = 5
+        const val MAX_PACOTES = 48
         const val RESYNC = 200
         const val ATRASADOS_RESYNC = 8
         const val BURACO_MAX = 4
         const val EXCESSO = 4
-        const val PLC_QUADROS = 2
-        const val CALMA = 250
+        const val PLC_QUADROS = 3
+        const val CALMA = 150
         const val SUBFLUXO_JANELA = 12
         const val RETROCESSO_INICIAL = 8
     }
