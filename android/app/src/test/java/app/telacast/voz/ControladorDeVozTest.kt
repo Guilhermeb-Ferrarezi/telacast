@@ -24,13 +24,15 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-private class DispositivoFalso(val motor: MotorDeVoz, val aoFalhar: (String) -> Unit, val erroAoIniciar: String?) : DispositivoDeAudio {
+private class DispositivoFalso(val motor: MotorDeVoz, val aoFalhar: (String) -> Unit, val erroAoIniciar: String?, val lancaNaRota: Boolean = false) : DispositivoDeAudio {
     var iniciado = false; var parado = false
     var rota: RotaDeAudio? = null; var opcoes: OpcoesDeVoz? = null
-    override fun iniciar(): String? { if (erroAoIniciar == null) iniciado = true; return erroAoIniciar }
-    override fun parar() { parado = true }
-    override fun definirRota(rota: RotaDeAudio) { this.rota = rota }
-    override fun aplicarOpcoes(opcoes: OpcoesDeVoz) { this.opcoes = opcoes }
+    /** Quantas vezes qualquer método do dispositivo foi chamado (para provar que o mudo não o toca). */
+    var chamadas = 0
+    override fun iniciar(): String? { chamadas++; if (erroAoIniciar == null) iniciado = true; return erroAoIniciar }
+    override fun parar() { chamadas++; parado = true }
+    override fun definirRota(rota: RotaDeAudio) { chamadas++; if (lancaNaRota) throw IllegalStateException("rota recusada"); this.rota = rota }
+    override fun aplicarOpcoes(opcoes: OpcoesDeVoz) { chamadas++; this.opcoes = opcoes }
 }
 
 private class ServicoFalso : ServicoDeVoz {
@@ -47,13 +49,13 @@ class ControladorDeVozTest {
     private val marina = 112623612862660617L
     private val joao = 112623612862660633L
 
-    private inner class Amb(val t: TestScope, val erroDoDispositivo: String? = null) {
+    private inner class Amb(val t: TestScope, val erroDoDispositivo: String? = null, val erroNaReabertura: String? = null, val lancaNaRota: Boolean = false) {
         val transporte = FakeTransporte()
         val gateway = Gateway(t.backgroundScope, transporte, relogio = { t.currentTime })
         val repo = Repository(t.backgroundScope, gateway, relogio = { t.currentTime })
         val dispositivos = ArrayList<DispositivoFalso>()
         val servico = ServicoFalso()
-        val voz = ControladorDeVoz(repo, t.backgroundScope, ConcentusOpus(), { motor, _, _, aoFalhar -> DispositivoFalso(motor, aoFalhar, erroDoDispositivo).also { dispositivos += it } }, servico, { t.currentTime })
+        val voz = ControladorDeVoz(repo, t.backgroundScope, ConcentusOpus(), { motor, _, _, aoFalhar -> DispositivoFalso(motor, aoFalhar, if (dispositivos.isEmpty()) erroDoDispositivo else erroNaReabertura ?: erroDoDispositivo, lancaNaRota).also { dispositivos += it } }, servico, { t.currentTime })
         val c: FakeConexao get() = transporte.ultima
         val enviados get() = transporte.conexoes.flatMap { it.c2s }
 
@@ -67,7 +69,7 @@ class ControladorDeVozTest {
         fun entrarEConfirmar() { voz.entrar(sala); rodar(); confirmarEntrada() }
     }
 
-    private fun TestScope.amb(erro: String? = null) = Amb(this, erro)
+    private fun TestScope.amb(erro: String? = null, erroNaReabertura: String? = null, lancaNaRota: Boolean = false) = Amb(this, erro, erroNaReabertura, lancaNaRota)
 
     @Test fun entrarMandaVoiceJoinEFicaEntrandoAteOServidorConfirmar() = runTest {
         val a = amb()
@@ -110,12 +112,13 @@ class ControladorDeVozTest {
         assertNull(a.servico.iniciadoCom)
     }
 
-    @Test fun dispositivoQueQuebraDepoisDeIniciadoTambemSai() = runTest {
+    @Test fun dispositivoQueQuebraDeNovoLogoDepoisDeReabrirSai() = runTest {
         val a = amb(); a.entrarEConfirmar()
-        a.dispositivos.single().aoFalhar("O fone foi desconectado.")
+        a.dispositivos[0].aoFalhar("O fone foi desconectado."); a.rodar()    // 1a falha: reabre
+        a.dispositivos[1].aoFalhar("O fone foi desconectado."); a.rodar()    // 2a, dentro de 10 s: sai
         assertEquals(FaseDaVoz.Fora, a.voz.estado.value.fase)
         assertEquals("O fone foi desconectado.", a.voz.estado.value.erro)
-        assertTrue(a.dispositivos.single().parado)
+        assertTrue(a.dispositivos.all { it.parado })
     }
 
     @Test fun sairMandaVoiceLeaveEFechaTudo() = runTest {
@@ -262,5 +265,74 @@ class ControladorDeVozTest {
         a.voz.entrar(sala); a.rodar()
         assertEquals(FaseDaVoz.Fora, a.voz.estado.value.fase)
         assertEquals("Sem conexão com o servidor.", a.voz.estado.value.erro)
+    }
+
+    // ---------------------------------------------------------------- áudio que falha no meio da chamada (Bluetooth, rota, foco)
+
+    @Test fun mudoESurdoNuncaTocamNoDispositivoNemNaRota() = runTest {
+        val a = amb(); a.entrarEConfirmar()
+        val d = a.dispositivos.single()
+        val antes = d.chamadas
+        a.voz.alternarMudo(); a.voz.alternarMudo(); a.voz.alternarMudo(); a.voz.alternarSurdo(); a.voz.alternarSurdo(); a.rodar()
+        assertEquals("nenhuma chamada ao dispositivo", antes, d.chamadas)
+        assertEquals(1, a.dispositivos.size)
+        assertEquals(FaseDaVoz.Conectada, a.voz.estado.value.fase)
+        assertTrue(a.enviados.none { it == C2S.VoiceLeave })
+        // e o eco do servidor (VoiceUpdate do próprio usuário mudo) também não derruba nada
+        a.c.envia(S2C.VoiceUpdate(VoiceState(eu.id, sala, muted = true, deafened = false))); a.rodar()
+        assertEquals(FaseDaVoz.Conectada, a.voz.estado.value.fase)
+        assertEquals(1, a.dispositivos.size)
+    }
+
+    @Test fun falhaDoAudioReabreODispositivoEAChamadaContinua() = runTest {
+        val a = amb(); a.entrarEConfirmar(); a.voz.alternarMudo()
+        a.dispositivos[0].aoFalhar("O microfone parou de responder."); a.rodar()
+        assertEquals("a chamada não cai", FaseDaVoz.Conectada, a.voz.estado.value.fase)
+        assertNull(a.voz.estado.value.erro)
+        assertEquals(2, a.dispositivos.size)
+        assertTrue(a.dispositivos[0].parado); assertTrue(a.dispositivos[1].iniciado)
+        assertTrue("o servidor não foi avisado de saída", a.enviados.none { it == C2S.VoiceLeave })
+        assertTrue("o mudo sobrevive", a.voz.estado.value.mudo)
+        assertNotNull(a.repo.ouvinteBinario)
+    }
+
+    @Test fun segundaFalhaLogoDepoisDesisteEPrimeiraAposAJanelaReabreDeNovo() = runTest {
+        val a = amb(); a.entrarEConfirmar()
+        a.dispositivos[0].aoFalhar("x"); a.rodar()
+        a.t.advanceTimeBy(11_000); a.rodar()
+        a.dispositivos[1].aoFalhar("y"); a.rodar()
+        assertEquals("fora da janela de 10 s reabre de novo", FaseDaVoz.Conectada, a.voz.estado.value.fase)
+        assertEquals(3, a.dispositivos.size)
+        a.t.advanceTimeBy(2_000); a.rodar()
+        a.dispositivos[2].aoFalhar("z"); a.rodar()
+        assertEquals("falhou de novo dentro da janela: sai", FaseDaVoz.Fora, a.voz.estado.value.fase)
+        assertEquals("z", a.voz.estado.value.erro)
+        assertEquals(C2S.VoiceLeave, a.enviados.last())
+    }
+
+    @Test fun seAReaberturaFalharSaiComAMensagemDela() = runTest {
+        val a = amb(erroNaReabertura = "Não consegui abrir o microfone.")
+        // o primeiro dispositivo abre bem, o segundo não
+        a.voz.entrar(sala); a.rodar(); a.confirmarEntrada()
+        a.dispositivos[0].aoFalhar("caiu"); a.rodar()
+        assertEquals(FaseDaVoz.Fora, a.voz.estado.value.fase)
+        assertEquals("Não consegui abrir o microfone.", a.voz.estado.value.erro)
+        assertEquals(C2S.VoiceLeave, a.enviados.last())
+    }
+
+    @Test fun avisoDeFalhaDeDispositivoAntigoEhIgnorado() = runTest {
+        val a = amb(); a.entrarEConfirmar()
+        val antigo = a.dispositivos[0]
+        antigo.aoFalhar("x"); a.rodar()
+        antigo.aoFalhar("de novo, do velho"); a.rodar() // já foi trocado: não conta
+        assertEquals(FaseDaVoz.Conectada, a.voz.estado.value.fase)
+        assertEquals(2, a.dispositivos.size)
+    }
+
+    @Test fun trocarARotaQueODispositivoRecusaNaoDerrubaAChamada() = runTest {
+        val a = amb(lancaNaRota = true); a.entrarEConfirmar()
+        a.voz.definirRota(RotaDeAudio.Fone); a.rodar()
+        assertEquals(FaseDaVoz.Conectada, a.voz.estado.value.fase)
+        assertEquals(RotaDeAudio.Fone, a.voz.estado.value.rota)
     }
 }

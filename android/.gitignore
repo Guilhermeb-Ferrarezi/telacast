@@ -3,6 +3,8 @@ build/
 .gradle/
 .kotlin/
 local.properties
+# credenciais do Firebase (push): nunca versionar
+google-services.json
 captures/
 
 # artefatos e segredos: nunca versionar chaves

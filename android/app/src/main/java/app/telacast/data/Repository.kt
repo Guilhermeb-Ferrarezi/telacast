@@ -226,6 +226,9 @@ class Repository(
     fun entrarNaVoz(canal: Long): Boolean = gateway.enviar(C2S.VoiceJoin(canal))
     fun sairDaVoz() { gateway.enviar(C2S.VoiceLeave) }
     fun definirVoz(mudo: Boolean, surdo: Boolean) { gateway.enviar(C2S.VoiceSet(mudo, surdo)) }
+    fun registrarPush(token: String): Boolean = gateway.enviar(C2S.PushRegister(token, "fcm"))
+    fun cancelarPush(token: String): Boolean = gateway.enviar(C2S.PushUnregister(token))
+    fun definirFoco(focado: Boolean): Boolean = gateway.enviar(C2S.SetFocus(focado))
     fun enviarBinario(quadro: ByteArray): Boolean = gateway.enviarBinario(quadro)
 
     fun bloquear(usuario: Long) { gateway.enviar(C2S.Block(usuario)) }

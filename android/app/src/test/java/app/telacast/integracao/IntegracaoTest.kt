@@ -366,6 +366,29 @@ class IntegracaoTest {
         assertEquals("a pequena veio inteira e serve igual", "800x600", p)
     }
 
+    // ------------------------------------------------------------------ push (D1)
+
+    /** O servidor aceita os três comandos em silêncio (sem credencial do Firebase o push fica desligado) e recusa o inválido. */
+    @Test fun comandosDePushSaoAceitosEInvalidosRecusados() {
+        val antes = bob.avisos.size
+        val token = "tok-it-${sufixo}"
+        assertTrue(bob.repo.registrarPush(token))
+        assertTrue(bob.repo.registrarPush(token)) // idempotente
+        assertTrue(bob.repo.definirFoco(true))
+        assertTrue(bob.repo.definirFoco(false))
+        assertTrue(bob.repo.cancelarPush(token))
+        // as mensagens de uma conexão são tratadas em ordem: quando a resposta de um comando com resposta chega, os de push já passaram
+        bob.gateway.enviar(app.telacast.proto.C2S.ListSessions)
+        esperar("sessões de volta") { if (bob.estado.sessoes.isNotEmpty()) true else null }
+        assertEquals("nenhum erro para comandos válidos", emptyList<Aviso>(), bob.avisos.drop(antes).filterIsInstance<Aviso.Erro>())
+
+        bob.gateway.enviar(app.telacast.proto.C2S.PushRegister("com espaço", "fcm"))
+        esperar("erro para token inválido") { bob.avisos.drop(antes).filterIsInstance<Aviso.Erro>().firstOrNull() }
+        val n = bob.avisos.count { it is Aviso.Erro }
+        bob.gateway.enviar(app.telacast.proto.C2S.PushRegister("tok-ok", "apns"))
+        esperar("erro para plataforma desconhecida") { if (bob.avisos.count { it is Aviso.Erro } > n) true else null }
+    }
+
     // ------------------------------------------------------------------ amizade, bloqueio, fixadas, busca e conta (B7/B8)
 
     @Test fun amizadeDmEBloqueio() {

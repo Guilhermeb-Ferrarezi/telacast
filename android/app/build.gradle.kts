@@ -49,6 +49,9 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // Opus em Java puro: roda igual na JVM (testes) e no aparelho, sem NDK nem libs nativas
     implementation("io.github.jaredmdobson:concentus:1.0.2")
+    // push por FCM (D1). Sem google-services.json o Firebase não inicializa e o app só não registra push
+    implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
+    implementation("com.google.firebase:firebase-messaging")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
@@ -62,6 +65,9 @@ dependencies {
 tasks.withType<Test>().configureEach {
     maxHeapSize = "768m"
     systemProperty("telacast.fixtures", rootProject.projectDir.resolve("../proto/fixtures").canonicalPath)
+    // RNNoise na JVM: a versão do PC da ponte nativa (scripts/rnnoise.sh --host). Sem ela os testes do RNNoise são ignorados.
+    rootProject.projectDir.resolve("native/rnnoise/target/release").takeIf { it.resolve("libtelacast_rnnoise.so").exists() }
+        ?.let { jvmArgs("-Djava.library.path=${it.absolutePath}") }
     if (project.hasProperty("integrationTests")) {
         filter.includeTestsMatching("*IntegracaoTest")
         outputs.upToDateWhen { false }
@@ -73,3 +79,7 @@ tasks.withType<Test>().configureEach {
         testLogging { events("failed") }
     }
 }
+
+// Credenciais do Firebase (baixadas do console do projeto, ficam fora do git): sem o arquivo o build e os testes funcionam igual
+// e o app simplesmente não registra push.
+if (file("google-services.json").exists()) apply(plugin = "com.google.gms.google-services")

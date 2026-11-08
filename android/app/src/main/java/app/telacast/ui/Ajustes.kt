@@ -135,7 +135,7 @@ private fun FormularioDeSenha(aoTrocar: (String, String) -> Unit) {
 @Composable
 fun SecaoDeVoz(o: OpcoesDeVoz, aoMudar: ((OpcoesDeVoz) -> OpcoesDeVoz) -> Unit) {
     Column(Modifier.fillMaxWidth().background(Grafite.L3, Formas.Cartao).padding(vertical = 4.dp)) {
-        Interruptor("Supressão de ruído", "Filtra ruído de fundo (efeito do Android, se o aparelho tiver).", o.supressaoDeRuido) { v -> aoMudar { it.copy(supressaoDeRuido = v) } }
+        Interruptor("Supressão de ruído", "Tira ruído de fundo da sua voz (RNNoise, o mesmo do desktop; sem ele, o efeito do Android).", o.supressaoDeRuido) { v -> aoMudar { it.copy(supressaoDeRuido = v) } }
         Interruptor("Cancelamento de eco", "Evita que a voz dos outros volte pelo seu microfone.", o.cancelamentoDeEco) { v -> aoMudar { it.copy(cancelamentoDeEco = v) } }
         Interruptor("Ganho automático", "Mantém o volume da sua voz parecido.", o.ganhoAutomatico) { v -> aoMudar { it.copy(ganhoAutomatico = v) } }
         DeslizanteDeVoz("Sensibilidade do microfone", "${(o.sensibilidade * 100).toInt()}%", o.sensibilidade, 0f..1f) { v -> aoMudar { it.copy(sensibilidade = v) } }

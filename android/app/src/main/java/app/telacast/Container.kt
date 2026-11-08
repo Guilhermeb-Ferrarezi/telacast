@@ -11,6 +11,13 @@ import app.telacast.arquivos.EnviadorDeAnexos
 import app.telacast.arquivos.OkHttpArquivos
 import app.telacast.data.ControladorDoCompositor
 import app.telacast.data.Repository
+import app.telacast.push.ControladorDeFoco
+import app.telacast.push.GerenciadorDePush
+import app.telacast.push.Notificador
+import app.telacast.push.NotificadorNulo
+import app.telacast.push.ProvedorDeToken
+import app.telacast.push.ReceptorDePush
+import app.telacast.push.SemToken
 import app.telacast.voz.ConcentusOpus
 import app.telacast.voz.ControladorDeVoz
 import app.telacast.voz.FabricaDeDispositivo
@@ -44,6 +51,12 @@ class Container(
     fabricaDeDispositivo: FabricaDeDispositivo = FabricaSemAudio,
     servicoDeVoz: ServicoDeVoz = ServicoDeVozNulo,
     rotaInicialDaVoz: RotaDeAudio = RotaDeAudio.AltoFalante,
+    /** Desenha as notificações de push (no app: `NotificadorAndroid`); nos testes, nenhum. */
+    val notificador: Notificador = NotificadorNulo,
+    /** Token do FCM (no app: `ProvedorFirebase`; sem credenciais ou nos testes: nenhum). */
+    provedorDeToken: ProvedorDeToken = SemToken,
+    /** RNNoise da voz (no app: `SupressorRnnoise`); `null` nos testes. */
+    fabricaDeSupressor: app.telacast.voz.FabricaDeSupressor? = null,
 ) {
     val gateway = Gateway(escopo, transporte, relogio)
     val repositorio = Repository(escopo, gateway, relogio)
@@ -59,6 +72,11 @@ class Container(
     /** Chat de voz: máquina de estados, motor de áudio e serviço em primeiro plano. */
     val voz = ControladorDeVoz(
         repositorio, escopo, ConcentusOpus(), fabricaDeDispositivo, servicoDeVoz, relogio,
-        opcoesIniciais = preferencias.opcoesDeVoz, rotaInicial = rotaInicialDaVoz,
+        opcoesIniciais = preferencias.opcoesDeVoz, rotaInicial = rotaInicialDaVoz, supressores = fabricaDeSupressor,
     )
+
+    /** Push (D1): registro do token, foco (`SetFocus`) e a decisão de mostrar a notificação. */
+    val push = GerenciadorDePush(repositorio, escopo, provedorDeToken, preferencias)
+    val foco = ControladorDeFoco(repositorio, escopo)
+    val receptorDePush = ReceptorDePush(notificador, { foco.emPrimeiroPlano }, relogio)
 }

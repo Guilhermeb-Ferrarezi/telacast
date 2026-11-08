@@ -11,6 +11,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
@@ -54,6 +55,16 @@ fun RaizDoApp(vm: AppViewModel) {
             val senhaTrocada by vm.senhaTrocada.collectAsState()
             val vozEstado by vm.voz.collectAsState()
             val contexto = LocalContext.current
+            // POST_NOTIFICATIONS (Android 13+): pedida uma vez ao entrar na conta; se negar, não insistimos
+            val pedirNotificacoes = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+            LaunchedEffect(Unit) {
+                if (Build.VERSION.SDK_INT >= 33 && vm.devePedirNotificacoes() &&
+                    ContextCompat.checkSelfPermission(contexto, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    vm.marcarPediuNotificacoes()
+                    pedirNotificacoes.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+            }
             // RECORD_AUDIO só é pedida quando a pessoa entra na voz (nunca ao abrir o app). POST_NOTIFICATIONS (Android 13+)
             // vai junto, para a notificação da chamada aparecer; negá-la não impede a voz.
             var canalPendente by remember { mutableStateOf<Long?>(null) }
@@ -67,6 +78,7 @@ fun RaizDoApp(vm: AppViewModel) {
                 if (ContextCompat.checkSelfPermission(contexto, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) vm.entrarNaVoz(canal)
                 else {
                     canalPendente = canal
+                    vm.marcarPediuNotificacoes() // a mesma pergunta já vai junto: não repetir depois
                     val pedir = buildList {
                         add(Manifest.permission.RECORD_AUDIO)
                         if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)

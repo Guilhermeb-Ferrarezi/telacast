@@ -12,8 +12,9 @@ class MotorDeVoz(
     private val enviar: (ByteArray) -> Unit,
     relogio: () -> Long = System::currentTimeMillis,
     alvoDoJitter: Int = JitterBuffer.ALVO_INICIAL,
-) {
-    private val envio = PipelineDeEnvio(fabrica.codificador())
+    supressor: FabricaDeSupressor? = null,
+) : AutoCloseable {
+    private val envio = PipelineDeEnvio(fabrica.codificador(), fabricaDeSupressor = supressor)
     private val recepcao = RecepcaoDeVoz(fabrica, relogio, alvoDoJitter)
     @Volatile private var mudo = false
     @Volatile private var surdo = false
@@ -29,6 +30,15 @@ class MotorDeVoz(
     fun definirSurdo(v: Boolean) { surdo = v }
     fun definirSensibilidade(s: Float) { envio.vad.sensibilidade = s }
     fun definirGanho(g: Float) { envio.ganho = g }
+    fun definirAgc(ligado: Boolean) { envio.agc.ligado = ligado }
+    /** Opção "Supressão de ruído": liga o RNNoise (se a biblioteca nativa existe). */
+    fun definirSupressao(ligado: Boolean) { envio.supressao = ligado }
+    /** Há RNNoise próprio (então o NoiseSuppressor do sistema deve ficar desligado). */
+    val supressorProprio: Boolean get() = envio.supressorProprio
+    /** Probabilidade de voz do RNNoise no último quadro. */
+    val probDeVoz: Float get() = envio.probDeVoz
+    /** Libera o RNNoise nativo. Chame depois de parar a captura. */
+    override fun close() { envio.close() }
     fun definirVolume(usuario: Long, volume: Float) = recepcao.definirVolume(usuario, volume)
     fun volume(usuario: Long) = recepcao.volume(usuario)
 

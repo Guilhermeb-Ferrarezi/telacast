@@ -241,4 +241,64 @@ class AppViewModelTest {
         assertEquals(2f, a.vm.voz.value.opcoes.ganhoDeEntrada, 0.001f)
         assertEquals(2f, a.prefs.opcoesDeVoz.ganhoDeEntrada, 0.001f)
     }
+
+    // ---------------------------------------------------------------- push (D1): toque na notificação
+    private fun TestScope.ambComToque(d: app.telacast.push.DestinoDoToque, logado: Boolean): Amb {
+        val a = amb()
+        a.vm.abrirPorNotificacao(d); a.rodar()
+        if (!logado) return a
+        a.vm.editarForm { it.copy(usuario = "g", senha = "s") }; a.vm.entrar(); a.rodar(); a.autenticar()
+        return a
+    }
+
+    @Test fun toqueEmDmAbreAConversaDepoisDeEntrar() = runTest {
+        val a = ambComToque(app.telacast.push.DestinoDoToque.Dm(112623800000000001L), logado = true)
+        assertEquals(Destino.Dm(112623800000000001L), a.vm.nav.value.destino)
+        assertEquals(112623800000000001L, a.vm.estado.value.canalAberto)
+    }
+
+    @Test fun toqueEmCanalAbreOCanalEMarcaComoAberto() = runTest {
+        val a = ambComToque(app.telacast.push.DestinoDoToque.Canal(servidor.id, memes), logado = true)
+        assertEquals(Destino.Canal(servidor.id, memes), a.vm.nav.value.destino)
+        assertEquals(memes, a.vm.estado.value.canalAberto)
+    }
+
+    @Test fun toqueEmCanalQueNaoExisteMaisVaiParaOInicio() = runTest {
+        val a = ambComToque(app.telacast.push.DestinoDoToque.Canal(servidor.id, 424242L), logado = true)
+        assertEquals(Destino.Amigos, a.vm.nav.value.destino)
+    }
+
+    @Test fun toqueEmPedidoDeAmizadeAbreAbaPendente() = runTest {
+        val a = ambComToque(app.telacast.push.DestinoDoToque.Pendentes, logado = true)
+        assertEquals(Destino.Amigos, a.vm.nav.value.destino)
+        assertEquals(app.telacast.estado.AbaInicio.Pendente, a.vm.nav.value.abaInicio)
+    }
+
+    @Test fun toqueComOAppJaAbertoNavegaNaHora() = runTest {
+        val a = amb(); a.vm.editarForm { it.copy(usuario = "g", senha = "s") }; a.vm.entrar(); a.rodar(); a.autenticar()
+        a.vm.abrirPorNotificacao(app.telacast.push.DestinoDoToque.Canal(servidor.id, memes)); a.rodar()
+        assertEquals(Destino.Canal(servidor.id, memes), a.vm.nav.value.destino)
+        a.vm.abrirPorNotificacao(app.telacast.push.DestinoDoToque.Dm(112623800000000002L)); a.rodar()
+        assertEquals(Destino.Dm(112623800000000002L), a.vm.nav.value.destino)
+    }
+
+    @Test fun sairDescartaToquePendenteEPermissaoDeNotificacoesPedeUmaVezSo() = runTest {
+        val a = amb(); a.vm.editarForm { it.copy(usuario = "g", senha = "s") }; a.vm.entrar(); a.rodar()
+        a.vm.abrirPorNotificacao(app.telacast.push.DestinoDoToque.Canal(servidor.id, memes)); a.vm.sair(); a.rodar()
+        a.vm.editarForm { it.copy(usuario = "g", senha = "s") }; a.vm.entrar(); a.rodar(); a.autenticar()
+        assertEquals("o toque antigo não vale na conta nova: abre o destino inicial", Destino.Canal(servidor.id, geral), a.vm.nav.value.destino)
+        assertTrue(a.vm.devePedirNotificacoes())
+        a.vm.marcarPediuNotificacoes()
+        assertFalse(a.vm.devePedirNotificacoes())
+    }
+
+    @Test fun sairMandaPushUnregisterAntesDoLogout() = runTest {
+        val a = amb(); a.prefs.tokenDePush = "tok-1"
+        a.vm.editarForm { it.copy(usuario = "g", senha = "s") }; a.vm.entrar(); a.rodar(); a.autenticar()
+        a.vm.sair(); a.rodar()
+        val c2s = a.c.c2s
+        assertEquals(C2S.PushUnregister("tok-1"), c2s[c2s.lastIndex - 1])
+        assertEquals(C2S.Logout, c2s.last())
+        assertEquals("", a.prefs.tokenDePush)
+    }
 }

@@ -74,7 +74,7 @@ sealed class C2S {
             "Register", "Login", "Resume", "Logout", "VoiceJoin", "VoiceLeave", "VoiceSet", "ChangePassword",
             "ListSessions", "RevokeSession", "RevokeOtherSessions", "CreateServer", "JoinServer", "CreateChannel",
             "Send", "Edit", "Delete", "SetStatus", "SetIdle", "Search", "Block", "Unblock", "Pin", "Pins", "React",
-            "Ack", "Typing", "History", "FriendRequest", "FriendAccept", "FriendRemove", "OpenDm",
+            "Ack", "Typing", "History", "FriendRequest", "FriendAccept", "FriendRemove", "OpenDm", "PushRegister", "PushUnregister", "SetFocus",
         )
     }
 }

@@ -31,7 +31,7 @@ data class OpcoesDeVoz(
     val cancelamentoDeEco: Boolean = true,
     val ganhoAutomatico: Boolean = true,
     /** Sensibilidade do VAD, 0 a 1 (padrão 0,7, igual ao desktop). */
-    val sensibilidade: Float = Vad.SENSIBILIDADE_PADRAO,
+    val sensibilidade: Float = Vad.SENSIBILIDADE_PADRAO_ANDROID,
     /** Ganho de entrada linear (0,5 a 4). */
     val ganhoDeEntrada: Float = 1f,
 )
@@ -105,6 +105,8 @@ class ControladorDeVoz(
     private val intervaloDoMedidorMs: Long = 100,
     opcoesIniciais: OpcoesDeVoz = OpcoesDeVoz(),
     rotaInicial: RotaDeAudio = RotaDeAudio.AltoFalante,
+    /** RNNoise (no app: [SupressorRnnoise]); `null` ou sem a biblioteca nativa = sem supressor próprio, vale o do sistema. */
+    private val supressores: FabricaDeSupressor? = null,
 ) {
     private val lock = Any()
     private val _estado = MutableStateFlow(EstadoDeVoz(opcoes = opcoesIniciais, rota = rotaInicial))
@@ -151,11 +153,15 @@ class ControladorDeVoz(
         motor?.definirVolume(usuario, v)
     }
 
-    fun definirRota(rota: RotaDeAudio) = synchronized(lock) { atualizar { it.copy(rota = rota) }; dispositivo?.definirRota(rota) }
+    fun definirRota(rota: RotaDeAudio) = synchronized(lock) {
+        atualizar { it.copy(rota = rota) }
+        // trocar a rota nunca derruba a chamada: se o dispositivo recusar, o próximo `read` falho reabre o áudio
+        runCatching { dispositivo?.definirRota(rota) }
+    }
 
     fun definirOpcoes(o: OpcoesDeVoz) = synchronized(lock) {
         atualizar { it.copy(opcoes = o) }
-        motor?.definirSensibilidade(o.sensibilidade); motor?.definirGanho(o.ganhoDeEntrada)
+        motor?.definirSensibilidade(o.sensibilidade); motor?.definirGanho(o.ganhoDeEntrada); motor?.definirAgc(o.ganhoAutomatico); motor?.definirSupressao(o.supressaoDeRuido)
         dispositivo?.aplicarOpcoes(o)
     }
 
@@ -180,7 +186,7 @@ class ControladorDeVoz(
             FaseDaVoz.Fora -> Unit
             FaseDaVoz.Entrando -> if (meu != null && meu.channelId == alvo) conectar(meu.channelId)
             FaseDaVoz.Conectada -> when {
-                meu == null -> encerrar("Você saiu da chamada de voz.")
+                meu == null -> { runCatching { android.util.Log.w("TelacastVoz", "servidor tirou da voz: voz=${s.voz.size} eu=$eu") }; encerrar("Você saiu da chamada de voz.") }
                 meu.channelId != _estado.value.canal -> { alvo = meu.channelId; atualizar { it.copy(canal = meu.channelId) } }
                 else -> limparQuemSaiu(s, meu.channelId)
             }
@@ -206,12 +212,17 @@ class ControladorDeVoz(
         jobLimite?.cancel()
         if (motor != null) { atualizar { it.copy(fase = FaseDaVoz.Conectada, canal = canal, desdeMs = it.desdeMs ?: relogio()) }; return }
         val st = _estado.value
-        val m = MotorDeVoz(opus, { repo.enviarBinario(it) }, relogio)
+        val m = MotorDeVoz(opus, { repo.enviarBinario(it) }, relogio, supressor = supressores)
+        m.definirSupressao(st.opcoes.supressaoDeRuido)
+        if (m.supressorProprio && !custoMedido) {
+            custoMedido = true
+            runCatching { android.util.Log.i("TelacastVoz", "RNNoise ativo: ${SupressorRnnoise.medirCustoPorQuadroUs()?.toInt()} µs por quadro de 10 ms (limite 10000)") }
+        } else if (!m.supressorProprio) runCatching { android.util.Log.i("TelacastVoz", "RNNoise indisponível (biblioteca nativa ausente): usando o NoiseSuppressor do sistema") }
         m.definirMudo(st.mudo || st.surdo); m.definirSurdo(st.surdo)
-        m.definirSensibilidade(st.opcoes.sensibilidade); m.definirGanho(st.opcoes.ganhoDeEntrada)
+        m.definirSensibilidade(st.opcoes.sensibilidade); m.definirGanho(st.opcoes.ganhoDeEntrada); m.definirAgc(st.opcoes.ganhoAutomatico)
         for ((u, v) in st.volumes) m.definirVolume(u, v)
         repo.ouvinteBinario = m::receberQuadro
-        val d = dispositivos.criar(m, st.opcoes, st.rota) { msg -> synchronized(lock) { encerrar(msg, avisarServidor = true) } }
+        val d = criarDispositivo(m, st)
         val erro = d.iniciar()
         if (erro != null) { repo.ouvinteBinario = null; encerrar(erro, avisarServidor = true); return }
         motor = m; dispositivo = d
@@ -220,6 +231,38 @@ class ControladorDeVoz(
         val nome = textoDoCanal(canal)
         servico.iniciar("Voz conectada", nome)
         iniciarMedidor()
+    }
+
+    /** Geração do dispositivo atual: avisos de falha de um dispositivo que já foi trocado ou parado são ignorados. */
+    private var geracaoDoDispositivo = 0
+    private var ultimaReaberturaMs = Long.MIN_VALUE
+    private var custoMedido = false
+
+    private fun criarDispositivo(m: MotorDeVoz, st: EstadoDeVoz): DispositivoDeAudio {
+        val minha = ++geracaoDoDispositivo
+        // a falha chega da thread de áudio do dispositivo: trata fora dela (reabrir para e junta essas threads)
+        return dispositivos.criar(m, st.opcoes, st.rota) { msg -> escopo.launch { synchronized(lock) { aoFalharODispositivo(minha, msg) } } }
+    }
+
+    /**
+     * O áudio falhou no meio da chamada (rota trocada, Bluetooth entrando ou saindo, microfone tomado, foco). Antes de sair da
+     * chamada tenta reabrir o dispositivo UMA vez (o motor, o jitter buffer e o estado de mudo/surdo ficam); se falhar de novo
+     * dentro de [JANELA_DA_REABERTURA_MS], aí sim encerra com a mensagem.
+     */
+    private fun aoFalharODispositivo(geracao: Int, msg: String) {
+        val m = motor
+        if (geracao != geracaoDoDispositivo || m == null || _estado.value.fase != FaseDaVoz.Conectada) return
+        val agora = relogio()
+        val recente = ultimaReaberturaMs != Long.MIN_VALUE && agora - ultimaReaberturaMs < JANELA_DA_REABERTURA_MS
+        if (recente) { runCatching { android.util.Log.w("TelacastVoz", "áudio falhou de novo ($msg): saindo da chamada") }; encerrar(msg, avisarServidor = true); return }
+        ultimaReaberturaMs = agora
+        runCatching { android.util.Log.w("TelacastVoz", "áudio falhou ($msg): reabrindo o dispositivo") }
+        dispositivo?.parar(); dispositivo = null
+        val st = _estado.value
+        val novo = criarDispositivo(m, st)
+        val erro = runCatching { novo.iniciar() }.getOrElse { it.message ?: "falha ao reabrir o áudio" }
+        if (erro != null) { encerrar(erro, avisarServidor = true); return }
+        dispositivo = novo
     }
 
     private fun textoDoCanal(canal: Long): String {
@@ -267,13 +310,21 @@ class ControladorDeVoz(
 
     private fun pararAudio() {
         jobMedidor?.cancel(); jobMedidor = null
+        geracaoDoDispositivo++ // invalida avisos de falha que ainda estejam a caminho
         dispositivo?.parar(); dispositivo = null
-        motor = null
+        motor?.close(); motor = null
         repo.ouvinteBinario = null
+    }
+
+    private companion object {
+        /** Segunda falha do áudio dentro desta janela depois de uma reabertura: desiste e sai da chamada. */
+        const val JANELA_DA_REABERTURA_MS = 10_000L
     }
 
     /** Fecha tudo e volta a [FaseDaVoz.Fora]. */
     private fun encerrar(erro: String?, avisarServidor: Boolean = false) {
+        // diagnóstico: de onde veio a saída da chamada (adb logcat -s TelacastVoz)
+        runCatching { android.util.Log.w("TelacastVoz", "encerrar: erro=$erro avisarServidor=$avisarServidor fase=${_estado.value.fase}", Throwable("origem")) }
         if (avisarServidor) repo.sairDaVoz()
         jobLimite?.cancel(); jobLimite = null
         pararAudio()

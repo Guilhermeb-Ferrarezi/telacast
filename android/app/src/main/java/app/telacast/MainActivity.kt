@@ -1,5 +1,6 @@
 package app.telacast
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -9,6 +10,7 @@ import androidx.activity.viewModels
 import androidx.compose.ui.graphics.toArgb
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
+import app.telacast.push.destinoDoIntent
 import app.telacast.tema.Grafite
 import app.telacast.tema.GrafiteTheme
 import app.telacast.ui.RaizDoApp
@@ -28,5 +30,17 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge(statusBarStyle = escuro, navigationBarStyle = escuro)
         super.onCreate(savedInstanceState)
         setContent { GrafiteTheme { RaizDoApp(vm) } }
+        // toque numa notificação de push com o app fechado; depois de rotação/restauração o Intent antigo não vale de novo
+        if (savedInstanceState == null) tratarToque(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        tratarToque(intent)
+    }
+
+    private fun tratarToque(intent: Intent?) {
+        destinoDoIntent(intent)?.let { vm.abrirPorNotificacao(it) }
     }
 }

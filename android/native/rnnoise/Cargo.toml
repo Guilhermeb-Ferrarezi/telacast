@@ -1,0 +1,23 @@
+# Ponte JNI do RNNoise (nnnoiseless) para o app Android. Fora do workspace do repositório (o `[workspace]` vazio abaixo
+# impede o Cargo de procurar o Cargo.toml da raiz). Build: android/scripts/rnnoise.sh
+[package]
+name = "telacast-rnnoise"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# a mesma versão e as mesmas features do cliente desktop (app/Cargo.toml): o mesmo algoritmo e o mesmo modelo
+nnnoiseless = { version = "0.5", default-features = false }
+jni = "0.21"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[workspace]

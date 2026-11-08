@@ -1,5 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Só no build de DEBUG: permite ws:// (texto claro) para o servidor de desenvolvimento. O release não tem isto. -->
-    <application android:networkSecurityConfig="@xml/network_security_config" />
+    <!-- Só no build de DEBUG: permite ws:// (texto claro) para o servidor de desenvolvimento, e o receiver de push de teste. O release não tem isto. -->
+    <application android:networkSecurityConfig="@xml/network_security_config">
+        <!-- dispara uma notificação de push de teste (sem FCM) por `adb shell am broadcast`.
+             Exportado, mas protegido pela permissão DUMP, que só o shell do adb (e o sistema) tem: outros apps não conseguem chamar. -->
+        <receiver
+            android:name="app.telacast.push.ReceptorDeTesteDePush"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="app.telacast.debug.PUSH_DE_TESTE" />
+            </intent-filter>
+        </receiver>
+    </application>
 </manifest>

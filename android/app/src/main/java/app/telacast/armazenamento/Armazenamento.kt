@@ -17,6 +17,10 @@ interface Preferencias {
     var tamanhoDoTexto: Int
     /** Opções de voz (supressão de ruído, eco, ganho, sensibilidade). */
     var opcoesDeVoz: OpcoesDeVoz
+    /** Token do FCM desta instalação (vazio = ainda não temos); não é segredo de login. */
+    var tokenDePush: String
+    /** Já pedimos a permissão de notificações uma vez (não insistimos). */
+    var pediuNotificacoes: Boolean
     /** Rascunho do compositor por canal (some ao enviar). */
     fun rascunho(canal: Long): String
     fun salvarRascunho(canal: Long, texto: String)
@@ -37,6 +41,8 @@ class PreferenciasEmMemoria(
     override var ultimoServidor: Long = 0,
     override var tamanhoDoTexto: Int = 1,
     override var opcoesDeVoz: OpcoesDeVoz = OpcoesDeVoz(),
+    override var tokenDePush: String = "",
+    override var pediuNotificacoes: Boolean = false,
 ) : Preferencias {
     private val rascunhos = HashMap<Long, String>()
     override fun rascunho(canal: Long) = rascunhos[canal].orEmpty()

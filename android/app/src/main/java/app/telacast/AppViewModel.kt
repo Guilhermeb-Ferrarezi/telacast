@@ -19,6 +19,7 @@ import app.telacast.estado.Navegacao
 import app.telacast.estado.TextosDeErro
 import app.telacast.net.Credencial
 import app.telacast.proto.Channel
+import app.telacast.push.DestinoDoToque
 import app.telacast.proto.Status
 import app.telacast.voz.EstadoDeVoz
 import app.telacast.voz.OpcoesDeVoz
@@ -114,6 +115,8 @@ class AppViewModel(private val c: Container) : ViewModel() {
     /** `Logout` (revoga o token) e volta ao formulário. */
     fun sair() {
         c.voz.sair()
+        c.push.aoSair() // PushUnregister antes do Logout; apaga o token daqui e do FCM
+        toquePendente = null
         repo.sair()
         c.cofre.apagar()
         retomando.value = false
@@ -121,6 +124,35 @@ class AppViewModel(private val c: Container) : ViewModel() {
         _nav.value = Navegacao()
         _form.update { it.copy(senha = "", convite = "", entrando = false, erro = null) }
     }
+
+    // ------------------------------------------------------------------ push
+
+    /** Toque numa notificação: se o app ainda está entrando, guarda e aplica quando o snapshot chegar. */
+    private var toquePendente: DestinoDoToque? = null
+
+    fun abrirPorNotificacao(d: DestinoDoToque) {
+        toquePendente = d
+        aplicarToque(repo.estado.value)
+    }
+
+    private fun aplicarToque(s: AppState) {
+        val d = toquePendente ?: return
+        val sn = s.snapshot
+        if (!s.autenticado || sn == null || !navInicializada) return
+        toquePendente = null
+        when (d) {
+            is DestinoDoToque.Dm -> abrirDm(d.canal)
+            is DestinoDoToque.Canal -> {
+                val sv = sn.servers.firstOrNull { it.id == d.servidor }
+                if (sv != null && sv.channels.any { it.id == d.canal }) abrirCanal(d.servidor, d.canal) else abrirAmigos()
+            }
+            DestinoDoToque.Pendentes -> { abrirAmigos(); escolherAba(AbaInicio.Pendente) }
+        }
+    }
+
+    /** Permissão de notificações: pedimos uma vez só (ao entrar na conta ou ao entrar na voz), sem insistir. */
+    fun devePedirNotificacoes(): Boolean = !c.preferencias.pediuNotificacoes
+    fun marcarPediuNotificacoes() { c.preferencias.pediuNotificacoes = true }
 
     /** Na tela "Entrando…" quando a retomada demora: desiste e mostra o formulário. */
     fun usarOutraConta() = sair()
@@ -133,6 +165,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
             if (_form.value.entrando || _form.value.senha.isNotEmpty()) _form.update { it.copy(entrando = false, senha = "", convite = "") }
             if (!navInicializada && s.snapshot != null) { navInicializada = true; escolherDestinoInicial(s) }
             corrigirDestino(s)
+            aplicarToque(s)
         }
         s.erroDeEntrada?.let { e ->
             retomando.value = false
@@ -179,13 +212,17 @@ class AppViewModel(private val c: Container) : ViewModel() {
     fun fecharMenu() = _nav.update { it.fecharMenu() }
     fun abrirDialogo(d: Dialogo) = _nav.update { it.abrirDialogo(d) }
     fun fecharDialogo() = _nav.update { it.fecharDialogo() }
-    fun escolherAba(a: AbaInicio) = _nav.update { it.escolherAba(a) }
+    fun escolherAba(a: AbaInicio) {
+        _nav.update { it.escolherAba(a) }
+        if (a == AbaInicio.Pendente) c.notificador.limparPedidos()
+    }
 
     fun selecionarServidor(id: Long?) = _nav.update { it.selecionarServidor(id) }
 
     fun abrirCanal(servidor: Long, canal: Long) {
         _nav.update { it.irPara(Destino.Canal(servidor, canal)) }
         repo.abrirCanal(canal)
+        c.notificador.limparCanal(canal)
         c.compositor.abrirCanal(canal)
         c.preferencias.ultimoServidor = servidor
         c.preferencias.ultimoCanal = canal
@@ -194,6 +231,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
     fun abrirDm(canal: Long) {
         _nav.update { it.irPara(Destino.Dm(canal)).copy(servidorNoPainel = null) }
         repo.abrirCanal(canal)
+        c.notificador.limparCanal(canal)
         c.compositor.abrirCanal(canal)
     }
 
