@@ -148,31 +148,77 @@ pub enum Img {
 
 /// Cache de imagens dos anexos: baixa e decodifica em segundo plano, cria a textura na thread da interface.
 pub struct Images {
-    map: HashMap<i64, Img>,
+    map: HashMap<i64, Slot>,
+    /// Contador de quadros (incrementa em `pump`, que roda uma vez por quadro desenhado).
+    tick: u64,
     tx: Sender<(i64, Option<egui::ColorImage>)>,
     rx: Receiver<(i64, Option<egui::ColorImage>)>,
     inflight: usize,
 }
 
+/// Uma imagem do cache com o que precisa para ser descartada: tamanho da textura e último quadro em que foi pedida.
+struct Slot {
+    img: Img,
+    bytes: usize,
+    used: u64,
+}
+
+/// Teto das texturas de anexos (RAM do driver + VRAM). Passou disso, saem as menos recentes.
+const IMAGES_BUDGET: usize = 96 << 20;
+/// Uma imagem pedida nos últimos quadros está na tela: nunca é descartada.
+const IMAGES_KEEP_FRAMES: u64 = 120;
+
 impl Images {
     pub fn new() -> Self {
         let (tx, rx) = channel();
-        Self { map: HashMap::new(), tx, rx, inflight: 0 }
+        Self { map: HashMap::new(), tick: 0, tx, rx, inflight: 0 }
+    }
+
+    /// Bytes ocupados pelas texturas prontas.
+    pub fn bytes(&self) -> usize {
+        self.map.values().map(|s| s.bytes).sum()
+    }
+
+    /// Descarta, da menos para a mais recente, as texturas fora da tela até caber no teto. Quem foi pedida nos
+    /// últimos `IMAGES_KEEP_FRAMES` quadros fica (pode estourar o teto enquanto está visível).
+    fn evict(&mut self) {
+        let mut total = self.bytes();
+        if total <= IMAGES_BUDGET {
+            return;
+        }
+        let mut cand: Vec<(u64, i64)> = self
+            .map
+            .iter()
+            .filter(|(_, s)| s.bytes > 0 && self.tick.saturating_sub(s.used) > IMAGES_KEEP_FRAMES)
+            .map(|(k, s)| (s.used, *k))
+            .collect();
+        cand.sort_unstable();
+        for (_, k) in cand {
+            if total <= IMAGES_BUDGET {
+                break;
+            }
+            if let Some(s) = self.map.remove(&k) {
+                total -= s.bytes;
+            }
+        }
     }
 
     /// Recebe o que as threads terminaram e vira textura.
     pub fn pump(&mut self, ctx: &egui::Context) {
+        self.tick += 1;
         while let Ok((id, img)) = self.rx.try_recv() {
             self.inflight = self.inflight.saturating_sub(1);
-            self.map.insert(
-                id,
-                match img {
-                    Some(ci) => Img::Ready(ctx.load_texture(format!("att{id}"), ci, egui::TextureOptions::LINEAR)),
-                    None => Img::Failed,
-                },
-            );
+            let slot = match img {
+                Some(ci) => {
+                    let bytes = ci.size[0] * ci.size[1] * 4;
+                    Slot { img: Img::Ready(ctx.load_texture(format!("att{id}"), ci, egui::TextureOptions::LINEAR)), bytes, used: self.tick }
+                }
+                None => Slot { img: Img::Failed, bytes: 0, used: self.tick },
+            };
+            self.map.insert(id, slot);
             ctx.request_repaint();
         }
+        self.evict();
     }
 
     /// Imagem do chat: baixa a miniatura do servidor (chave `id`).
@@ -206,7 +252,7 @@ impl Images {
 
     fn load_with(&mut self, key: i64, ctx: &egui::Context, f: impl FnOnce() -> Option<egui::ColorImage> + Send + 'static) -> &Img {
         if !self.map.contains_key(&key) && self.inflight < MAX_INFLIGHT {
-            self.map.insert(key, Img::Loading);
+            self.map.insert(key, Slot { img: Img::Loading, bytes: 0, used: self.tick });
             self.inflight += 1;
             let (tx, ctx2) = (self.tx.clone(), ctx.clone());
             std::thread::spawn(move || {
@@ -214,7 +260,13 @@ impl Images {
                 ctx2.request_repaint();
             });
         }
-        self.map.get(&key).unwrap_or(&Img::Loading)
+        match self.map.get_mut(&key) {
+            Some(s) => {
+                s.used = self.tick;
+                &s.img
+            }
+            None => &Img::Loading,
+        }
     }
 }
 
@@ -324,4 +376,67 @@ fn fetch_text(url: &str, total: u64) -> Option<(String, u64)> {
     }
     let left = if truncated { total.saturating_sub(bytes.len() as u64).max(1) } else { 0 };
     Some((text, left))
+}
+
+#[cfg(test)]
+mod tests_cache {
+    use super::*;
+
+    fn tex(ctx: &egui::Context, nome: &str, lado: usize) -> (Img, usize) {
+        let ci = egui::ColorImage::filled([lado, lado], egui::Color32::GRAY);
+        (Img::Ready(ctx.load_texture(nome, ci, egui::TextureOptions::LINEAR)), lado * lado * 4)
+    }
+
+    fn ocupa(m: &mut Images, ctx: &egui::Context, id: i64, lado: usize, used: u64) {
+        let (img, bytes) = tex(ctx, &format!("t{id}"), lado);
+        m.map.insert(id, Slot { img, bytes, used });
+    }
+
+    #[test]
+    fn descarta_as_menos_recentes_fora_da_tela() {
+        let ctx = egui::Context::default();
+        let mut m = Images::new();
+        m.tick = 1000;
+        // 7 imagens de 2048² (16 MiB cada) = 112 MiB > 96 MiB
+        for (id, used) in [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70)] {
+            ocupa(&mut m, &ctx, id, 2048, used);
+        }
+        m.evict();
+        assert!(m.bytes() <= IMAGES_BUDGET, "ficou com {} bytes", m.bytes());
+        assert!(!m.map.contains_key(&1), "a mais antiga sai primeiro");
+        assert!(m.map.contains_key(&7), "a mais recente fica");
+    }
+
+    #[test]
+    fn nao_descarta_o_que_esta_na_tela() {
+        let ctx = egui::Context::default();
+        let mut m = Images::new();
+        m.tick = 1000;
+        for id in 1..=6 {
+            ocupa(&mut m, &ctx, id, 2048, 1000 - 5); // pedidas há 5 quadros
+        }
+        m.evict();
+        assert_eq!(m.map.len(), 6, "visíveis nunca saem, mesmo acima do teto");
+    }
+
+    #[test]
+    fn dentro_do_teto_nao_mexe() {
+        let ctx = egui::Context::default();
+        let mut m = Images::new();
+        m.tick = 1000;
+        ocupa(&mut m, &ctx, 1, 512, 1);
+        ocupa(&mut m, &ctx, 2, 512, 2);
+        m.evict();
+        assert_eq!(m.map.len(), 2);
+    }
+
+    #[test]
+    fn pedir_atualiza_o_uso() {
+        let ctx = egui::Context::default();
+        let mut m = Images::new();
+        m.tick = 50;
+        ocupa(&mut m, &ctx, 7, 64, 1);
+        let _ = m.map.get_mut(&7).map(|s| s.used = m.tick);
+        assert_eq!(m.map[&7].used, 50);
+    }
 }

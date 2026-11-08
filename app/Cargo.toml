@@ -30,5 +30,6 @@ telacast-qs = { path = "../qs" }
 rfd = { version = "0.15", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
+libc = "0.2"
 nvidia-video-codec-sdk = { path = "../vendor/nvidia-video-codec-sdk" }
 cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12080"] }

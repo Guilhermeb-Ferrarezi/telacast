@@ -46,7 +46,7 @@ Para onde vai o PSS: `[anon]` 78 MB, `[heap]` 21 MB, o próprio binário 21 MB (
 |---|---|---|---|
 | 1 | Limitar o Vulkan ao ICD da NVIDIA (`VK_LOADER_DRIVERS_SELECT=nvidia_icd.json` ou `wgpu` só com o adaptador discreto) | 5 linhas + teste | ~17–25 MB (libLLVM, threads vk) |
 | 2 | LRU nas texturas de `Images` (teto de ~64 MB) e em `Texts`; descartar textura ao sair do canal | médio | evita crescimento sem limite (centenas de MB em sessão longa) |
-| 3 | Descarregar o contexto CUDA/NVENC ao parar a transmissão e só carregar ao transmitir | médio (cudarc) | até ~100–200 MiB de VRAM e ~30 MB de RAM depois de transmitir |
+| 3 | Descarregar o contexto CUDA/NVENC ao parar a transmissão e só carregar ao transmitir | médio (cudarc) | **descartado**: um app recém-aberto, sem CUDA, já usa ~200 MiB de VRAM (é o wgpu/Vulkan); o CUDA só entra ao transmitir |
 | 4 | `MALLOC_ARENA_MAX=2` no `main` (via `mallopt`) e `malloc_trim` ao trocar de canal | pequeno | 10–30 MB de `[anon]`, a medir |
 | 5 | Histórico por canal: manter só as últimas N mensagens de canais não abertos | médio | depende do uso |
 | 6 | `strip = true`, `lto = "thin"`, `codegen-units = 1`, `panic = "abort"` no release | trivial, build mais lento | ≤10 MB de arquivo mapeado |
@@ -56,3 +56,28 @@ Como medir (sem tocar na tela do usuário): abrir o app novo, deixar 2 min parad
 `grep -E '^(Rss|Pss|Pss_Anon|Pss_File)' /proc/<pid>/smaps_rollup` e `nvidia-smi --query-compute-apps=pid,used_memory --format=csv`;
 repetir depois de abrir um canal com 20 imagens e depois de transmitir 30 s. Em Xvfb o wgpu cai no lavapipe (CPU), então
 o número **não representa** o da tela real: a medição precisa ser na sessão do usuário, com o OK dele para reabrir o app.
+
+## Resultado (feito em 2026-11-07, `app/src/memoria.rs` e `app/src/files.rs`)
+
+A/B no mesmo binário, na sessão real (`:0`), 75 s depois de abrir, conta do usuário logada. `TELACAST_SEM_AJUSTES=1` desliga os ajustes.
+
+| | RSS | PSS | PSS anônimo | PSS de arquivos | bibliotecas gráficas extras |
+|---|---|---|---|---|---|
+| sem ajustes | 192 MB | 123 MB | 36 MB | 88 MB | libgallium, libLLVM, lavapipe |
+| **com ajustes** | **122 MB** | **89 MB** | 24 MB | 66 MB | nenhuma |
+
+Menos 34 MB de PSS (−27%) e 70 MB de RSS logo na abertura. VRAM não mudou (200 MiB).
+
+O que entrou:
+- **Vulkan só com drivers das GPUs que existem** (`VK_LOADER_DRIVERS_DISABLE` montado a partir de `/sys/class/drm` e dos manifestos
+  instalados; não mexe se a variável já existe ou se nenhum driver serve). Tirou lavapipe, nouveau, radeon, asahi e a libLLVM.
+- **wgpu só com Vulkan/DX12/Metal** (sem GL, que carregava EGL/Mesa só para listar adaptadores). `WGPU_BACKEND` do usuário vence.
+  Consequência: Linux sem Vulkan deixa de abrir; use `WGPU_BACKEND=gl`.
+- **`mallopt(M_ARENA_MAX, 2)`** no começo do `main` (efeito só aparece em sessão longa).
+- **Cache de imagens com teto de 96 MiB**: as texturas menos recentes e fora da tela (não pedidas nos últimos 120 quadros) saem;
+  quem está visível nunca sai. Se a imagem for pedida de novo, baixa a miniatura outra vez. 4 testes.
+
+Achado que muda o plano: o mesmo app, depois de ~25 min de uso, tinha 115 MB de memória anônima contra 36 MB recém-aberto. **O crescimento
+em sessão longa (~80 MB) é o problema maior**, e vem de cache sem limite e de fragmentação, não do driver. O teto de imagens e o
+`M_ARENA_MAX` atacam isso, mas só uma sessão longa mostra o efeito: reabrir o app depois de algumas horas e comparar com os 115 MB.
+Ainda sem limite: histórico de mensagens por canal e `Texts`.

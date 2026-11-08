@@ -4,6 +4,7 @@ mod gateway;
 mod files;
 mod gpu;
 mod md_view;
+mod memoria;
 mod net;
 mod publisher;
 mod quick;
@@ -34,6 +35,7 @@ fn main() -> eframe::Result {
     if !single::acquire() {
         return Ok(());
     }
+    memoria::preparar();
     // sobras de imagens coladas por execuções que já terminaram (o nome leva o PID)
     if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
         for e in rd.flatten() {
@@ -61,6 +63,7 @@ fn main() -> eframe::Result {
                 .with_decorations(false) // a barra de título é nossa (como a do Discord)
                 .with_inner_size([1280.0, 760.0])
                 .with_min_inner_size([900.0, 520.0]),
+            wgpu_options: memoria::wgpu(),
             ..Default::default()
         },
         Box::new(|cc| {
