@@ -88,3 +88,20 @@ Ainda sem limite: histórico de mensagens por canal e `Texts`.
 PSS 80,1 MB sem a funcionalidade, 80,4 MB com ela, 80,8 MB depois da primeira notificação (thread `notif` + executor do zbus, +2 threads).
 Binário Linux +1,04 MB (o zbus já estava no binário pelo `accesskit_unix`). O `Limiter` guarda um `HashMap` por canal e uma fila de no máximo 10
 instantes: limitado. Nota: as primeiras medições do dia deram ~120 MB de PSS nos dois binários (não identifiquei a causa; logo depois voltou a ~80 MB nos dois); o par intercalado acima é o confiável.
+
+## Voz: DSP novo e cancelamento de eco opcional (2026-11-07)
+
+`app/src/voice_dsp.rs` (passa-alta, pré-AGC, AGC2, esticador de tempo) não traz dependência. A única dependência nova é `sonora` 0.3
+(AEC3 do WebRTC em Rust puro, sem C/C++) para o cancelamento de eco, **desligado por padrão**; o estado dele só existe enquanto a
+opção está ligada. A/B no mesmo Xvfb, logado, numa chamada com um remoto simulado, 60 s depois de abrir (PSS):
+
+| | PSS | Pss_Anon | RSS | threads |
+|---|---|---|---|---|
+| binário de antes (2 rodadas) | 103,0 e 103,0 MB | 31,4 e 31,6 MB | 145 MB | 23 |
+| binário novo, eco desligado (2 rodadas) | 102,3 MB (e um valor atípico de 141 MB) | 31,4 MB | 145 MB | 23 |
+| binário novo, eco ligado | 103,8 MB | 31,9 MB | 146 MB | 23 |
+
+Sobre o valor atípico: o app às vezes sobe para ~140 MB de PSS (46 MB anônimos) em vez de ~103 MB; apareceu também no binário de antes
+(140,7 MB na primeira medição), então não é desta mudança (é o mesmo efeito das medições "~120 contra ~80 MB" de cima, que continua sem causa
+identificada). O custo do eco ligado é **~1 MB de PSS e ~0,5% de um núcleo**; o dos buffers por usuário remoto (jitter até 48 pacotes,
+esticador de ~7 KB) é desprezível. Binário: +0,85 MB no Linux (+0,71 MB só do `sonora`) e +0,83 MB no Windows.

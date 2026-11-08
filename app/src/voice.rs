@@ -25,8 +25,10 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SampleRate, SizedSample, Stream, StreamConfig};
 use nnnoiseless::DenoiseState;
-use opus::{Application, Bitrate, Channels, Decoder, Encoder, Signal};
+use opus::{Application, Bandwidth, Bitrate, Channels, Decoder, Encoder, Signal};
 use rtrb::{Consumer, Producer, RingBuffer};
+
+use crate::voice_dsp::{Agc2, Eco, EcoStats, Escala, Esticador, JitterChegada, PassaAlta, PreAgc};
 
 // ───────────────────────────── constantes ─────────────────────────────
 
@@ -36,8 +38,11 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const FRAME: usize = 960;
 /// Tamanho máximo de um pacote Opus (igual a `proto::VOICE_MAX_PACKET`).
 pub const MAX_PACKET: usize = 400;
-/// Bitrate do codificador.
-const BITRATE: i32 = 32_000;
+/// Bitrate do codificador (VBR com restrição, banda total, sinal "voz"). 48 kbps = 120 bytes médios por quadro de 20 ms;
+/// o Opus nunca passa de `MAX_PACKET` (o buffer de saída tem esse tamanho e a libopus trunca o orçamento a ele), e o
+/// teto do VBR restrito fica perto de 1,5× a média: a conta abaixo garante folga de mais de 2× antes do limite.
+const BITRATE: i32 = 48_000;
+const _: () = assert!(BITRATE as usize / 8 / 50 * 3 <= MAX_PACKET, "bitrate alto demais para VOICE_MAX_PACKET");
 /// Janela de "falando": recebeu pacote há menos que isto.
 const SPEAKING_WINDOW: Duration = Duration::from_millis(250);
 /// Usuário sem pacotes por tanto tempo é descartado (decodificador e buffer liberados).
@@ -63,6 +68,12 @@ const MON_MAX: usize = 10;
 const MON_RING_QUADROS: usize = 16;
 /// Amostras a mais/menos lidas por quadro do monitor ao compensar deriva (≈ 0,3%).
 const MON_AJUSTE: usize = 3;
+/// Fila da referência do cancelador de eco (o que o app toca, 48 kHz mono): 1 s.
+const REF_RING: usize = 48_000;
+/// Referência guardada a mais que isto (amostras) = o capturador ficou para trás: descarta o excesso mais antigo.
+const REF_MAX: usize = FRAME * 4;
+/// Atraso fixo (amostras, 10 ms) da referência: dá folga para o mixer (que acorda a cada 2–5 ms) nunca deixar a fila curta.
+const REF_FOLGA: usize = 480;
 /// Fade de entrada/saída nas bordas de falas (5 ms).
 const FADE_AMOSTRAS: usize = 240;
 /// Capacidade das filas entre os callbacks do cpal e as threads (amostras mono; ≥ 0,5 s a 192 kHz).
@@ -359,72 +370,6 @@ impl Vad {
     }
 }
 
-/// Controle automático de ganho: leva a fala ao nível-alvo (-22 dBFS RMS) com ganho entre 0 e +24 dB
-/// (nunca atenua). Só adapta quando há voz (congela no silêncio e no hangover, para não subir o ruído):
-/// ataque de ~50 ms para baixar, liberação de ~1 s para subir. O ganho é interpolado dentro do quadro
-/// (sem degrau) e termina num limitador suave.
-pub struct Agc {
-    ligado: bool,
-    ganho_db: f32,
-}
-
-impl Agc {
-    pub const ALVO_DB: f32 = -22.0;
-    pub const MAX_DB: f32 = 24.0;
-    const JOELHO: f32 = 0.85;
-
-    pub fn new() -> Agc {
-        Agc { ligado: true, ganho_db: 0.0 }
-    }
-
-    pub fn set_enabled(&mut self, on: bool) {
-        self.ligado = on;
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.ligado
-    }
-
-    pub fn gain_db(&self) -> f32 {
-        self.ganho_db
-    }
-
-    pub fn reset(&mut self) {
-        self.ganho_db = 0.0;
-    }
-
-    /// Adapta o ganho e o aplica a `quadro` (20 ms). `nivel_db` é o RMS do quadro antes do AGC; `fala` diz
-    /// se há voz neste quadro.
-    pub fn process(&mut self, quadro: &mut [f32], nivel_db: f32, fala: bool) {
-        // 20 ms por quadro: coeficientes de 1 polo para τ = 50 ms (ataque) e 1 s (liberação)
-        const ATAQUE: f32 = 0.3297; // 1 - exp(-20/50)
-        const LIBERACAO: f32 = 0.0198; // 1 - exp(-20/1000)
-        let g0 = self.ganho_db;
-        let desejado = if !self.ligado {
-            0.0
-        } else if fala && nivel_db.is_finite() {
-            (Self::ALVO_DB - nivel_db).clamp(0.0, Self::MAX_DB)
-        } else {
-            g0 // congelado
-        };
-        let k = if desejado < g0 || !self.ligado { ATAQUE } else { LIBERACAO };
-        let g1 = (g0 + (desejado - g0) * k).clamp(0.0, Self::MAX_DB);
-        self.ganho_db = g1;
-        let (l0, l1) = (10f32.powf(g0 / 20.0), 10f32.powf(g1 / 20.0));
-        let n = quadro.len().max(1) as f32;
-        for (i, x) in quadro.iter_mut().enumerate() {
-            let l = l0 + (l1 - l0) * ((i + 1) as f32 / n);
-            *x = soft_limit_knee(*x * l, Self::JOELHO);
-        }
-    }
-}
-
-impl Default for Agc {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Medidor para a UI: dBFS → 0.0..=1.0 (-60 dB = 0, 0 dB = 1), subida imediata e descida suave.
 pub struct LevelMeter {
     nivel: f32,
@@ -452,25 +397,26 @@ impl Default for LevelMeter {
 
 // ───────────────────────────── jitter buffer ─────────────────────────────
 
-/// Atraso mínimo e máximo do jitter buffer, em quadros de 20 ms (40 e 100 ms).
+/// Atraso mínimo e máximo do jitter buffer, em quadros de 20 ms (40 e 240 ms). O alvo é adaptativo: o mínimo vale
+/// numa rede calma, e rajadas do TCP (o WebSocket segura os pacotes e solta tudo de uma vez) sobem o alvo até o máximo.
 pub const JB_MIN: usize = 2;
-pub const JB_MAX: usize = 5;
+pub const JB_MAX: usize = 12;
 const JB_INICIAL: usize = 3;
 /// Alvo inicial do jitter buffer no modo de baixa latência (o mínimo, 40 ms).
 const JB_INICIAL_BAIXA: usize = 2;
-const JB_MAX_PACOTES: usize = 32;
+const JB_MAX_PACOTES: usize = 48;
 /// Diferença de seq acima disso (para mais ou para menos) = o remetente recomeçou: ressincroniza.
 const JB_RESYNC: i32 = 200;
 /// Tantos descartes por atraso seguidos = o remetente recomeçou: ressincroniza.
 const JB_ATRASADOS_RESYNC: u32 = 8;
 /// Buraco maior que isso é saltado de uma vez em vez de gerar um PLC por quadro perdido.
 const JB_BURACO_MAX: i32 = 4;
-/// Excesso de profundidade (acima do alvo) a partir do qual descarta o mais antigo para recuperar latência.
+/// Excesso de profundidade (acima do alvo) a partir do qual o alvo sobe (rajada) ou, no máximo, descarta o mais antigo.
 const JB_EXCESSO: usize = 4;
 /// Quadros de PLC antes de considerar silêncio quando o buffer esvazia.
-const JB_PLC_QUADROS: u32 = 2;
-/// Quadros sem problema para diminuir o alvo em 1 (5 s).
-const JB_CALMA: u32 = 250;
+const JB_PLC_QUADROS: u32 = 3;
+/// Quadros sem problema para diminuir o alvo em 1 (3 s).
+const JB_CALMA: u32 = 150;
 /// Esvaziar e voltar em menos que isto (quadros) conta como subfluxo (aumenta o alvo), não como pausa de fala.
 const JB_SUBFLUXO_JANELA: u32 = 12;
 /// Quanto pode "voltar" o primeiro pacote ainda não tocado (reordenação na chegada).
@@ -500,8 +446,9 @@ pub enum PushOutcome {
 ///
 /// - Ordena por `seq` com aritmética modular de `u32` (funciona na virada do contador).
 /// - Descarta duplicados e pacotes que chegaram depois do seu quadro já ter passado.
-/// - Começa a tocar quando há `alvo` quadros guardados; o alvo (2 a 5 quadros) sobe quando há subfluxo ou
-///   pacote atrasado e desce depois de 5 s sem problemas.
+/// - Começa a tocar quando há `alvo` quadros guardados; o alvo (2 a 12 quadros = 40 a 240 ms) sobe de 2 em 2 quando há
+///   subfluxo ou pacote atrasado, sobe sozinho para absorver uma rajada (em vez de cortar áudio) e desce 1 depois de 3 s
+///   sem problemas.
 /// - Perda no meio da fala vira `Lost` (PLC); buffer esvaziado vira alguns quadros de PLC e depois `Silence`
 ///   (o `seq` continua contíguo depois de uma pausa de VAD, então a fala retomada encaixa sozinha).
 pub struct JitterBuffer {
@@ -517,6 +464,12 @@ pub struct JitterBuffer {
     atrasados_seguidos: u32,
     calma: u32,
     descartes: u32,
+    /// Para as estatísticas: esvaziamentos no meio da fala (subfluxos), PLCs por buraco na sequência.
+    cortes: u32,
+    buracos: u32,
+    ultimo_buraco: bool,
+    /// Quadros de PLC por buffer vazio desde o início (só os testes leem).
+    plc_vazio: u32,
 }
 
 impl Default for JitterBuffer {
@@ -545,7 +498,33 @@ impl JitterBuffer {
             atrasados_seguidos: 0,
             calma: 0,
             descartes: 0,
+            cortes: 0,
+            buracos: 0,
+            ultimo_buraco: false,
+            plc_vazio: 0,
         }
+    }
+
+    /// Quadros de PLC por buffer vazio (só para os testes).
+    #[cfg(test)]
+    fn plc_vazio(&self) -> u32 {
+        self.plc_vazio
+    }
+
+    /// Esvaziamentos (cortes audíveis) desde a última chamada.
+    pub fn take_cuts(&mut self) -> u32 {
+        std::mem::take(&mut self.cortes)
+    }
+
+    /// Quadros perdidos por buraco na sequência (rede) desde a última chamada.
+    #[allow(dead_code)] // diagnóstico (usado nos testes)
+    pub fn take_holes(&mut self) -> u32 {
+        std::mem::take(&mut self.buracos)
+    }
+
+    /// O último `Playout::Lost` foi um buraco na sequência (perda de rede), não um esvaziamento.
+    pub fn last_was_hole(&self) -> bool {
+        self.ultimo_buraco
     }
 
     /// Pacotes descartados desde a última chamada (atrasados, duplicados, excesso de latência).
@@ -584,7 +563,7 @@ impl JitterBuffer {
     }
 
     fn sobe_alvo(&mut self) {
-        self.alvo = (self.alvo + 1).min(JB_MAX);
+        self.alvo = (self.alvo + 2).min(JB_MAX);
         self.calma = 0;
     }
 
@@ -657,6 +636,7 @@ impl JitterBuffer {
                 self.espera = 0;
                 if self.ocioso <= JB_SUBFLUXO_JANELA {
                     self.sobe_alvo(); // voltou logo depois de esvaziar: foi subfluxo, não pausa de fala
+                    self.cortes += 1;
                 }
                 self.ocioso = 0;
             } else {
@@ -665,10 +645,16 @@ impl JitterBuffer {
             }
         }
 
-        // recupera latência acumulada (rajada, relógio do remetente mais rápido)
+        // Rajada (o WebSocket/TCP segurou os pacotes e soltou tudo de uma vez): em vez de cortar áudio, sobe o alvo até
+        // o máximo e só descarta o que passar disso. O excesso que sobra é gasto aos poucos pelo comprimidor de tempo.
+        if self.pacotes.len() > self.alvo + JB_EXCESSO && self.alvo < JB_MAX {
+            self.alvo = JB_MAX.min(self.pacotes.len() - JB_EXCESSO);
+            self.calma = 0;
+        }
         while self.pacotes.len() > self.alvo + JB_EXCESSO {
             self.pula_um();
         }
+        self.ultimo_buraco = false;
 
         let p = self.proximo;
         if let Some(i) = self.pacotes.iter().position(|(s, _)| *s == p) {
@@ -678,6 +664,7 @@ impl JitterBuffer {
             if self.vazios > 0 {
                 self.vazios = 0;
                 self.sobe_alvo(); // o pacote chegou logo depois de esvaziar: subfluxo
+                self.cortes += 1;
             }
             self.calma += 1;
             if self.calma >= JB_CALMA && self.alvo > JB_MIN {
@@ -696,12 +683,15 @@ impl JitterBuffer {
                 self.ocioso = 1;
                 return Playout::Silence;
             }
+            self.plc_vazio += 1;
             return Playout::Lost;
         }
 
         // há pacotes mais novos mas o do ponto de reprodução não veio: perdido
         self.vazios = 0;
         self.calma = 0;
+        self.ultimo_buraco = true;
+        self.buracos += 1;
         let menor = self
             .pacotes
             .iter()
@@ -809,12 +799,58 @@ impl Default for Declick {
     }
 }
 
-/// Um usuário remoto: jitter buffer + decodificador Opus + suavização das bordas.
+/// Estatísticas de um usuário remoto, para o painel de voz (ver [`Engine::voice_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RxUserStats {
+    pub user: i64,
+    /// Perda de rede em % (média móvel de ~5 s de fala: quadros com buraco na sequência / quadros tocados).
+    pub loss_pct: f32,
+    /// Jitter de chegada (RFC 3550), em ms.
+    pub jitter_ms: f32,
+    /// Alvo do jitter buffer e áudio guardado agora (buffer + decodificado à frente), em ms.
+    pub target_ms: f32,
+    pub buffered_ms: f32,
+    /// Esvaziamentos no meio da fala nos últimos 60 s, convertidos em cortes por minuto.
+    pub cuts_per_min: f32,
+    /// Atraso estimado até o alto-falante (sem a rede): buffer atual + fila de saída + 2 blocos do dispositivo, em ms.
+    pub latency_ms: f32,
+    /// O receptor está comprimindo (+1) ou esticando (-1) o tempo agora, 0 = reprodução normal.
+    pub warp: i8,
+    /// Recebeu pacote nos últimos ~250 ms.
+    pub speaking: bool,
+}
+
+/// Quadros de fala para a média móvel da perda (~5 s).
+const PERDA_JANELA: f32 = 250.0;
+/// Janela dos "cortes por minuto".
+const CORTES_JANELA: Duration = Duration::from_secs(60);
+/// Desvio (em quadros de 20 ms) do buffer em relação ao alvo que liga/desliga o comprimidor e o esticador.
+const WARP_LIGA_COMPRIME: f32 = 2.0;
+const WARP_DESLIGA_COMPRIME: f32 = 1.0;
+const WARP_LIGA_ESTICA: f32 = 2.0;
+const WARP_DESLIGA_ESTICA: f32 = 1.0;
+
+/// Um usuário remoto: jitter buffer + decodificador Opus + esticador de tempo + suavização das bordas.
+///
+/// O buffer de jitter entrega pacotes; o decodificador vira PCM de 20 ms e o PCM passa por um [`Esticador`], que mantém
+/// o atraso perto do alvo do jitter buffer sem cortar nem repetir quadro: acima do alvo (rajada do TCP, relógio do
+/// remetente mais rápido) a fala toca até 20% mais rápido; abaixo (rede atrasando) até 20% mais devagar, em vez de
+/// esvaziar e fazer PLC. Sem desvio o PCM passa direto, idêntico (a regra só liga com ≥ 2 quadros de diferença, com
+/// histerese, e fala em silêncio não é processada).
 pub struct UserStream {
     jb: JitterBuffer,
     dec: Decoder,
     declick: Declick,
     last_rx: Instant,
+    esc: Esticador,
+    warp: Escala,
+    tmp: Vec<f32>,
+    t0: Instant,
+    jit: JitterChegada,
+    perda: f32,
+    cortes: VecDeque<Instant>,
+    /// Comprimir/esticar o tempo ligado (padrão). Desligado só nos testes de comparação.
+    warp_ligado: bool,
 }
 
 impl UserStream {
@@ -824,11 +860,25 @@ impl UserStream {
 
     pub fn new_com_jitter(alvo_inicial: usize) -> Result<UserStream, String> {
         let dec = Decoder::new(SAMPLE_RATE, Channels::Mono).map_err(|e| format!("decodificador Opus: {e}"))?;
-        Ok(UserStream { jb: JitterBuffer::com_alvo(alvo_inicial), dec, declick: Declick::new(), last_rx: Instant::now() })
+        Ok(UserStream {
+            jb: JitterBuffer::com_alvo(alvo_inicial),
+            dec,
+            declick: Declick::new(),
+            last_rx: Instant::now(),
+            esc: Esticador::new(),
+            warp: Escala::Normal,
+            tmp: vec![0.0; FRAME],
+            t0: Instant::now(),
+            jit: JitterChegada::new(),
+            perda: 0.0,
+            cortes: VecDeque::new(),
+            warp_ligado: true,
+        })
     }
 
     pub fn push(&mut self, seq: u32, dados: Vec<u8>) -> PushOutcome {
         self.last_rx = Instant::now();
+        self.jit.update(self.t0.elapsed().as_secs_f64() * 1000.0, seq);
         self.jb.push(seq, dados)
     }
 
@@ -841,30 +891,143 @@ impl UserStream {
         self.jb.take_discarded()
     }
 
-    /// Gera os próximos 20 ms em `out` (`FRAME` amostras). `false` = silêncio (`out` zerado).
-    pub fn render(&mut self, out: &mut [f32]) -> bool {
-        debug_assert!(out.len() >= FRAME);
-        let out = &mut out[..FRAME];
-        let dados = match self.jb.pop() {
-            Playout::Silence => return self.declick.silencio(out),
-            Playout::Frame(d) => d,
-            Playout::Lost => Vec::new(),
+    /// Quadros de 20 ms guardados (jitter buffer + PCM decodificado à frente).
+    fn guardado(&self) -> f32 {
+        self.jb.depth() as f32 + self.esc.disponivel() as f32 / FRAME as f32
+    }
+
+    /// Escolhe comprimir/esticar com histerese a partir do desvio do buffer em relação ao alvo. Devolve a fração de
+    /// velocidade (0,05 a 0,20, proporcional ao desvio).
+    fn decide(&mut self) -> f32 {
+        if !self.jb.is_playing() || !self.warp_ligado {
+            self.warp = Escala::Normal;
+            return 0.0;
+        }
+        let dev = self.guardado() - self.jb.target() as f32;
+        self.warp = match self.warp {
+            Escala::Comprime if dev >= WARP_DESLIGA_COMPRIME => Escala::Comprime,
+            Escala::Estica if -dev >= WARP_DESLIGA_ESTICA => Escala::Estica,
+            _ if dev >= WARP_LIGA_COMPRIME => Escala::Comprime,
+            _ if -dev >= WARP_LIGA_ESTICA => Escala::Estica,
+            _ => Escala::Normal,
         };
-        match self.dec.decode_float(&dados, out, false) {
+        (dev.abs() * 0.05).clamp(0.05, Esticador::TAXA_MAX)
+    }
+
+    /// Pede o próximo quadro ao jitter buffer e decodifica para `self.tmp`. `None` = silêncio (nada a tocar).
+    fn proximo_pcm(&mut self) -> Option<bool> {
+        let (dados, perdido) = match self.jb.pop() {
+            Playout::Silence => return None,
+            Playout::Frame(d) => (d, false),
+            Playout::Lost => (Vec::new(), true),
+        };
+        if perdido {
+            let buraco = self.jb.last_was_hole();
+            self.perda += (buraco as u8 as f32 - self.perda) / PERDA_JANELA;
+        } else {
+            self.perda -= self.perda / PERDA_JANELA;
+        }
+        match self.dec.decode_float(&dados, &mut self.tmp, false) {
             Ok(n) => {
                 if n < FRAME {
-                    out[n..].fill(0.0);
+                    self.tmp[n..].fill(0.0);
                 }
-                for x in out.iter_mut() {
+                for x in self.tmp.iter_mut() {
                     if !x.is_finite() {
                         *x = 0.0;
                     }
                 }
-                self.declick.audio(out);
-                true
+                Some(true)
             }
-            Err(_) => self.declick.silencio(out),
+            Err(_) => Some(false),
         }
+    }
+
+    /// Gera os próximos 20 ms em `out` (`FRAME` amostras). `false` = silêncio (`out` zerado).
+    pub fn render(&mut self, out: &mut [f32]) -> bool {
+        debug_assert!(out.len() >= FRAME);
+        let out = &mut out[..FRAME];
+        let taxa = self.decide();
+        let mut fim = false;
+        for _ in 0..4 {
+            if self.esc.disponivel() >= Esticador::precisa(self.warp) {
+                break;
+            }
+            match self.proximo_pcm() {
+                None => {
+                    fim = true;
+                    break;
+                }
+                Some(true) => {
+                    let pcm = std::mem::take(&mut self.tmp);
+                    self.esc.push(&pcm);
+                    self.tmp = pcm;
+                }
+                Some(false) => {}
+            }
+        }
+        let cortes = self.jb.take_cuts();
+        for _ in 0..cortes {
+            self.cortes.push_back(Instant::now());
+        }
+        if self.esc.pull(out, self.warp, taxa).is_some() {
+            self.declick.audio(out);
+            return true;
+        }
+        // menos de um quadro guardado e o jitter buffer não tem mais nada (fim da fala): esvazia o resto, com fade
+        let resto = self.esc.disponivel();
+        if fim && resto > 0 {
+            out.fill(0.0);
+            self.esc.drain_all(out);
+            let u = out[resto - 1];
+            let n = FADE_AMOSTRAS.min(FRAME - resto);
+            for (i, x) in out[resto..resto + n].iter_mut().enumerate() {
+                *x = u * (0.5 + 0.5 * (std::f32::consts::PI * (i + 1) as f32 / n as f32).cos());
+            }
+            self.declick.audio(out);
+            return true;
+        }
+        if fim {
+            self.esc.clear();
+            self.warp = Escala::Normal;
+        }
+        self.declick.silencio(out)
+    }
+
+    /// Estatísticas atuais; `cb_saida_ms` e `fila_saida_ms` vêm do mixer.
+    pub fn stats(&mut self, user: i64, fila_saida_ms: f32, cb_saida_ms: f32) -> RxUserStats {
+        let agora = Instant::now();
+        while self.cortes.front().is_some_and(|t| agora.duration_since(*t) > CORTES_JANELA) {
+            self.cortes.pop_front();
+        }
+        let buffered_ms = if self.jb.is_playing() || self.esc.disponivel() > 0 { self.guardado() * 20.0 } else { 0.0 };
+        let observado = self.t0.elapsed().min(CORTES_JANELA).as_secs_f32().max(10.0);
+        RxUserStats {
+            user,
+            loss_pct: self.perda * 100.0,
+            jitter_ms: self.jit.ms(),
+            target_ms: self.jb.target() as f32 * 20.0,
+            buffered_ms,
+            cuts_per_min: self.cortes.len() as f32 * 60.0 / observado,
+            latency_ms: buffered_ms + fila_saida_ms + 2.0 * cb_saida_ms,
+            warp: match self.warp {
+                Escala::Comprime => 1,
+                Escala::Estica => -1,
+                Escala::Normal => 0,
+            },
+            speaking: self.last_rx.elapsed() < SPEAKING_WINDOW,
+        }
+    }
+
+    #[cfg(test)]
+    fn sem_warp(&mut self) {
+        self.warp_ligado = false;
+    }
+
+    /// Amostras removidas / repetidas pelo esticador desde o início.
+    #[allow(dead_code)] // diagnóstico (usado nos testes)
+    pub fn warped(&self) -> (u64, u64) {
+        (self.esc.removidas, self.esc.repetidas)
     }
 }
 
@@ -875,8 +1038,20 @@ impl UserStream {
 pub struct SendPipeline {
     enc: Encoder,
     pub vad: Vad,
-    /// Controle automático de ganho (depois do RNNoise; o VAD decide sobre o nível *antes* dele).
-    pub agc: Agc,
+    /// Passa-alta de 80 Hz, a primeira coisa na captura (sempre ligada).
+    hpf: PassaAlta,
+    /// Ganho de entrada automático antes do RNNoise (a opção "AGC" liga/desliga este e o AGC2).
+    pub pre_agc: PreAgc,
+    /// AGC2 (igual ao do Discord) depois do RNNoise; o VAD decide sobre o nível *antes* dele.
+    pub agc2: Agc2,
+    /// Nível (dBFS) do último quadro depois do RNNoise e antes do AGC2.
+    nivel_db: f32,
+    /// Opção "AGC" do usuário. O pré-AGC só roda junto com o RNNoise (é para ele que serve).
+    agc_on: bool,
+    /// Cancelador de eco (AEC3), só enquanto a opção está ligada (cria e solta a memória dele).
+    eco: Option<Eco>,
+    /// O que o app tocou no intervalo do quadro atual (mesma base de tempo do microfone), para o cancelador de eco.
+    pub reference: Vec<f32>,
     meter: LevelMeter,
     /// Ganho linear de entrada (1.0 = sem mudança).
     pub gain: f32,
@@ -912,6 +1087,8 @@ impl SendPipeline {
         let _ = enc.set_vbr(true);
         let _ = enc.set_vbr_constraint(true);
         let _ = enc.set_signal(Signal::Voice);
+        let _ = enc.set_max_bandwidth(Bandwidth::Fullband);
+        let _ = enc.set_bandwidth(Bandwidth::Fullband);
         let _ = enc.set_inband_fec(false);
         let _ = enc.set_dtx(false);
         let _ = enc.set_complexity(8);
@@ -923,7 +1100,13 @@ impl SendPipeline {
         Ok(SendPipeline {
             enc,
             vad: Vad::new(Vad::SENSIBILIDADE_PADRAO),
-            agc: Agc::new(),
+            hpf: PassaAlta::new(),
+            pre_agc: PreAgc::new(),
+            agc2: Agc2::new(),
+            nivel_db: -120.0,
+            agc_on: true,
+            eco: None,
+            reference: vec![0.0; FRAME],
             meter: LevelMeter::new(),
             gain: 1.0,
             force_open: false,
@@ -954,6 +1137,7 @@ impl SendPipeline {
             self.den = DenoiseState::new();
         }
         self.den_on = ligado;
+        self.pre_agc.ligado = self.agc_on && ligado;
         if !self.processou {
             self.den_ativo = ligado; // nada tocado ainda: não há o que suavizar
         }
@@ -996,8 +1180,42 @@ impl SendPipeline {
         self.speaking
     }
 
+    /// Liga/desliga o AGC: pré-AGC antes do RNNoise (só vale com a supressão de ruído ligada: sem RNNoise, ganho antes
+    /// do VAD de energia só amplificaria o ruído) e AGC2 depois.
+    pub fn set_agc(&mut self, on: bool) {
+        self.agc_on = on;
+        self.pre_agc.ligado = on && self.den_on;
+        self.agc2.ligado = on;
+    }
+
+    /// Liga/desliga o cancelador de eco (AEC3). Ao ligar cria o estado; ao desligar solta a memória.
+    pub fn set_echo_cancel(&mut self, on: bool) {
+        if on && self.eco.is_none() {
+            self.eco = Some(Eco::new());
+        } else if !on {
+            self.eco = None;
+        }
+    }
+
+    pub fn echo_cancel(&self) -> bool {
+        self.eco.is_some()
+    }
+
+    /// ERLE e atraso do eco estimados pelo cancelador (`None` com ele desligado).
+    pub fn echo_stats(&self) -> Option<EcoStats> {
+        self.eco.as_ref().map(|e| e.stats())
+    }
+
+    /// Nível (dBFS) depois do RNNoise e antes do AGC2, do último quadro.
+    pub fn level_db(&self) -> f32 {
+        self.nivel_db
+    }
+
     /// Esquece o estado (ao ficar mudo): fecha o VAD, zera o medidor e a pré-rolagem.
     pub fn reset(&mut self) {
+        self.hpf.reset();
+        self.pre_agc.reset();
+        self.agc2.reset();
         self.vad.reset();
         self.meter.reset();
         self.preroll.clear();
@@ -1036,9 +1254,17 @@ impl SendPipeline {
             return;
         }
         let g = if self.gain.is_finite() { self.gain.clamp(0.0, 8.0) } else { 1.0 };
-        for (d, s) in self.buf.iter_mut().zip(quadro) {
-            *d = (s * g).clamp(-1.0, 1.0);
+        // passa-alta de 80 Hz antes de tudo, depois o ganho manual e o pré-AGC (voz baixa/longe chega ao RNNoise num
+        // nível normal; senão ele a corta como se fosse ruído)
+        self.buf.copy_from_slice(quadro);
+        self.hpf.process(&mut self.buf);
+        if let Some(eco) = self.eco.as_mut() {
+            eco.process(&mut self.buf, &self.reference);
         }
+        for d in self.buf.iter_mut() {
+            *d = (*d * g).clamp(-1.0, 1.0);
+        }
+        self.pre_agc.process(&mut self.buf);
         // Supressão de ruído (depois do ganho, antes do VAD e do Opus). Ao alternar, crossfade linear
         // de um quadro entre o sinal cru e o limpo.
         let mut prob = None;
@@ -1067,12 +1293,16 @@ impl SendPipeline {
         }
         self.den_ativo = self.den_on;
         self.processou = true;
-        // O VAD decide sobre o nível pós-RNNoise e *antes* do AGC: assim os limiares não dependem do ganho
-        // que o AGC acumulou. O AGC só adapta com evidência de voz neste quadro.
+        // O VAD decide sobre o nível pós-RNNoise e *antes* do AGC2: assim os limiares não dependem do ganho que o
+        // AGC2 acumulou. O AGC2 usa a probabilidade de voz do RNNoise (sem RNNoise, 1 quando o VAD vê voz).
         let db = rms_db(&self.buf);
+        self.nivel_db = db;
         let estava = self.vad.is_open();
         let aberto = self.vad.process_db_prob(db, prob) || self.force_open;
-        self.agc.process(&mut self.buf, db, self.vad.evidence());
+        // só vale como "fala" o que o VAD também enxerga (energia mínima e probabilidade): o RNNoise às vezes dá
+        // probabilidade alta para chiado de sala quase digital, e o AGC2 aprenderia esse nível como se fosse voz
+        let p_fala = if self.vad.evidence() { prob.unwrap_or(1.0) } else { 0.0 };
+        self.agc2.process(&mut self.buf, p_fala);
         self.level = self.meter.update(rms_db(&self.buf));
         self.speaking = aberto;
 
@@ -1135,6 +1365,16 @@ struct Shared {
     vad_sens: AtomicU32,
     agc: AtomicBool,
     agc_db: AtomicU32,
+    /// Para o painel de estatísticas: ganho do pré-AGC (dB), nível pós-RNNoise (dBFS) e probabilidade de voz.
+    pre_db: AtomicU32,
+    nivel_db: AtomicU32,
+    prob: AtomicU32,
+    /// Estatísticas por usuário remoto, publicadas pelo mixer a cada ~250 ms.
+    rx_stats: Mutex<Vec<RxUserStats>>,
+    /// Cancelamento de eco ligado (padrão desligado) e o que o cancelador mede (NaN = sem valor).
+    eco: AtomicBool,
+    eco_erle: AtomicU32,
+    eco_atraso: AtomicU32,
     nivel: AtomicU32,
     falando: AtomicBool,
     pendentes: AtomicUsize,
@@ -1176,6 +1416,13 @@ impl Shared {
             vad_sens: AtomicU32::new(Vad::SENSIBILIDADE_PADRAO.to_bits()),
             agc: AtomicBool::new(true),
             agc_db: AtomicU32::new(0),
+            pre_db: AtomicU32::new(0),
+            nivel_db: AtomicU32::new((-120.0f32).to_bits()),
+            prob: AtomicU32::new(0),
+            rx_stats: Mutex::new(Vec::new()),
+            eco: AtomicBool::new(false),
+            eco_erle: AtomicU32::new(f32::NAN.to_bits()),
+            eco_atraso: AtomicU32::new(f32::NAN.to_bits()),
             nivel: AtomicU32::new(0),
             falando: AtomicBool::new(false),
             pendentes: AtomicUsize::new(0),
@@ -1222,6 +1469,44 @@ enum Cmd {
 
 // ───────────────────────────── threads de processamento ─────────────────────────────
 
+/// Descarta até `n` amostras da fila da referência (as mais antigas).
+fn descarta_ref(cons: &mut Consumer<f32>, n: usize) {
+    let k = cons.slots().min(n);
+    if k > 0 {
+        if let Ok(c) = cons.read_chunk(k) {
+            c.commit_all();
+        }
+    }
+}
+
+/// Lê `FRAME` amostras da referência (o que o app tocou) para casar com o quadro de microfone atual. Se faltar, completa com
+/// zeros e anota a dívida: quando as amostras que faltavam chegarem, são descartadas, então a linha do tempo continua
+/// casada com a captura (só esses poucos ms da referência viram silêncio). Se sobrar demais, descarta as mais antigas.
+fn le_referencia(cons: &mut Consumer<f32>, dst: &mut [f32], divida: &mut usize) {
+    if *divida > 0 {
+        let d = cons.slots().min(*divida);
+        descarta_ref(cons, d);
+        *divida -= d;
+    }
+    let n = cons.slots();
+    if n > REF_MAX && *divida == 0 {
+        descarta_ref(cons, n - FRAME * 2);
+    }
+    let k = cons.slots().min(dst.len());
+    if k > 0 {
+        if let Ok(c) = cons.read_chunk(k) {
+            let (a, b) = c.as_slices();
+            dst[..a.len()].copy_from_slice(a);
+            dst[a.len()..a.len() + b.len()].copy_from_slice(b);
+            c.commit_all();
+        }
+    }
+    if k < dst.len() {
+        dst[k..].fill(0.0);
+        *divida += dst.len() - k;
+    }
+}
+
 /// Thread do codificador: lê a fila de captura, reamostra para 48 kHz e alimenta o [`SendPipeline`].
 fn loop_captura(
     sh: Arc<Shared>,
@@ -1229,6 +1514,7 @@ fn loop_captura(
     taxa: u32,
     mut send: Box<dyn FnMut(u32, &[u8]) + Send>,
     mut mon_prod: Producer<f32>,
+    mut ref_cons: Consumer<f32>,
 ) {
     sh.taxa_entrada.store(taxa, Relaxed);
     let espera = Duration::from_millis(if sh.baixa_lat.load(Relaxed) { 1 } else { 4 });
@@ -1244,6 +1530,9 @@ fn loop_captura(
     let mut a48: Vec<f32> = Vec::with_capacity(8192);
     let mut mudo_antes = false;
     let mut ruido_antes = true;
+    let mut eco_antes = false;
+    let mut divida_ref = 0usize; // amostras de referência que faltaram (zeros usados): descarta o mesmo tanto quando chegar
+    let mut quadros = 0u32;
     while !sh.parar.load(Relaxed) {
         let n = cons.slots();
         if n == 0 {
@@ -1266,6 +1555,7 @@ fn loop_captura(
                 sh.nivel.store(0, Relaxed);
                 sh.falando.store(false, Relaxed);
             }
+            descarta_ref(&mut ref_cons, usize::MAX);
             continue;
         }
         mudo_antes = false;
@@ -1275,11 +1565,20 @@ fn loop_captura(
         let limite = f32_from_bits(&sh.vad_db);
         pipe.vad.set_open_db(if limite.is_finite() { Some(limite) } else { None });
         pipe.vad.set_sensitivity(f32_from_bits(&sh.vad_sens));
-        pipe.agc.set_enabled(sh.agc.load(Relaxed));
+        pipe.set_agc(sh.agc.load(Relaxed));
         let ruido = sh.ruido.load(Relaxed);
         if ruido != ruido_antes {
             ruido_antes = ruido;
             pipe.set_noise_suppression(ruido);
+        }
+        let eco = sh.eco.load(Relaxed);
+        if eco != eco_antes {
+            eco_antes = eco;
+            pipe.set_echo_cancel(eco);
+            descarta_ref(&mut ref_cons, usize::MAX);
+            divida_ref = 0;
+            sh.eco_erle.store(f32::NAN.to_bits(), Relaxed);
+            sh.eco_atraso.store(f32::NAN.to_bits(), Relaxed);
         }
         // Monitor: o PCM já processado (ganho + RNNoise + AGC), só com o portão do VAD aberto, vai direto para
         // a fila do mixer, sem Opus e sem passar pelo `send`. Mudo/surdo desligam.
@@ -1298,11 +1597,24 @@ fn loop_captura(
         };
         let mut usados = 0;
         while a48.len() - usados >= FRAME {
+            if eco_antes {
+                le_referencia(&mut ref_cons, &mut pipe.reference, &mut divida_ref);
+                quadros = quadros.wrapping_add(1);
+            }
             pipe.process_mon(&a48[usados..usados + FRAME], &mut enviar, &mut monitorar);
             usados += FRAME;
         }
         a48.drain(..usados);
-        sh.agc_db.store(pipe.agc.gain_db().to_bits(), Relaxed);
+        if eco_antes && quadros % 25 == 0 {
+            if let Some(st) = pipe.echo_stats() {
+                sh.eco_erle.store(st.erle_db.unwrap_or(f32::NAN).to_bits(), Relaxed);
+                sh.eco_atraso.store(st.delay_ms.map_or(f32::NAN, |v| v as f32).to_bits(), Relaxed);
+            }
+        }
+        sh.agc_db.store(pipe.agc2.gain_db().to_bits(), Relaxed);
+        sh.pre_db.store(pipe.pre_agc.gain_db().to_bits(), Relaxed);
+        sh.nivel_db.store(pipe.level_db().to_bits(), Relaxed);
+        sh.prob.store(pipe.voice_prob().to_bits(), Relaxed);
         sh.nivel.store(pipe.level().to_bits(), Relaxed);
         sh.falando.store(pipe.speaking(), Relaxed);
     }
@@ -1500,6 +1812,7 @@ fn loop_reproducao(
     mut prod: Producer<f32>,
     taxa: u32,
     mon_cons: Consumer<f32>,
+    mut ref_prod: Producer<f32>,
 ) {
     let baixa = sh.baixa_lat.load(Relaxed);
     // Bloco de mixagem: 20 ms no modo normal, 5 ms no de baixa latência (as vozes continuam sendo
@@ -1526,6 +1839,10 @@ fn loop_reproducao(
     let mut tmp_mon = vec![0f32; bloco];
     let mut extra_ms = 0usize;
     let mut subfluxos_vistos = 0u32;
+    let mut ultima_estat = Instant::now();
+    let mut eco_antes = false;
+    let mut ref_inicio = Instant::now();
+    let mut ref_escrito: u64 = 0;
 
     while !sh.parar.load(Relaxed) {
         // mensagens da rede/UI
@@ -1578,6 +1895,9 @@ fn loop_reproducao(
         if surdo {
             if !usuarios.is_empty() {
                 usuarios.clear();
+                if let Ok(mut g) = sh.rx_stats.lock() {
+                    g.clear();
+                }
             }
             usu_buf.clear();
             thread::sleep(Duration::from_millis(10));
@@ -1620,7 +1940,41 @@ fn loop_reproducao(
         let lead48 = alvo * SAMPLE_RATE as usize / taxa as usize;
         let mp = mon_params(baixa, cb_in_48k, bloco, lead48);
         sh.est_alvo_ms.store((alvo as f32 * 1000.0 / taxa as f32).to_bits(), Relaxed);
+        if ultima_estat.elapsed() >= Duration::from_millis(250) {
+            ultima_estat = Instant::now();
+            let fila_ms = alvo as f32 * 1000.0 / taxa as f32;
+            let cb_ms = sh.cb_saida.load(Relaxed) as f32 * 1000.0 / taxa as f32;
+            let mut v: Vec<RxUserStats> = usuarios.iter_mut().map(|(id, u)| u.stats(*id, fila_ms, cb_ms)).collect();
+            v.sort_by_key(|r| r.user);
+            if let Ok(mut g) = sh.rx_stats.lock() {
+                *g = v;
+            }
+        }
         sh.est_mon_ms.store(((mp.media + mon.extra) as f32 * 1000.0 / SAMPLE_RATE as f32).to_bits(), Relaxed);
+
+        // Referência do cancelador de eco: a linha do tempo do que o app toca, contínua e na taxa do relógio (blocos de
+        // áudio quando há voz, zeros por tempo quando não há), 10 ms atrasada para nunca ficar curta.
+        let eco = sh.eco.load(Relaxed);
+        if eco != eco_antes {
+            eco_antes = eco;
+            ref_inicio = Instant::now();
+            ref_escrito = 0;
+        }
+        if eco {
+            let devido = (ref_inicio.elapsed().as_secs_f64() * SAMPLE_RATE as f64) as u64 + REF_FOLGA as u64;
+            let mut falta = devido.saturating_sub(ref_escrito) as usize;
+            let zeros = [0f32; 480];
+            while falta > 0 && ref_prod.slots() > 0 {
+                let k = falta.min(zeros.len());
+                let (_, resto) = ref_prod.push_partial_slice(&zeros[..k]);
+                let escrito = k - resto.len();
+                ref_escrito += escrito as u64;
+                falta -= k;
+                if escrito < k {
+                    break;
+                }
+            }
+        }
 
         // enche a fila de reprodução
         let mut voltas = 0;
@@ -1655,6 +2009,10 @@ fn loop_reproducao(
                 mixer.add(&tmp_mon, 1.0);
             }
             let quadro = mixer.finish();
+            if eco {
+                let (_, resto) = ref_prod.push_partial_slice(quadro);
+                ref_escrito += (quadro.len() - resto.len()) as u64;
+            }
             if taxa == SAMPLE_RATE {
                 let _ = prod.push_partial_slice(quadro);
             } else {
@@ -2084,6 +2442,60 @@ pub struct Stats {
     pub output_callback_frames: u32,
 }
 
+/// Estatísticas do que o microfone está enviando.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TxStats {
+    /// Nível depois do RNNoise e antes do AGC2, em dBFS.
+    pub level_db: f32,
+    /// Ganho aplicado agora pelo pré-AGC (antes do RNNoise) e pelo AGC2, em dB.
+    pub pre_gain_db: f32,
+    pub agc2_gain_db: f32,
+    /// Probabilidade de voz do RNNoise (0 com a supressão desligada).
+    pub voice_prob: f32,
+    /// VAD aberto: está mandando pacotes.
+    pub speaking: bool,
+    /// Cancelador de eco ligado: ERLE e atraso do caminho do eco (`None` com ele desligado).
+    pub echo: Option<EcoStats>,
+}
+
+/// Totais da recepção (todos os usuários remotos).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RxTotals {
+    pub users: usize,
+    /// Médias de perda e jitter; soma dos cortes por minuto; maiores buffer e latência.
+    pub loss_pct: f32,
+    pub jitter_ms: f32,
+    pub cuts_per_min: f32,
+    pub buffered_ms: f32,
+    pub latency_ms: f32,
+}
+
+impl RxTotals {
+    pub fn from_users(rx: &[RxUserStats]) -> RxTotals {
+        let n = rx.len();
+        if n == 0 {
+            return RxTotals::default();
+        }
+        let m = n as f32;
+        RxTotals {
+            users: n,
+            loss_pct: rx.iter().map(|r| r.loss_pct).sum::<f32>() / m,
+            jitter_ms: rx.iter().map(|r| r.jitter_ms).sum::<f32>() / m,
+            cuts_per_min: rx.iter().map(|r| r.cuts_per_min).sum(),
+            buffered_ms: rx.iter().map(|r| r.buffered_ms).fold(0.0, f32::max),
+            latency_ms: rx.iter().map(|r| r.latency_ms).fold(0.0, f32::max),
+        }
+    }
+}
+
+/// Tudo que o painel de estatísticas de voz mostra, de uma vez só.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VoiceStats {
+    pub tx: TxStats,
+    pub rx: Vec<RxUserStats>,
+    pub total: RxTotals,
+}
+
 /// O motor de voz. Criar com [`Engine::start`]; soltar (`Drop`) encerra threads e fecha os dispositivos.
 pub struct Engine {
     sh: Arc<Shared>,
@@ -2153,6 +2565,7 @@ impl Engine {
     ) -> Result<Engine, String> {
         let (tx, rx) = mpsc::channel();
         let (mon_prod, mon_cons) = RingBuffer::<f32>::new(FRAME * MON_RING_QUADROS);
+        let (ref_prod, ref_cons) = RingBuffer::<f32>::new(REF_RING);
         let mut threads = Vec::new();
         let mut falha = |e: std::io::Error| format!("Não foi possível iniciar a thread de áudio: {e}");
 
@@ -2161,7 +2574,7 @@ impl Engine {
             threads.push(
                 thread::Builder::new()
                     .name("telacast-audio-codificador".into())
-                    .spawn(move || loop_captura(s, cons, taxa, send, mon_prod))
+                    .spawn(move || loop_captura(s, cons, taxa, send, mon_prod, ref_cons))
                     .map_err(&mut falha)?,
             );
         }
@@ -2170,7 +2583,7 @@ impl Engine {
         threads.push(
             thread::Builder::new()
                 .name("telacast-audio-mixer".into())
-                .spawn(move || loop_reproducao(s, rx, prod, taxa, mon_cons))
+                .spawn(move || loop_reproducao(s, rx, prod, taxa, mon_cons, ref_prod))
                 .map_err(&mut falha)?,
         );
         Ok(Engine { sh, tx, cmd: None, threads })
@@ -2209,6 +2622,16 @@ impl Engine {
         self.sh.ruido.load(Relaxed)
     }
 
+    /// Cancelamento de eco (AEC3 do WebRTC) no microfone, usando o que o app toca como referência. Padrão: desligado
+    /// (experimental). Ao ligar custa ~5,7 MB e ~0,8% de um núcleo; sem fone, tira o que sai da caixa de som do microfone.
+    pub fn set_echo_cancel(&self, on: bool) {
+        self.sh.eco.store(on, Relaxed);
+    }
+
+    pub fn echo_cancel(&self) -> bool {
+        self.sh.eco.load(Relaxed)
+    }
+
     /// "Ouvir meu microfone": toca localmente exatamente o que está sendo enviado (já com ganho e supressão,
     /// só com o VAD aberto). Padrão: desligado. Mudo não toca; surdo não toca nada.
     pub fn set_monitor(&self, on: bool) {
@@ -2244,7 +2667,8 @@ impl Engine {
         f32_from_bits(&self.sh.vad_sens)
     }
 
-    /// Controle automático de ganho do microfone (alvo -22 dBFS, até +24 dB, nunca atenua). Padrão: ligado.
+    /// AGC do microfone: pré-AGC antes do RNNoise (traz a voz baixa para perto de -30 dBFS, até +30 dB) e AGC2 igual ao
+    /// do Discord depois (pico da fala em -5 dBFS, até +50 dB, 6 dB/s, nunca amplifica ruído). Padrão: ligado.
     pub fn set_agc(&self, on: bool) {
         self.sh.agc.store(on, Relaxed);
     }
@@ -2253,7 +2677,29 @@ impl Engine {
         self.sh.agc.load(Relaxed)
     }
 
-    /// Ganho que o AGC está aplicando agora, em dB (0..=24), para depuração.
+    /// Estatísticas de envio e de recepção (por usuário e total), para o painel de voz. Barato: copia um vetor pequeno.
+    pub fn voice_stats(&self) -> VoiceStats {
+        let sh = &self.sh;
+        let rx = sh.rx_stats.lock().map(|g| g.clone()).unwrap_or_default();
+        let falando = self.self_speaking();
+        VoiceStats {
+            tx: TxStats {
+                level_db: f32_from_bits(&sh.nivel_db),
+                pre_gain_db: f32_from_bits(&sh.pre_db),
+                agc2_gain_db: f32_from_bits(&sh.agc_db),
+                voice_prob: f32_from_bits(&sh.prob),
+                speaking: falando,
+                echo: sh.eco.load(Relaxed).then(|| {
+                    let (e, a) = (f32_from_bits(&sh.eco_erle), f32_from_bits(&sh.eco_atraso));
+                    EcoStats { erle_db: e.is_finite().then_some(e), delay_ms: a.is_finite().then_some(a as i32) }
+                }),
+            },
+            total: RxTotals::from_users(&rx),
+            rx,
+        }
+    }
+
+    /// Ganho que o AGC2 está aplicando agora, em dB (0..=50), para depuração.
     pub fn agc_gain_db(&self) -> f32 {
         f32_from_bits(&self.sh.agc_db)
     }
@@ -2329,7 +2775,9 @@ impl Engine {
         let cb_out = ms(sh.cb_saida.load(Relaxed), sh.taxa_saida.load(Relaxed));
         let alvo = f32_from_bits(&sh.est_alvo_ms);
         let fila_mon = f32_from_bits(&sh.est_mon_ms);
-        let jitter = if sh.baixa_lat.load(Relaxed) { JB_INICIAL_BAIXA } else { JB_INICIAL } as f32 * 20.0;
+        // atraso do jitter buffer: o real (maior entre os usuários ouvidos agora) ou, sem ninguém, o alvo inicial
+        let real = sh.rx_stats.lock().map(|g| g.iter().map(|r| r.buffered_ms).fold(0.0, f32::max)).unwrap_or(0.0);
+        let jitter = if real > 0.0 { real } else { (if sh.baixa_lat.load(Relaxed) { JB_INICIAL_BAIXA } else { JB_INICIAL }) as f32 * 20.0 };
         let monitor = cb_in + 20.0 + fila_mon + alvo + 2.0 * cb_out;
         let remota = alvo + 2.0 * cb_out + jitter;
         (monitor, remota)
@@ -2424,7 +2872,7 @@ mod tests {
         assert!(pacotes.len() >= 28, "VAD deveria abrir com um tom de -9 dBFS: {}", pacotes.len());
         assert!(pacotes.iter().all(|(_, d)| d.len() <= MAX_PACKET));
         let media = pacotes.iter().map(|(_, d)| d.len()).sum::<usize>() as f32 / pacotes.len() as f32;
-        assert!(media < 160.0, "32 kbps ≈ 80 bytes por quadro, veio {media}");
+        assert!(media < 190.0, "48 kbps ≈ 120 bytes por quadro, veio {media}");
         let mut saida = Vec::new();
         let mut q = vec![0f32; FRAME];
         for i in 0..pacotes.len() + 4 {
@@ -2700,7 +3148,7 @@ mod tests {
         jb.push(seq, pkt(0)); // chegou no tick seguinte
         let p = jb.pop();
         assert!(matches!(p, Playout::Frame(_)));
-        assert_eq!(jb.target(), 4, "subfluxo aumenta o atraso");
+        assert_eq!(jb.target(), 5, "subfluxo aumenta o atraso em 2 quadros (40 ms)");
         // muita calma (fala contínua e estável) diminui devagar
         seq += 1;
         for _ in 0..(JB_CALMA as usize * 3) {
@@ -2708,7 +3156,7 @@ mod tests {
             seq += 1;
             jb.pop();
         }
-        assert!(jb.target() < 4 && jb.target() >= JB_MIN);
+        assert!(jb.target() < 5 && jb.target() >= JB_MIN);
     }
 
     #[test]
@@ -2719,7 +3167,7 @@ mod tests {
         }
         assert_eq!(jb.target(), JB_MAX);
         assert_eq!(JB_MIN * 20, 40);
-        assert_eq!(JB_MAX * 20, 100);
+        assert_eq!(JB_MAX * 20, 240);
     }
 
     #[test]
@@ -3161,7 +3609,10 @@ mod tests {
         p.set_noise_suppression(false);
         assert!(!p.noise_suppression());
         let o = processa(&mut p, &x);
-        assert_eq!(o, x);
+        // sem RNNoise, com ganho unitário e AGC sem o que amplificar, só a passa-alta de 80 Hz mexe no sinal
+        let mut esperado = x.clone();
+        PassaAlta::new().process(&mut esperado);
+        assert_eq!(o, esperado);
     }
 
     #[test]
@@ -3318,7 +3769,9 @@ mod tests {
         // com ganho unitário (AGC sem o que amplificar) e sem RNNoise o PCM processado é o próprio tom
         let primeiro = |x: &[f32]| x.iter().position(|v| v.abs() > 1e-4).expect("há som");
         let k = primeiro(&saida) - primeiro(&tom);
-        let maior = (0..FRAME * 25).map(|i| (saida[k + i] - tom[i]).abs()).fold(0f32, f32::max);
+        let mut esperado = tom.clone();
+        PassaAlta::new().process(&mut esperado); // a passa-alta de 80 Hz é a única coisa que mexe no tom
+        let maior = (0..FRAME * 25).map(|i| (saida[k + i] - esperado[i]).abs()).fold(0f32, f32::max);
         assert!(maior < 1e-6, "o monitor tocou algo diferente do PCM processado (dif máx {maior})");
         let atraso_ms = (k as f32 - 14400.0) / 48.0;
         eprintln!("atraso do monitor (modo normal, microfone → fila de saída): {atraso_ms:.0} ms");
@@ -3337,7 +3790,9 @@ mod tests {
             let primeiro = |x: &[f32]| x.iter().position(|v| v.abs() > 1e-4).expect("há som");
             let k = primeiro(&saida) - primeiro(&tom);
             if !baixa {
-                let maior = (0..FRAME * 25).map(|i| (saida[k + i] - tom[i]).abs()).fold(0f32, f32::max);
+                let mut esperado = tom.clone();
+                PassaAlta::new().process(&mut esperado);
+                let maior = (0..FRAME * 25).map(|i| (saida[k + i] - esperado[i]).abs()).fold(0f32, f32::max);
                 assert!(maior < 1e-6, "conteúdo diferente (dif {maior})");
             } else {
                 // 5 ms de granularidade num teste com threads e build de depuração: pode haver uma falta de
@@ -3558,88 +4013,489 @@ mod tests {
         }
     }
 
+    /// Fala com pausas, como numa conversa: blocos de 2 s com 1,4 s de fala (RMS `nivel_db`) e 0,6 s de ruído de sala
+    /// (RMS `ruido_db`). O AGC2 estima o piso de ruído nas pausas, então um sinal sem pausa nunca sobe de ganho.
+    fn fala_com_pausas(nivel_db: f32, ruido_db: f32, blocos: usize) -> Vec<f32> {
+        let mut x = Vec::new();
+        for b in 0..blocos {
+            let mut f = fala_sintetica(FRAME * 70);
+            escala_db(&mut f, nivel_db);
+            x.extend(f);
+            let mut r = ruido_branco(0.1, FRAME * 30, 11 + b as u32);
+            escala_db(&mut r, ruido_db);
+            x.extend(r);
+        }
+        x
+    }
+
     #[test]
-    fn agc_sobe_fala_fraca_para_perto_do_alvo() {
-        let mut x = fala_sintetica(FRAME * 300);
-        escala_db(&mut x, -40.0);
+    fn agc_sobe_fala_fraca_com_agc2() {
+        let x = fala_com_pausas(-45.0, -80.0, 15); // 30 s
         let mut p = pipeline_energia();
         let o = processa(&mut p, &x);
-        let fim = rms_db(&o[FRAME * 200..]);
-        assert!((-27.0..=-19.0).contains(&fim), "saída em {fim} dBFS (alvo -22)");
-        assert!(p.agc.gain_db() > 12.0 && p.agc.gain_db() <= Agc::MAX_DB, "ganho {}", p.agc.gain_db());
+        let miolo = |v: &[f32]| rms_db(&v[FRAME * 1500 - FRAME * 600..FRAME * 1500 - FRAME * 100]);
+        assert_eq!(p.pre_agc.gain_db(), 0.0, "sem RNNoise o pré-AGC fica desligado");
+        assert!(p.agc2.gain_db() > 8.0 && p.agc2.gain_db() <= Agc2::MAX_GANHO as f32, "AGC2 {}", p.agc2.gain_db());
+        assert!(miolo(&o) > miolo(&x) + 6.0, "saída {} dBFS contra entrada {}", miolo(&o), miolo(&x));
         assert!(o.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+    }
+
+    #[test]
+    fn pre_agc_sobe_antes_do_rnnoise_e_a_voz_baixa_nao_e_cortada() {
+        let x = fala_com_pausas(-52.0, -80.0, 8);
+        let mut com = SendPipeline::new().unwrap();
+        let o = processa(&mut com, &x);
+        let g = com.pre_agc.gain_db();
+        assert!(g > 5.0 && g <= PreAgc::MAX_DB, "pré-AGC {g}");
+        let mut sem = SendPipeline::new().unwrap();
+        sem.set_agc(false);
+        let o2 = processa(&mut sem, &x);
+        assert_eq!(sem.pre_agc.gain_db(), 0.0);
+        // com o pré-AGC o RNNoise recebe a voz num nível normal: sai mais voz que sem ele
+        let fala = |v: &[f32]| rms_db(&v[FRAME * 70..FRAME * 70 + FRAME * 60]);
+        assert!(fala(&o) > fala(&o2) + 3.0, "com {} dBFS, sem {} dBFS", fala(&o), fala(&o2));
     }
 
     #[test]
     fn agc_nao_amplifica_sinal_alto_nem_atenua() {
         let mut x = fala_sintetica(FRAME * 150);
         escala_db(&mut x, -15.0);
-        let mut p = pipeline_energia();
-        let o = processa(&mut p, &x);
-        assert!(p.agc.gain_db() < 0.01, "ganho {}", p.agc.gain_db());
-        assert!((rms_db(&o[FRAME * 50..]) - rms_db(&x[FRAME * 50..])).abs() < 1.0);
+        for ns in [false, true] {
+            let mut p = SendPipeline::new().unwrap();
+            p.set_noise_suppression(ns);
+            let o = processa(&mut p, &x);
+            assert!(p.pre_agc.gain_db() < 0.01 && p.agc2.gain_db() < 0.01, "ns={ns}: ganhos {} {}", p.pre_agc.gain_db(), p.agc2.gain_db());
+            if !ns {
+                // só a passa-alta de 80 Hz mexe: menos de 1,5 dB
+                assert!((rms_db(&o[FRAME * 50..]) - rms_db(&x[FRAME * 50..])).abs() < 1.5);
+            }
+        }
     }
 
     #[test]
     fn agc_congela_no_silencio_e_no_ruido() {
-        // ruído de -65 dBFS por 10 s: sem voz o ganho nunca sobe
+        // ruído de -65 dBFS por 10 s: sem voz os ganhos nunca sobem
         let mut r = ruido_rosa(0.1, FRAME * 500, 5);
         escala_db(&mut r, -65.0);
-        let mut p = pipeline_energia();
+        let mut p = SendPipeline::new().unwrap();
         processa(&mut p, &r);
-        assert_eq!(p.agc.gain_db(), 0.0, "ruído não pode subir o ganho");
-        // fala e depois 5 s de silêncio: o ganho fica onde estava
-        let mut x = fala_sintetica(FRAME * 250);
-        escala_db(&mut x, -40.0);
+        assert!(p.pre_agc.gain_db() < 0.5, "ruído subiu o pré-AGC: {}", p.pre_agc.gain_db());
+        assert_eq!(p.agc2.gain_db(), 0.0, "ruído não pode subir o AGC2");
+        // fala e depois 5 s de silêncio: o AGC2 fica onde estava
+        let x = fala_com_pausas(-45.0, -80.0, 15);
         let mut p = pipeline_energia();
         processa(&mut p, &x);
-        let g = p.agc.gain_db();
-        assert!(g > 10.0);
+        let g = p.agc2.gain_db();
+        assert!(g > 4.0, "AGC2 {g}");
         processa(&mut p, &vec![0.0; FRAME * 250]);
-        assert!((p.agc.gain_db() - g).abs() < 0.01, "ganho mexeu no silêncio: {g} → {}", p.agc.gain_db());
+        assert!((p.agc2.gain_db() - g).abs() < 0.3, "ganho mexeu no silêncio: {g} → {}", p.agc2.gain_db());
     }
 
     #[test]
     fn agc_sem_pumping() {
-        // tom estável a -40 dBFS: depois de convergir o ganho praticamente não mexe
-        let x = seno(300.0, 48000.0, 0.0141, FRAME * 400, 0);
-        let mut p = pipeline_energia();
-        let mut ganhos = Vec::new();
-        for q in x.chunks_exact(FRAME) {
-            p.process(q, &mut |_, _| {});
-            ganhos.push(p.agc.gain_db());
-        }
-        assert!((ganhos[399] - 18.0).abs() < 0.6, "convergiu para {}", ganhos[399]);
-        let cauda = &ganhos[300..];
-        let (mn, mx) = cauda.iter().fold((99f32, -99f32), |(a, b), g| (a.min(*g), b.max(*g)));
-        assert!(mx - mn < 0.1, "oscila {mn}..{mx} em regime");
-        // fala com sílabas: sobe no máximo ~0,5 dB por quadro (24 dB/s) e a faixa em regime é pequena
-        let mut f = fala_sintetica(FRAME * 400);
-        escala_db(&mut f, -40.0);
+        // fala com pausas: o AGC2 sobe no máximo 6 dB/s (0,12 dB por quadro de 20 ms; 0,72 dB uma vez no fim da espera)
+        // e em regime o ganho praticamente não mexe
+        let f = fala_com_pausas(-45.0, -80.0, 25);
         let mut p = pipeline_energia();
         let mut g = Vec::new();
         for q in f.chunks_exact(FRAME) {
             p.process(q, &mut |_, _| {});
-            g.push(p.agc.gain_db());
+            g.push(p.agc2.gain_db());
         }
         let maior_subida = g.windows(2).map(|w| w[1] - w[0]).fold(0f32, f32::max);
-        assert!(maior_subida <= 0.5, "subida de {maior_subida} dB num quadro");
-        let cauda = &g[200..];
+        assert!(maior_subida <= 0.12 + 0.72 + 0.01, "subida de {maior_subida} dB num quadro");
+        let cauda = &g[g.len() - 500..];
         let (mn, mx) = cauda.iter().fold((99f32, -99f32), |(a, b), v| (a.min(*v), b.max(*v)));
-        assert!(mx - mn < 6.0, "faixa do ganho em regime {mn}..{mx}");
+        assert!(mx - mn < 3.0, "faixa do ganho em regime {mn}..{mx}");
     }
 
     #[test]
     fn agc_desligado_volta_a_zero_sem_degrau() {
-        let mut x = seno(300.0, 48000.0, 0.0141, FRAME * 200, 0);
-        let mut p = pipeline_energia();
+        let x = fala_com_pausas(-52.0, -80.0, 15);
+        let mut p = SendPipeline::new().unwrap();
         processa(&mut p, &x);
-        assert!(p.agc.gain_db() > 10.0);
-        p.agc.set_enabled(false);
-        x = seno(300.0, 48000.0, 0.0141, FRAME * 30, 0);
-        let o = processa(&mut p, &x);
-        assert!(p.agc.gain_db() < 0.5);
+        let (pre, g2) = (p.pre_agc.gain_db(), p.agc2.gain_db());
+        assert!(pre > 5.0 && g2 > 3.0, "{pre} {g2}");
+        p.set_agc(false);
+        let x2 = fala_com_pausas(-52.0, -80.0, 1);
+        let o = processa(&mut p, &x2);
+        assert_eq!(p.pre_agc.gain_db(), 0.0);
+        assert!(p.agc2.gain_db() < g2 - 3.0, "AGC2 desce a 6 dB/s: {g2} → {}", p.agc2.gain_db());
         assert!(passo_max(&o) < 0.1, "degrau ao desligar o AGC: {}", passo_max(&o));
+    }
+
+    // ── jitter adaptativo (40–240 ms) e esticar/comprimir ──
+
+    #[test]
+    fn jitter_rajada_de_dez_pacotes_sobe_o_alvo_e_nao_corta_audio() {
+        let mut jb = JitterBuffer::com_alvo(5);
+        for i in 0..10u32 {
+            jb.push(i, pkt(i as u8));
+        }
+        let r: Vec<_> = (0..10).map(|_| frame_num(jb.pop())).collect();
+        assert_eq!(r, (0..10).map(Some).collect::<Vec<_>>());
+        assert!(jb.target() > 5, "o alvo subiu para absorver a rajada: {}", jb.target());
+        assert_eq!(jb.take_discarded(), 0);
+    }
+
+    #[test]
+    fn jitter_rajada_grande_sobe_ao_maximo_e_so_entao_descarta() {
+        let mut jb = JitterBuffer::com_alvo(2);
+        for i in 0..20u32 {
+            jb.push(i, pkt(i as u8));
+        }
+        let primeiro = frame_num(jb.pop());
+        assert!(primeiro.is_some());
+        assert_eq!(jb.target(), JB_MAX);
+        assert!(jb.depth() <= jb.target() + JB_EXCESSO, "profundidade {}", jb.depth());
+        assert!(jb.take_discarded() > 0);
+    }
+
+    #[test]
+    fn jitter_conta_cortes_e_buracos() {
+        let mut jb = JitterBuffer::com_alvo(2);
+        jb.push(0, pkt(0));
+        jb.push(1, pkt(1));
+        jb.push(3, pkt(3)); // buraco no 2
+        jb.push(4, pkt(4));
+        tocar(&mut jb, 5);
+        assert_eq!(jb.take_holes(), 1);
+        assert_eq!(jb.take_cuts(), 0);
+        // esvazia e o pacote chega no tick seguinte: corte
+        let _ = jb.pop(); // PLC por esvaziamento (não é buraco)
+        assert!(!jb.last_was_hole());
+        jb.push(5, pkt(5));
+        assert!(matches!(jb.pop(), Playout::Frame(_)));
+        assert_eq!(jb.take_cuts(), 1);
+        assert_eq!(jb.take_holes(), 0);
+    }
+
+    fn codifica(x: &[f32]) -> Vec<(u32, Vec<u8>)> {
+        let mut enc = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip).unwrap();
+        enc.set_bitrate(Bitrate::Bits(BITRATE)).unwrap();
+        enc.set_signal(Signal::Voice).unwrap();
+        let mut buf = [0u8; MAX_PACKET];
+        x.chunks_exact(FRAME)
+            .enumerate()
+            .map(|(i, q)| {
+                let n = enc.encode_float(q, &mut buf).unwrap();
+                (i as u32, buf[..n].to_vec())
+            })
+            .collect()
+    }
+
+    /// Resultado de tocar um fluxo de pacotes por um `UserStream`.
+    struct Tocado {
+        pcm: Vec<f32>,
+        quadros_com_audio: usize,
+        u: UserStream,
+    }
+
+    /// `chegadas[t]` = índices dos pacotes que chegam antes do tick `t`; roda `ticks` ticks de 20 ms.
+    fn toca(pacotes: &[(u32, Vec<u8>)], chegadas: &[Vec<usize>], ticks: usize, alvo: usize, warp: bool) -> Tocado {
+        let mut u = UserStream::new_com_jitter(alvo).unwrap();
+        if !warp {
+            u.sem_warp();
+        }
+        let mut pcm = Vec::new();
+        let mut q = vec![0f32; FRAME];
+        let mut com_audio = 0;
+        for t in 0..ticks {
+            for &i in chegadas.get(t).map(|v| v.as_slice()).unwrap_or(&[]) {
+                u.push(pacotes[i].0, pacotes[i].1.clone());
+            }
+            if u.render(&mut q) {
+                com_audio += 1;
+            }
+            pcm.extend_from_slice(&q);
+        }
+        Tocado { pcm, quadros_com_audio: com_audio, u }
+    }
+
+    /// Um pacote por tick, com a rajada pedida: `rajada` pacotes de uma vez no tick 0, depois um por tick.
+    fn chegadas_com_rajada(n: usize, rajada: usize) -> Vec<Vec<usize>> {
+        let mut c: Vec<Vec<usize>> = vec![Vec::new(); n + 40];
+        for i in 0..rajada.min(n) {
+            c[0].push(i);
+        }
+        for i in rajada..n {
+            c[i - rajada + 1].push(i);
+        }
+        c
+    }
+
+    /// Maior degrau entre amostras vizinhas, ignorando as bordas (fade-in do começo e fade-out do fim).
+    fn degrau_do_miolo(pcm: &[f32]) -> f32 {
+        let ini = pcm.iter().position(|v| v.abs() > 1e-6).unwrap_or(0) + FRAME * 2;
+        let fim = pcm.iter().rposition(|v| v.abs() > 1e-6).unwrap_or(0).saturating_sub(FRAME * 2);
+        passo_max(&pcm[ini..fim.max(ini + 2)])
+    }
+
+    fn tom_de_fala(n_quadros: usize) -> Vec<f32> {
+        // tom de 220 Hz com 3 harmônicos e variação lenta de amplitude (como uma vogal sustentada)
+        (0..n_quadros * FRAME)
+            .map(|i| {
+                let t = i as f32 / 48000.0;
+                let env = 0.8 + 0.2 * (2.0 * PI * 3.0 * t).sin();
+                env * 0.25 * ((2.0 * PI * 220.0 * t).sin() + 0.5 * (2.0 * PI * 440.0 * t).sin() + 0.25 * (2.0 * PI * 660.0 * t).sin()) / 1.5
+            })
+            .collect()
+    }
+
+    #[test]
+    fn usuario_sem_desvio_nao_mexe_no_tempo_e_e_transparente() {
+        let x = tom_de_fala(60);
+        let pacotes = codifica(&x);
+        let ch = chegadas_com_rajada(60, 1);
+        let r = toca(&pacotes, &ch, 55, 3, true); // enquanto o fluxo corre (no fim o buffer seca e o esticador pode entrar)
+        assert_eq!(r.u.warped(), (0, 0), "rede calma: o tempo não pode ser mexido");
+        assert!(r.quadros_com_audio >= 50);
+        let natural = passo_max(&x);
+        assert!(degrau_do_miolo(&r.pcm) < natural * 2.0 + 0.01, "degrau {} contra {natural}", degrau_do_miolo(&r.pcm));
+    }
+
+    #[test]
+    fn usuario_rajada_de_dez_pacotes_e_absorvida_sem_descontinuidade() {
+        let x = tom_de_fala(80);
+        let pacotes = codifica(&x);
+        let ch = chegadas_com_rajada(80, 10);
+        let natural = passo_max(&x);
+        let r = toca(&pacotes, &ch, 130, 3, true);
+        let (rem, rep) = r.u.warped();
+        let tocado = r.quadros_com_audio * FRAME;
+        eprintln!(
+            "rajada de 10: tocou {tocado} amostras de {} enviadas; comprimiu {rem}, esticou {rep}; degrau {:.4} (natural {natural:.4}); alvo final {} quadros",
+            x.len(),
+            degrau_do_miolo(&r.pcm),
+            r.u.jitter().target()
+        );
+        assert!(rem > 0, "o excesso da rajada deveria ser gasto comprimindo o tempo");
+        assert!(degrau_do_miolo(&r.pcm) < 0.05, "descontinuidade: degrau {}", degrau_do_miolo(&r.pcm));
+        assert!(degrau_do_miolo(&r.pcm) < natural * 3.0 + 0.02);
+        // nada some: o que entrou saiu, descontando só o que o comprimidor removeu (um período de pitch por vez)
+        assert_eq!(r.u.jitter().depth(), 0);
+        let soma = tocado as u64 + rem - rep;
+        // a sobra é a cauda: JB_PLC_QUADROS de PLC depois do último pacote, o fade-out e o quadro de resto
+        let cauda = ((JB_PLC_QUADROS as usize + 3) * FRAME) as i64;
+        assert!((soma as i64 - x.len() as i64).abs() <= cauda, "tocado {tocado} + removido {rem} - repetido {rep} contra {} enviado", x.len());
+        assert!((tocado as f32) >= x.len() as f32 * 0.85, "a duração tocada ficou longe da enviada: {tocado} de {}", x.len());
+        // sem o comprimidor, a mesma rajada toca igual, só que com 40–60 ms a mais de atraso até o fim
+        let sem = toca(&pacotes, &ch, 130, 3, false);
+        assert_eq!(sem.u.warped(), (0, 0));
+        assert!(degrau_do_miolo(&sem.pcm) < 0.05);
+    }
+
+    #[test]
+    fn usuario_falta_de_tres_pacotes_nao_gera_descontinuidade() {
+        let x = tom_de_fala(80);
+        let pacotes = codifica(&x);
+        let mut ch = chegadas_com_rajada(80, 1);
+        for t in ch.iter_mut() {
+            t.retain(|i| !(30..33).contains(i)); // perde 3 seguidos
+        }
+        let natural = passo_max(&x);
+        let r = toca(&pacotes, &ch, 120, 3, true);
+        let tocado = r.quadros_com_audio * FRAME;
+        eprintln!("falta de 3: tocou {tocado} de {} enviadas; warped {:?}; degrau {:.4} (natural {natural:.4})", x.len(), r.u.warped(), degrau_do_miolo(&r.pcm));
+        assert!(degrau_do_miolo(&r.pcm) < 0.05, "descontinuidade: degrau {}", degrau_do_miolo(&r.pcm));
+        assert!(rms(&r.pcm[FRAME * 29..FRAME * 40]) > 0.05, "o buraco virou silêncio");
+        // os 3 quadros perdidos viram 3 de PLC (mesma duração); a sobra é a cauda (3 de PLC + fade-out + resto)
+        let (rem, rep) = r.u.warped();
+        let liquido = tocado as i64 + rem as i64 - rep as i64 - x.len() as i64;
+        assert!((0..=((JB_PLC_QUADROS as usize + 3) * FRAME) as i64).contains(&liquido), "duração tocada {tocado} contra {} enviada (líquido {liquido})", x.len());
+        let mut u = r.u;
+        let st = u.stats(1, 0.0, 0.0);
+        assert!(st.loss_pct > 0.5, "a perda deveria aparecer nas estatísticas: {}", st.loss_pct);
+    }
+
+    #[test]
+    fn usuario_rede_atrasando_estica_o_tempo_em_vez_de_esvaziar() {
+        // alvo de 6 quadros; os pacotes passam a chegar a 90% da cadência (relógio do remetente mais lento / rede
+        // segurando): sem esticar o buffer esvazia e faz PLC; esticando, a fala desacelera e não corta
+        let n = 120;
+        let x = tom_de_fala(n);
+        let pacotes = codifica(&x);
+        let mut ch: Vec<Vec<usize>> = vec![Vec::new(); 160];
+        let mut t_chegada = 0.0f32;
+        for i in 0..n {
+            t_chegada += if i < 8 { 0.0 } else { 1.0 / 0.9 };
+            ch[(t_chegada as usize).min(159)].push(i);
+        }
+        let com = toca(&pacotes, &ch, 160, 6, true);
+        let sem = toca(&pacotes, &ch, 160, 6, false);
+        let (_, rep) = com.u.warped();
+        eprintln!(
+            "chegada a 90%: com esticar repetiu {rep} amostras, degrau {:.4}; quadros de PLC por buffer vazio: com={} sem={}",
+            degrau_do_miolo(&com.pcm),
+            com.u.jitter().plc_vazio(),
+            sem.u.jitter().plc_vazio()
+        );
+        assert!(rep > 0, "deveria esticar");
+        assert!(degrau_do_miolo(&com.pcm) < 0.05, "degrau {}", degrau_do_miolo(&com.pcm));
+        assert!(com.u.jitter().plc_vazio() < sem.u.jitter().plc_vazio(), "esticar deveria evitar esvaziamentos");
+    }
+
+    #[test]
+    fn usuario_estatisticas_basicas() {
+        let x = tom_de_fala(60);
+        let pacotes = codifica(&x);
+        let ch = chegadas_com_rajada(60, 10);
+        let mut r = toca(&pacotes, &ch, 40, 3, true);
+        let st = r.u.stats(7, 40.0, 10.0);
+        assert_eq!(st.user, 7);
+        assert!(st.target_ms >= 40.0 && st.target_ms <= 240.0);
+        assert!(st.buffered_ms >= 0.0 && st.latency_ms >= st.buffered_ms + 40.0 + 20.0 - 0.1, "{st:?}");
+        assert_eq!(st.loss_pct, 0.0);
+        let tot = RxTotals::from_users(&[st, RxUserStats { user: 8, loss_pct: 4.0, jitter_ms: 6.0, cuts_per_min: 3.0, latency_ms: 500.0, ..Default::default() }]);
+        assert_eq!(tot.users, 2);
+        assert!((tot.loss_pct - 2.0).abs() < 1e-4 && tot.cuts_per_min >= 3.0 && tot.latency_ms == 500.0);
+        assert_eq!(RxTotals::from_users(&[]), RxTotals::default());
+    }
+
+    #[test]
+    fn opus_48_kbps_banda_total_cabe_no_limite_do_servidor() {
+        let mut p = SendPipeline::new().unwrap();
+        p.set_noise_suppression(false);
+        // pior caso: fala sintética com ruído forte e transientes (pacotes grandes no VBR)
+        let mut x = fala_sintetica(FRAME * 200);
+        let r = ruido_branco(0.5, FRAME * 200, 3);
+        for (a, b) in x.iter_mut().zip(&r) {
+            *a = (*a * 2.0 + b).clamp(-1.0, 1.0);
+        }
+        let mut tamanhos = Vec::new();
+        for q in x.chunks_exact(FRAME) {
+            p.process(q, &mut |_, d| tamanhos.push(d.len()));
+        }
+        assert!(tamanhos.len() > 150);
+        let (max, media) = (*tamanhos.iter().max().unwrap(), tamanhos.iter().sum::<usize>() as f32 / tamanhos.len() as f32);
+        eprintln!("Opus 48 kbps: {} pacotes, média {media:.0} bytes, máximo {max} bytes (limite {MAX_PACKET})", tamanhos.len());
+        assert!(max <= MAX_PACKET);
+        assert!(media < 190.0, "média {media}");
+        let mut enc = Encoder::new(SAMPLE_RATE, Channels::Mono, Application::Voip).unwrap();
+        enc.set_bitrate(Bitrate::Bits(BITRATE)).unwrap();
+        assert_eq!(enc.get_bitrate().unwrap(), Bitrate::Bits(48_000));
+    }
+
+    // ── cancelamento de eco ──
+
+    /// Eco sintético: `far` atrasado `atraso_ms` e passado por uma resposta curta (cauda de 5 ms) com ganho `ganho_db`.
+    fn eco_de(far: &[f32], atraso_ms: usize, ganho_db: f32) -> Vec<f32> {
+        let d = atraso_ms * 48;
+        let h: Vec<f32> = {
+            let r = ruido_branco(1.0, 240, 77);
+            let n = (r.iter().map(|v| v * v).sum::<f32>()).sqrt();
+            r.iter().enumerate().map(|(k, v)| v / n * (-(k as f32) / 60.0).exp() * 10f32.powf(ganho_db / 20.0) * 1.6).collect()
+        };
+        (0..far.len())
+            .map(|i| h.iter().enumerate().filter(|(k, _)| i >= d + k).map(|(k, hk)| hk * far[i - d - k]).sum())
+            .collect()
+    }
+
+    #[test]
+    fn eco_pipeline_cancela_o_eco_e_preserva_a_fala_do_perto() {
+        let seg = 14usize;
+        let n = FRAME * 50 * seg;
+        // duas vozes de verdade diferentes: tons fundamentais com vibrato em 130 e 210 Hz (harmônicos iguais seriam
+        // "eco" para o filtro adaptativo, e não é isso que acontece entre duas pessoas)
+        let voz = |f0: f32, db: f32| {
+            let mut fase = 0.0f32;
+            let mut v: Vec<f32> = (0..n)
+                .map(|i| {
+                    let t = i as f32 / 48000.0;
+                    fase += 2.0 * PI * f0 * (1.0 + 0.12 * (2.0 * PI * 0.7 * t).sin()) / 48000.0;
+                    let mut x = 0.0;
+                    for h in 1..25 {
+                        let fh = f0 * h as f32;
+                        let env = (-((fh - 700.0) / 400.0).powi(2)).exp() + 0.6 * (-((fh - 1800.0) / 600.0).powi(2)).exp();
+                        x += env / h as f32 * (fase * h as f32).sin();
+                    }
+                    x * (0.35 + 0.65 * (2.0 * PI * 3.7 * t).sin().abs())
+                })
+                .collect();
+            escala_db(&mut v, db);
+            v
+        };
+        let far = voz(130.0, -25.0);
+        let mut perto = voz(210.0, -28.0);
+        for (i, v) in perto.iter_mut().enumerate() {
+            if i < 10 * 50 * FRAME || i >= 13 * 50 * FRAME {
+                *v = 0.0; // fala do perto só de 10 s a 13 s
+            }
+        }
+        let eco = eco_de(&far, 80, -10.0);
+        let mic: Vec<f32> = (0..n).map(|i| eco[i] + perto[i]).collect();
+        let roda = |ligado: bool| {
+            let mut p = SendPipeline::new().unwrap();
+            p.set_noise_suppression(false);
+            p.set_agc(false);
+            p.set_echo_cancel(ligado);
+            let mut out = Vec::with_capacity(n);
+            for (q, r) in mic.chunks_exact(FRAME).zip(far.chunks_exact(FRAME)) {
+                p.reference.copy_from_slice(r);
+                p.process(q, &mut |_, _| {});
+                out.extend_from_slice(p.last_frame());
+            }
+            (out, p.echo_stats())
+        };
+        let (sem, st_sem) = roda(false);
+        let (com, st) = roda(true);
+        assert!(st_sem.is_none());
+        let en = |x: &[f32]| x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>();
+        let seg_s = |s: usize, e: usize| (s * 48000, e * 48000);
+        let (a, b) = seg_s(6, 10);
+        let erle = 10.0 * (en(&sem[a..b]) / en(&com[a..b])).log10();
+        let (a, b) = seg_s(10, 13);
+        let perto_db = 10.0 * (en(&com[a..b]) / en(&perto[a..b])).log10();
+        eprintln!("eco: ERLE {erle:.1} dB (6–10 s), fala do perto na saída {perto_db:+.1} dB do original; stats {st:?}");
+        assert!(erle > 20.0, "ERLE {erle:.1} dB");
+        assert!((-6.0..=3.0).contains(&perto_db), "a fala do perto saiu {perto_db:+.1} dB do original");
+        let st = st.unwrap();
+        assert!(st.delay_ms.is_some_and(|d| (40..=200).contains(&d)), "atraso estimado {:?}", st.delay_ms);
+        assert!(com.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+    }
+
+    #[test]
+    fn eco_desligado_nao_mexe_no_sinal_e_ligar_desligar_e_barato() {
+        let x = seno(500.0, 48000.0, 0.3, FRAME * 10, 0);
+        let mut p = SendPipeline::new().unwrap();
+        p.set_noise_suppression(false);
+        p.set_agc(false);
+        assert!(!p.echo_cancel() && p.echo_stats().is_none());
+        let sem = processa(&mut p, &x);
+        let mut p2 = SendPipeline::new().unwrap();
+        p2.set_noise_suppression(false);
+        p2.set_agc(false);
+        p2.set_echo_cancel(true);
+        p2.set_echo_cancel(false);
+        assert_eq!(processa(&mut p2, &x), sem, "ligar e desligar tem de deixar tudo como estava (e soltar a memória)");
+        // ligado com referência vazia (ninguém falando): não pode engolir a voz do usuário
+        let mut p3 = SendPipeline::new().unwrap();
+        p3.set_noise_suppression(false);
+        p3.set_agc(false);
+        p3.set_echo_cancel(true);
+        let o = processa(&mut p3, &x);
+        let (ent, sai) = (rms(&x[FRAME * 5..]), rms(&o[FRAME * 5..]));
+        assert!(sai > ent * 0.8, "sem referência o microfone passa: {ent} → {sai}");
+    }
+
+    #[test]
+    fn eco_referencia_do_motor_fica_na_linha_do_tempo_da_captura() {
+        // le_referencia: completa com zeros e depois descarta o que faltou, sem deslocar a referência
+        let (mut prod, mut cons) = RingBuffer::<f32>::new(REF_RING);
+        let mut dst = vec![0f32; FRAME];
+        let mut divida = 0usize;
+        prod.push_partial_slice(&vec![1.0; 700]);
+        le_referencia(&mut cons, &mut dst, &mut divida);
+        assert_eq!((dst[699], dst[700], divida), (1.0, 0.0, FRAME - 700));
+        // as amostras atrasadas chegam: as primeiras `divida` são descartadas, o resto segue
+        prod.push_partial_slice(&vec![2.0; 260 + FRAME]);
+        le_referencia(&mut cons, &mut dst, &mut divida);
+        assert_eq!(divida, 0);
+        assert!(dst.iter().all(|v| *v == 2.0), "a referência seguinte começa exatamente onde a captura está");
+        // fila acumulada demais: descarta as mais antigas e segue
+        prod.push_partial_slice(&vec![3.0; FRAME * 6]);
+        le_referencia(&mut cons, &mut dst, &mut divida);
+        assert!(cons.slots() <= FRAME * 2 && dst.iter().all(|v| *v == 3.0));
     }
 
     // ── estalos: bordas, deriva do monitor e saída ──
@@ -3871,6 +4727,65 @@ mod tests {
              uso de 1 núcleo: {:.2}% (orçamento 20000 µs)",
             com / 200.0
         );
+    }
+
+    /// Custo de cada peça nova do DSP por quadro de 20 ms (rode com `--release -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn custo_cpu_dsp_novo() {
+        let n = 2000;
+        let mut x = fala_sintetica(FRAME * n);
+        escala_db(&mut x, -35.0);
+        let medir = |nome: &str, mut f: Box<dyn FnMut(&mut [f32])>| {
+            let mut y = x.clone();
+            let t = Instant::now();
+            for q in y.chunks_exact_mut(FRAME) {
+                f(q);
+            }
+            let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+            eprintln!("{nome:28} {us:7.1} µs por quadro de 20 ms ({:.3}% de um núcleo)", us / 200.0);
+        };
+        let mut hp = PassaAlta::new();
+        medir("passa-alta 80 Hz", Box::new(move |q| hp.process(q)));
+        let mut pre = PreAgc::new();
+        medir("pré-AGC", Box::new(move |q| {
+            pre.process(q);
+        }));
+        let mut a2 = Agc2::new();
+        medir("AGC2", Box::new(move |q| a2.process(q, 1.0)));
+        let mut eco = Eco::new();
+        let ref_ = vec![0.01f32; FRAME];
+        medir("cancelador de eco (AEC3)", Box::new(move |q| eco.process(q, &ref_)));
+        // esticador em modo comprimir (pior caso: busca de período todo quadro)
+        let mut e = Esticador::new();
+        let mut out = vec![0f32; FRAME];
+        let t = Instant::now();
+        let mut pulls = 0;
+        for q in x.chunks_exact(FRAME) {
+            e.push(q);
+            while e.disponivel() >= Esticador::precisa(Escala::Comprime) {
+                e.pull(&mut out, Escala::Comprime, 0.2);
+                pulls += 1;
+            }
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / pulls as f64;
+        eprintln!("{:28} {us:7.1} µs por quadro de 20 ms ({:.3}% de um núcleo, por usuário comprimindo)", "esticador (comprimindo)", us / 200.0);
+        // pipeline completo de envio com tudo ligado
+        let mut p = SendPipeline::new().unwrap();
+        p.set_echo_cancel(true);
+        let t = Instant::now();
+        for q in x.chunks_exact(FRAME) {
+            p.process(q, &mut |_, _| {});
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        eprintln!("{:28} {us:7.1} µs por quadro de 20 ms ({:.2}% de um núcleo)", "envio completo (c/ eco)", us / 200.0);
+        let mut p = SendPipeline::new().unwrap();
+        let t = Instant::now();
+        for q in x.chunks_exact(FRAME) {
+            p.process(q, &mut |_, _| {});
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        eprintln!("{:28} {us:7.1} µs por quadro de 20 ms ({:.2}% de um núcleo)", "envio completo (s/ eco)", us / 200.0);
     }
 
     // ── dispositivo real (manual) ──

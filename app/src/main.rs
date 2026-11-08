@@ -13,6 +13,7 @@ mod quick;
 mod rolagem;
 mod update;
 mod voice;
+mod voice_dsp;
 mod single;
 mod theme;
 mod viewer;
@@ -257,7 +258,7 @@ enum Act {
     /// Abre o diálogo Transmitir (com o canal de voz como destino, ou o aberto se `None`).
     OpenGoLive(Option<i64>),
     OpenVoiceSettings,
-    SetVoiceOptions { ns: bool, monitor: bool, low: bool },
+    SetVoiceOptions { ns: bool, monitor: bool, low: bool, eco: bool },
     SetNotif(notif::Prefs),
     /// Mostra uma notificação de teste agora (ignora foco e anti-spam).
     TestNotif,
@@ -391,6 +392,8 @@ struct Session {
     voice_ns: bool,
     voice_ll: bool,
     voice_monitor: bool,
+    /// Cancelamento de eco (experimental, padrão desligado).
+    voice_eco: bool,
     /// Motor só para testar o microfone nas configurações, quando não estou numa chamada.
     test_engine: Option<std::sync::Arc<voice::Engine>>,
     /// Rolagem horizontal da bandeja de anexos e onde ela ficou na tela (para a roda do mouse).
@@ -552,6 +555,7 @@ impl Session {
             voice_ns: true,
             voice_ll: true,
             voice_monitor: false,
+            voice_eco: false,
             test_engine: None,
             tray_x: 0.0,
             tray_rect: egui::Rect::NOTHING,
@@ -907,6 +911,7 @@ impl Session {
                 e.set_muted(self.voice_muted || self.voice_deaf);
                 e.set_deafened(self.voice_deaf);
                 e.set_noise_suppression(self.voice_ns);
+                e.set_echo_cancel(self.voice_eco);
                 e.set_monitor(self.voice_monitor);
                 for (u, v) in &self.voice_volumes {
                     e.set_user_volume(*u, *v);
@@ -944,6 +949,7 @@ impl Session {
             Ok(e) => {
                 let e = std::sync::Arc::new(e);
                 e.set_noise_suppression(self.voice_ns);
+                e.set_echo_cancel(self.voice_eco);
                 e.set_monitor(self.voice_monitor);
                 self.test_engine = Some(e);
             }
@@ -959,6 +965,7 @@ impl Session {
     fn apply_voice_options(&self) {
         for e in self.engine.iter().chain(self.test_engine.iter()) {
             e.set_noise_suppression(self.voice_ns);
+            e.set_echo_cancel(self.voice_eco);
             e.set_monitor(self.voice_monitor);
         }
     }
@@ -998,6 +1005,25 @@ impl Session {
             Some(e) => e.speaking(user),
             None => false,
         }
+    }
+
+    /// Estatísticas de voz com nomes, atualizadas ~2 vezes por segundo (o resto do tempo devolve o último valor).
+    fn voice_stats_cached(&self, ctx: &egui::Context) -> Option<(voice::VoiceStats, Vec<String>)> {
+        let e = self.mic_engine()?;
+        let id = egui::Id::new("voice-stats-cache");
+        let agora = ctx.input(|i| i.time);
+        let cached: Option<(f64, voice::VoiceStats, Vec<String>)> = ctx.data(|d| d.get_temp(id));
+        if let Some((t, vs, names)) = cached {
+            if agora - t < 0.5 {
+                ctx.request_repaint_after(Duration::from_millis(500));
+                return Some((vs, names));
+            }
+        }
+        let vs = e.voice_stats();
+        let names: Vec<String> = vs.rx.iter().map(|r| self.user_name_of(r.user)).collect();
+        ctx.data_mut(|d| d.insert_temp(id, (agora, vs.clone(), names.clone())));
+        ctx.request_repaint_after(Duration::from_millis(500));
+        Some((vs, names))
     }
 
     /// Nome de um usuário conhecido (ou "?").
@@ -1522,6 +1548,7 @@ struct App {
     voice_out: Option<String>,
     voice_ns: bool,
     voice_ll: bool,
+    voice_eco: bool,
     /// Notificações do sistema (guardadas no storage) e o último título de janela enviado ao sistema.
     notif: notif::Prefs,
     os_title: String,
@@ -1580,6 +1607,7 @@ impl App {
             token_saved: token,
             voice_ns: get("voice_ns") != "0",
             voice_ll: get("voice_ll") != "0",
+            voice_eco: get("voice_eco") == "1",
             notif: notif::Prefs { on: get("notif_on") != "0", only_dm_mentions: get("notif_only") != "0" },
             os_title: "Telacast".into(),
             voice_in: Some(get("voice_in")).filter(|v| !v.is_empty()),
@@ -1645,6 +1673,7 @@ impl App {
                     sess.voice_out = self.voice_out.clone();
                     sess.voice_ns = self.voice_ns;
                     sess.voice_ll = self.voice_ll;
+                    sess.voice_eco = self.voice_eco;
                     sess.notif = self.notif;
                     self.session = Some(sess);
                     return;
@@ -1709,6 +1738,7 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("voice_ll", if self.voice_ll { "1" } else { "0" }.into());
         storage.set_string("voice_ns", if self.voice_ns { "1" } else { "0" }.into());
+        storage.set_string("voice_eco", if self.voice_eco { "1" } else { "0" }.into());
         storage.set_string("notif_on", if self.notif.on { "1" } else { "0" }.into());
         storage.set_string("notif_only", if self.notif.only_dm_mentions { "1" } else { "0" }.into());
         storage.set_string("voice_in", self.voice_in.clone().unwrap_or_default());
@@ -2126,6 +2156,87 @@ fn attachment_view(ui: &mut egui::Ui, a: &p::Attachment, base: &str, token: &str
 
 /// Prévia ampliada de uma imagem sobre o app. Devolve `true` quando deve fechar (Esc, clique fora ou "Fechar").
 /// Com `download`, mostra também o botão "Baixar".
+/// Painel "Estatísticas da voz" (Configurações de voz): envio (nível, ganhos, prob. de voz) e, por usuário remoto e no
+/// total, perda, jitter, buffer atual/alvo, cortes por minuto e atraso estimado. Um acento âmbar nos valores fora do normal.
+fn voice_stats_panel(ui: &mut egui::Ui, vs: &voice::VoiceStats, names: &[String], connected: bool) {
+    let mono = |t: String, c: Color32| RichText::new(t).size(12.0).color(c).monospace();
+    ui.label(caps("Estatísticas da voz"));
+    egui::Frame::new().fill(L2).stroke(egui::Stroke::new(1.0, LINE)).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let tx = &vs.tx;
+        ui.label(RichText::new("ENVIO").size(11.0).color(MUTED));
+        egui::Grid::new("voice-stats-tx").num_columns(4).spacing([14.0, 2.0]).show(ui, |ui| {
+            ui.label(RichText::new("Nível").size(11.5).color(MUTED));
+            ui.label(RichText::new("Prob. de voz").size(11.5).color(MUTED));
+            ui.label(RichText::new("Pré-AGC").size(11.5).color(MUTED));
+            ui.label(RichText::new("AGC2").size(11.5).color(MUTED));
+            ui.end_row();
+            let nivel = if tx.level_db > -100.0 { format!("{:.0} dBFS", tx.level_db) } else { "—".into() };
+            ui.label(mono(nivel, if tx.speaking { AMBER } else { TEXT }));
+            ui.label(mono(format!("{:.0}%", tx.voice_prob * 100.0), TEXT));
+            ui.label(mono(format!("{:+.1} dB", tx.pre_gain_db), TEXT));
+            ui.label(mono(format!("{:+.1} dB", tx.agc2_gain_db), TEXT));
+            ui.end_row();
+        });
+        if let Some(e) = &tx.echo {
+            ui.add_space(2.0);
+            let erle = e.erle_db.map_or("aprendendo…".to_string(), |v| format!("{v:.0} dB"));
+            let atraso = e.delay_ms.map_or("—".to_string(), |v| format!("{v} ms"));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Eco").size(11.5).color(MUTED));
+                ui.label(mono(format!("ERLE {erle}"), TEXT));
+                ui.label(mono(format!("atraso {atraso}"), TEXT));
+            });
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new("RECEPÇÃO").size(11.0).color(MUTED));
+        if !connected || vs.rx.is_empty() {
+            let msg = if connected { "Ninguém falando agora." } else { "Entre num canal de voz para ver a recepção." };
+            ui.label(RichText::new(msg).size(12.0).color(MUTED));
+            return;
+        }
+        egui::ScrollArea::vertical().id_salt("voice-stats-scroll").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
+        egui::Grid::new("voice-stats-rx").num_columns(6).spacing([12.0, 3.0]).show(ui, |ui| {
+            for h in ["Usuário", "Perda", "Jitter", "Buffer", "Cortes/min", "Atraso"] {
+                ui.label(RichText::new(h).size(11.5).color(MUTED));
+            }
+            ui.end_row();
+            let alerta = |ruim: bool| if ruim { AMBER } else { TEXT };
+            for (r, nome) in vs.rx.iter().zip(names) {
+                let nome: String = if nome.chars().count() > 10 { format!("{}…", nome.chars().take(9).collect::<String>()) } else { nome.clone() };
+                ui.label(RichText::new(nome).size(12.0).color(if r.speaking { TEXT } else { TEXT2 }));
+                ui.label(mono(format!("{:.1}%", r.loss_pct), alerta(r.loss_pct >= 2.0)));
+                ui.label(mono(format!("{:.0} ms", r.jitter_ms), alerta(r.jitter_ms >= 30.0)));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let warp = match r.warp {
+                        1 => "»",
+                        -1 => "«",
+                        _ => " ",
+                    };
+                    ui.label(mono(format!("{:.0}/{:.0}{warp}", r.buffered_ms, r.target_ms), alerta(r.warp != 0)));
+                });
+                ui.label(mono(format!("{:.1}", r.cuts_per_min), alerta(r.cuts_per_min >= 3.0)));
+                ui.label(mono(format!("{:.0} ms", r.latency_ms), alerta(r.latency_ms >= 250.0)));
+                ui.end_row();
+            }
+            if vs.rx.len() > 1 {
+                let t = &vs.total;
+                ui.label(RichText::new("Total").size(12.0).strong().color(TEXT2));
+                ui.label(mono(format!("{:.1}%", t.loss_pct), alerta(t.loss_pct >= 2.0)));
+                ui.label(mono(format!("{:.0} ms", t.jitter_ms), alerta(t.jitter_ms >= 30.0)));
+                ui.label(mono(format!("{:.0}", t.buffered_ms), TEXT));
+                ui.label(mono(format!("{:.1}", t.cuts_per_min), alerta(t.cuts_per_min >= 3.0)));
+                ui.label(mono(format!("{:.0} ms", t.latency_ms), alerta(t.latency_ms >= 250.0)));
+                ui.end_row();
+            }
+        });
+        });
+        ui.add_space(4.0);
+        ui.label(RichText::new("Buffer = atual/alvo em ms (» comprimindo, « esticando o tempo). Atraso sem contar a rede.").size(11.0).color(MUTED));
+    });
+}
+
 fn lightbox(ctx: &egui::Context, tex: Option<egui::TextureHandle>, caption: &str, download: Option<String>) -> bool {
     let screen = ctx.content_rect();
     let max = egui::vec2((screen.width() - 120.0).max(200.0), (screen.height() - 150.0).max(150.0));
@@ -2862,7 +2973,9 @@ impl App {
                     body: "As notificações estão funcionando.".into(),
                     target: notif::Target::Pending,
                 }),
-                Act::SetVoiceOptions { ns, monitor, low } => {
+                Act::SetVoiceOptions { ns, monitor, low, eco } => {
+                    s.voice_eco = eco;
+                    self.voice_eco = eco;
                     let low_changed = s.voice_ll != low;
                     s.voice_ll = low;
                     self.voice_ll = low;
@@ -5237,6 +5350,7 @@ impl App {
             s.apply_voice_options();
         }
         let cur = s.current_channel();
+        let vstats = if matches!(s.modal, Modal::VoiceSettings(_)) { s.voice_stats_cached(ctx) } else { None };
         match &mut s.modal {
             Modal::None => {}
             Modal::AddServer { create, name, code } => {
@@ -5331,66 +5445,83 @@ impl App {
                 let (mut input, mut output) = (s.voice_in.clone(), s.voice_out.clone());
                 let level = s.engine.as_ref().or(s.test_engine.as_ref()).map(|e| e.mic_level());
                 let connected = s.engine.is_some();
-                let (mut ns, mut monitor, mut low) = (s.voice_ns, s.voice_monitor, s.voice_ll);
+                let (mut ns, mut monitor, mut low, mut eco) = (s.voice_ns, s.voice_monitor, s.voice_ll, s.voice_eco);
                 let lat = s.engine.as_ref().or(s.test_engine.as_ref()).map(|e| e.latency_estimate_ms());
-                modal(ctx, "Configurações de voz", 440.0, &mut dismissed, |ui| {
-                    ui.set_width(400.0);
-                    let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "Padrão do sistema".into());
-                    ui.label(caps("MICROFONE"));
-                    egui::ComboBox::from_id_salt("voice-in").width(ui.available_width()).selected_text(shown(&input)).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut input, None, "Padrão do sistema");
-                        for d in &devs.inputs {
-                            ui.selectable_value(&mut input, Some(d.clone()), d);
+                // com o motor aberto as estatísticas vão numa segunda coluna (a janela de 760 px de altura não comporta tudo em pilha)
+                let largura = if vstats.is_some() { 860.0 } else { 440.0 };
+                modal(ctx, "Configurações de voz", largura, &mut dismissed, |ui| {
+                    ui.set_width(largura - 40.0);
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(400.0);
+                            let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "Padrão do sistema".into());
+                            ui.label(caps("MICROFONE"));
+                            egui::ComboBox::from_id_salt("voice-in").width(ui.available_width()).selected_text(shown(&input)).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut input, None, "Padrão do sistema");
+                                for d in &devs.inputs {
+                                    ui.selectable_value(&mut input, Some(d.clone()), d);
+                                }
+                            });
+                            ui.add_space(8.0);
+                            ui.label(caps("SAÍDA DE ÁUDIO"));
+                            egui::ComboBox::from_id_salt("voice-out").width(ui.available_width()).selected_text(shown(&output)).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut output, None, "Padrão do sistema");
+                                for d in &devs.outputs {
+                                    ui.selectable_value(&mut output, Some(d.clone()), d);
+                                }
+                            });
+                            ui.add_space(8.0);
+                            ui.label(caps("NÍVEL DO MICROFONE"));
+                            let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
+                            ui.painter().rect_filled(bar, 5.0, L2);
+                            match level {
+                                Some(l) => {
+                                    let w = bar.width() * l.clamp(0.0, 1.0);
+                                    ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, egui::vec2(w, bar.height())), 5.0, OK);
+                                    ctx.request_repaint_after(Duration::from_millis(80));
+                                }
+                                None => {
+                                    ui.label(RichText::new("Entre num canal de voz para ver o nível do microfone.").size(12.0).color(MUTED));
+                                }
+                            }
+                            if connected {
+                                ui.label(RichText::new("Mudar o dispositivo reabre o áudio na hora.").size(12.0).color(MUTED));
+                            }
+                            ui.add_space(8.0);
+                            ui.checkbox(&mut ns, "Supressão de ruído");
+                            ui.label(RichText::new("Tira teclado, ventilador e barulho de fundo antes de enviar (RNNoise).").size(12.0).color(MUTED));
+                            ui.add_space(4.0);
+                            ui.checkbox(&mut low, "Baixa latência");
+                            let lat_txt = match lat {
+                                Some((m, r)) if m > 0.0 => format!("Atraso estimado: ouvir a si mesmo ~{m:.0} ms · vozes dos outros ~{r:.0} ms (sem a rede)."),
+                                _ => "Pede blocos de áudio pequenos ao sistema. Se estalar, desligue.".to_string(),
+                            };
+                            ui.label(RichText::new(lat_txt).size(12.0).color(MUTED));
+                            ui.add_space(4.0);
+                            ui.checkbox(&mut eco, "Cancelamento de eco (experimental)");
+                            ui.label(RichText::new("Para quem usa caixa de som: tira do microfone o que o app toca. Com fone não precisa.").size(12.0).color(MUTED));
+                            ui.add_space(4.0);
+                            ui.checkbox(&mut monitor, "Ouvir meu microfone");
+                            ui.label(RichText::new("Toca o que os outros ouvem. Use fone de ouvido: com caixa de som dá microfonia.").size(12.0).color(if monitor { AMBER } else { MUTED }));
+                            ui.add_space(10.0);
+                            if small_button(ui, "Fechar", FIELD) {
+                                close = true;
+                            }
+                        });
+                        if let Some((vs, names)) = &vstats {
+                            ui.add_space(20.0);
+                            ui.vertical(|ui| {
+                                ui.set_width(380.0);
+                                voice_stats_panel(ui, vs, names, connected);
+                            });
                         }
                     });
-                    ui.add_space(8.0);
-                    ui.label(caps("SAÍDA DE ÁUDIO"));
-                    egui::ComboBox::from_id_salt("voice-out").width(ui.available_width()).selected_text(shown(&output)).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut output, None, "Padrão do sistema");
-                        for d in &devs.outputs {
-                            ui.selectable_value(&mut output, Some(d.clone()), d);
-                        }
-                    });
-                    ui.add_space(8.0);
-                    ui.label(caps("NÍVEL DO MICROFONE"));
-                    let (bar, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
-                    ui.painter().rect_filled(bar, 5.0, L2);
-                    match level {
-                        Some(l) => {
-                            let w = bar.width() * l.clamp(0.0, 1.0);
-                            ui.painter().rect_filled(egui::Rect::from_min_size(bar.min, egui::vec2(w, bar.height())), 5.0, OK);
-                            ctx.request_repaint_after(Duration::from_millis(80));
-                        }
-                        None => {
-                            ui.label(RichText::new("Entre num canal de voz para ver o nível do microfone.").size(12.0).color(MUTED));
-                        }
-                    }
-                    if connected {
-                        ui.label(RichText::new("Mudar o dispositivo reabre o áudio na hora.").size(12.0).color(MUTED));
-                    }
-                    ui.add_space(8.0);
-                    ui.checkbox(&mut ns, "Supressão de ruído");
-                    ui.label(RichText::new("Tira teclado, ventilador e barulho de fundo antes de enviar (RNNoise).").size(12.0).color(MUTED));
-                    ui.add_space(4.0);
-                    ui.checkbox(&mut low, "Baixa latência");
-                    let lat_txt = match lat {
-                        Some((m, r)) if m > 0.0 => format!("Atraso estimado: ouvir a si mesmo ~{m:.0} ms · vozes dos outros ~{r:.0} ms (sem a rede)."),
-                        _ => "Pede blocos de áudio pequenos ao sistema. Se estalar, desligue.".to_string(),
-                    };
-                    ui.label(RichText::new(lat_txt).size(12.0).color(MUTED));
-                    ui.add_space(4.0);
-                    ui.checkbox(&mut monitor, "Ouvir meu microfone");
-                    ui.label(RichText::new("Toca o que os outros ouvem. Use fone de ouvido: com caixa de som dá microfonia.").size(12.0).color(if monitor { AMBER } else { MUTED }));
-                    ui.add_space(10.0);
-                    if small_button(ui, "Fechar", FIELD) {
-                        close = true;
-                    }
                 });
                 if input != s.voice_in || output != s.voice_out {
                     acts.push(Act::SetVoiceDevices { input, output });
                 }
-                if ns != s.voice_ns || monitor != s.voice_monitor || low != s.voice_ll {
-                    acts.push(Act::SetVoiceOptions { ns, monitor, low });
+                if ns != s.voice_ns || monitor != s.voice_monitor || low != s.voice_ll || eco != s.voice_eco {
+                    acts.push(Act::SetVoiceOptions { ns, monitor, low, eco });
                 }
             }
             Modal::TextView(a) => {

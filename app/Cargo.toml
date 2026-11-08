@@ -23,6 +23,8 @@ cpal = "0.16"
 opus = "0.4"
 rtrb = "0.3"
 nnnoiseless = { version = "0.5", default-features = false }
+# cancelamento de eco opcional (AEC3 do WebRTC portado para Rust puro, sem C/C++); sem os recursos de ruído/AGC2 ligados
+sonora = { version = "0.3", default-features = false }
 telacast-md = { path = "../md" }
 telacast-qs = { path = "../qs" }
 
