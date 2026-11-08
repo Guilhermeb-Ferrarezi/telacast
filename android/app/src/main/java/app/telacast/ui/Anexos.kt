@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -65,6 +66,9 @@ import app.telacast.tema.Tipos
 class ProvedorDeAnexos(
     val imagemEmCache: (Attachment) -> ImageBitmap? = { null },
     val imagem: suspend (Attachment) -> ImageBitmap? = { null },
+    /** Miniatura (ou o original, se for o que há) para a lista do chat; a tela cheia usa [imagem]. */
+    val miniaturaDoAnexoEmCache: (Attachment) -> ImageBitmap? = { null },
+    val miniaturaDoAnexo: suspend (Attachment) -> ImageBitmap? = { null },
     val previaEmCache: (Attachment) -> PreviaDeTexto? = { null },
     val previa: suspend (Attachment) -> PreviaDeTexto? = { null },
     val miniaturaEmCache: (FonteDeArquivo) -> ImageBitmap? = { null },
@@ -91,14 +95,17 @@ private sealed interface EstadoDeImagem {
 fun AnexoView(a: Attachment, textoExpandido: Boolean, acoes: AcoesDeAnexo, modifier: Modifier = Modifier) {
     val prov = LocalProvedorDeAnexos.current
     if (Arquivos.ehImagem(a)) {
-        var est by remember(a.id) { mutableStateOf(prov.imagemEmCache(a)?.let { EstadoDeImagem.Pronta(it) } ?: EstadoDeImagem.Carregando) }
+        // a lista usa a MINIATURA (até 1024 px); o original só é baixado na tela cheia
+        var est by remember(a.id) { mutableStateOf(prov.miniaturaDoAnexoEmCache(a)?.let { EstadoDeImagem.Pronta(it) } ?: EstadoDeImagem.Carregando) }
         LaunchedEffect(a.id) {
-            if (est is EstadoDeImagem.Carregando) est = prov.imagem(a)?.let { EstadoDeImagem.Pronta(it) } ?: EstadoDeImagem.Falhou
+            if (est is EstadoDeImagem.Carregando) est = prov.miniaturaDoAnexo(a)?.let { EstadoDeImagem.Pronta(it) } ?: EstadoDeImagem.Falhou
         }
         if (est !is EstadoDeImagem.Falhou) {
             BoxWithConstraints(modifier) {
-                val (w, h) = Arquivos.tamanhoDaImagem(a.width, a.height, minOf(400f, maxWidth.value))
                 val forma = RoundedCornerShape(8.dp)
+                // com o bitmap na mão, a proporção vem dele (foto com orientação EXIF 5 a 8 tem largura e altura trocadas no anexo)
+                val dim = (est as? EstadoDeImagem.Pronta)?.let { Arquivos.dimensoesDeExibicao(a, it.bmp.width, it.bmp.height) } ?: (a.width to a.height)
+                val (w, h) = Arquivos.tamanhoDaImagem(dim.first, dim.second, minOf(400f, maxWidth.value))
                 when (val e = est) {
                     is EstadoDeImagem.Pronta -> Image(
                         BitmapPainter(e.bmp), a.name, Modifier.size(w.dp, h.dp).clip(forma).clickable { acoes.aoAbrirImagem(a) },
@@ -180,12 +187,24 @@ fun CartaoDeTexto(a: Attachment, p: PreviaDeTexto, expandido: Boolean, acoes: Ac
     }
 }
 
-/** Imagem em tela cheia: fundo quase preto, zoom por pinça (1x a 5x), toque duplo alterna, Baixar e Fechar. */
+/**
+ * Imagem em tela cheia: fundo quase preto, zoom por pinça (1x a 5x), toque duplo alterna, Baixar e Fechar.
+ * Mostra logo a miniatura (que costuma estar na memória por causa do chat) e troca pelo original quando ele chega,
+ * sem piscar; se o original falhar (grande demais, rede), fica com a miniatura. "Baixar" baixa sempre o original.
+ */
 @Composable
 fun VisualizadorDeImagem(a: Attachment, aoFechar: () -> Unit, aoBaixar: () -> Unit) {
     val prov = LocalProvedorDeAnexos.current
-    var bmp by remember(a.id) { mutableStateOf(prov.imagemEmCache(a)) }
-    LaunchedEffect(a.id) { if (bmp == null) bmp = prov.imagem(a) }
+    var bmp by remember(a.id) { mutableStateOf(prov.imagemEmCache(a) ?: prov.miniaturaDoAnexoEmCache(a)) }
+    var original by remember(a.id) { mutableStateOf(prov.imagemEmCache(a) != null) }
+    var falhouOriginal by remember(a.id) { mutableStateOf(false) }
+    LaunchedEffect(a.id) {
+        if (bmp == null) bmp = prov.miniaturaDoAnexo(a)
+        if (!original) {
+            val o = prov.imagem(a)
+            if (o != null) { bmp = o; original = true } else falhouOriginal = true
+        }
+    }
     var escala by remember { mutableFloatStateOf(1f) }
     var deslocamento by remember { mutableStateOf(Offset.Zero) }
     Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.92f))) {
@@ -208,6 +227,9 @@ fun VisualizadorDeImagem(a: Attachment, aoFechar: () -> Unit, aoBaixar: () -> Un
             )
         } else {
             Text("Carregando…", style = Tipos.CorpoApagado, modifier = Modifier.align(Alignment.Center))
+        }
+        if (bmp != null && !original && !falhouOriginal) {
+            Text("Carregando a imagem original…", style = Tipos.Pequeno.copy(color = Grafite.Texto2), modifier = Modifier.align(Alignment.BottomCenter).windowInsetsPadding(WindowInsets.navigationBars).padding(bottom = 16.dp))
         }
         Row(
             Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars).padding(horizontal = 16.dp, vertical = 12.dp),

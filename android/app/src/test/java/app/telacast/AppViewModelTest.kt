@@ -179,11 +179,66 @@ class AppViewModelTest {
         assertEquals("g", a.vm.form.value.usuario)
     }
 
-    @Test fun avisoDeVozSomeSozinho() = runTest {
+    @Test fun avisoSomeSozinho() = runTest {
         val a = amb()
-        a.vm.cliqueEmVoz(); a.rodar()
-        assertEquals("Canais de voz chegam em breve.", a.vm.aviso.value)
+        a.vm.mostrarAviso("Teste"); a.rodar()
+        assertEquals("Teste", a.vm.aviso.value)
         a.t.advanceTimeBy(3_600); a.rodar()
         assertNull(a.vm.aviso.value)
+    }
+
+    private val salaDeVoz = 112623700000000014L
+
+    private fun TestScope.ambLogado() = amb().also { a -> a.vm.editarForm { it.copy(usuario = "g", senha = "s") }; a.vm.entrar(); a.rodar(); a.autenticar() }
+
+    @Test fun abrirVozVaiParaATelaDoCanalENaoMarcaTextoComoAberto() = runTest {
+        val a = ambLogado()
+        a.vm.abrirVoz(servidor.id, salaDeVoz); a.rodar()
+        assertEquals(Destino.Voz(servidor.id, salaDeVoz), a.vm.nav.value.destino)
+        assertEquals(servidor.id, a.vm.nav.value.servidorNoPainel)
+        assertNull("sem canal de texto aberto, nada é marcado como lido", a.vm.estado.value.canalAberto)
+    }
+
+    @Test fun destinoDeVozSobreviveEUmCanalApagadoVoltaAoInicio() = runTest {
+        val a = ambLogado()
+        a.vm.abrirVoz(servidor.id, salaDeVoz); a.rodar()
+        assertEquals(Destino.Voz(servidor.id, salaDeVoz), a.vm.nav.value.destino)
+        a.c.envia(S2C.Snapshot(snapshot.copy(servers = listOf(servidor.copy(channels = servidor.channels.filter { it.id != salaDeVoz }))))); a.rodar()
+        assertEquals(Destino.Amigos, a.vm.nav.value.destino)
+    }
+
+    @Test fun entrarNaVozMandaVoiceJoinEConfirmacaoDoServidorConecta() = runTest {
+        val a = ambLogado()
+        a.vm.entrarNaVoz(salaDeVoz); a.rodar()
+        assertTrue(a.c.c2s.contains(C2S.VoiceJoin(salaDeVoz)))
+        assertEquals(app.telacast.voz.FaseDaVoz.Entrando, a.vm.voz.value.fase)
+        // sem dispositivo de áudio (o contêiner dos testes usa FabricaSemAudio) a entrada falha e o erro vira aviso
+        a.c.envia(S2C.VoiceUpdate(app.telacast.proto.VoiceState(eu.id, salaDeVoz, false, false))); a.rodar()
+        assertEquals(app.telacast.voz.FaseDaVoz.Fora, a.vm.voz.value.fase)
+        assertTrue(a.vm.aviso.value!!.contains("áudio"))
+        assertEquals(C2S.VoiceLeave, a.c.c2s.last())
+    }
+
+    @Test fun abrirTelaDaVozLevaAoCanalDaChamada() = runTest {
+        val a = ambLogado()
+        a.vm.entrarNaVoz(salaDeVoz); a.rodar()
+        a.vm.abrirTelaDaVoz(); a.rodar()
+        assertEquals(Destino.Voz(servidor.id, salaDeVoz), a.vm.nav.value.destino)
+    }
+
+    @Test fun permissaoNegadaMostraAvisoENaoEntra() = runTest {
+        val a = ambLogado()
+        a.vm.recusarMicrofone(); a.rodar()
+        assertTrue(a.vm.aviso.value!!.contains("microfone"))
+        assertEquals(app.telacast.voz.FaseDaVoz.Fora, a.vm.voz.value.fase)
+        assertTrue(a.c.c2s.none { it is C2S.VoiceJoin })
+    }
+
+    @Test fun opcoesDeVozSaoGuardadasENoControlador() = runTest {
+        val a = amb()
+        a.vm.definirOpcoesDeVoz { it.copy(supressaoDeRuido = false, ganhoDeEntrada = 2f) }; a.rodar()
+        assertFalse(a.vm.voz.value.opcoes.supressaoDeRuido)
+        assertEquals(2f, a.vm.voz.value.opcoes.ganhoDeEntrada, 0.001f)
+        assertEquals(2f, a.prefs.opcoesDeVoz.ganhoDeEntrada, 0.001f)
     }
 }

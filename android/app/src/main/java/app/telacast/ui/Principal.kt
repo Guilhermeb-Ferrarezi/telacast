@@ -73,6 +73,7 @@ class AcoesPrincipais(
     val ajustes: AcoesDeAjustes = AcoesDeAjustes(),
     val aoAbrirAjustes: () -> Unit = {},
     val aoAbrirPerfil: (Long, String) -> Unit = { _, _ -> },
+    val voz: AcoesDeVoz = AcoesDeVoz(),
 )
 
 /**
@@ -89,6 +90,7 @@ fun TelaPrincipal(
     acoes: AcoesPrincipais,
     modifier: Modifier = Modifier,
     conversa: DadosDaConversa = DadosDaConversa(),
+    voz: DadosDeVoz = DadosDeVoz(),
 ) {
     BoxWithConstraints(modifier.fillMaxSize().background(Grafite.L2)) {
         val larguraGaveta = minOf((LARGURA_TRILHO + LARGURA_PAINEL).dp, maxWidth - 56.dp)
@@ -134,11 +136,14 @@ fun TelaPrincipal(
         ) {
             Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.statusBars)) {
                 (estado.conexao as? EstadoConexao.Reconectando)?.let { FaixaDeReconexao(it.tentativa) }
-                Box(Modifier.weight(1f)) { Centro(estado, nav, acoes, conversa) }
+                // enquanto você está numa chamada e não está na tela dela, a faixa fica no topo do centro
+                val naTelaDaVoz = (nav.destino as? Destino.Voz)?.canal == voz.estado.canal
+                if (voz.estado.naChamada && !naTelaDaVoz) FaixaDeVoz(voz.estado, localDaVoz(estado, voz.estado.canal), voz.agoraMs, acoes.voz)
+                Box(Modifier.weight(1f)) { Centro(estado, nav, acoes, conversa, voz) }
             }
 
             CamadaLateral(pEsq, aEsquerda = true, largura = larguraGaveta, aoFechar = acoes.aoFecharGaveta) {
-                Gaveta(estado, nav, recolhidas, acoes, larguraGaveta)
+                Gaveta(estado, nav, recolhidas, acoes, larguraGaveta, voz)
             }
             CamadaLateral(pDir, aEsquerda = false, largura = larguraMembros, aoFechar = acoes.aoFecharMembros) {
                 val sv = (nav.destino as? Destino.Canal)?.let { d -> estado.snapshot?.servers?.firstOrNull { it.id == d.servidor } }
@@ -148,10 +153,14 @@ fun TelaPrincipal(
             nav.folha?.let { f -> FolhaDaMensagem(estado, f.mensagem, f.emojis, acoes.folha) }
             when (val d = nav.dialogo) {
                 null -> Unit
-                Dialogo.Fixadas, Dialogo.Busca, Dialogo.Ajustes -> TelaCheiaDoDialogo(d, estado, conversa, acoes)
+                Dialogo.Fixadas, Dialogo.Busca, Dialogo.Ajustes -> TelaCheiaDoDialogo(d, estado, conversa, acoes, voz)
                 else -> DialogoAtual(d, acoes.dialogo)
             }
             nav.perfil?.let { PerfilDaPrincipal(estado, it, acoes) }
+            nav.volume?.let { u ->
+                val nome = estado.usuario(u)?.name ?: "?"
+                FolhaDeVolume(nome, voz.estado.volumeDe(u), { acoes.voz.aoMudarVolume(u, it) }, acoes.voz.aoFecharVolume)
+            }
             if (aviso != null) {
                 AvisoCurto(aviso, Modifier.align(Alignment.BottomCenter).windowInsetsPadding(WindowInsets.navigationBars).padding(bottom = 16.dp))
             }
@@ -170,7 +179,7 @@ private fun FaixaDeReconexao(tentativa: Int) {
 }
 
 @Composable
-private fun Centro(estado: AppState, nav: Navegacao, acoes: AcoesPrincipais, conversa: DadosDaConversa) {
+private fun Centro(estado: AppState, nav: Navegacao, acoes: AcoesPrincipais, conversa: DadosDaConversa, voz: DadosDeVoz) {
     val sn = estado.snapshot
     when (val d = nav.destino) {
         is Destino.Canal -> {
@@ -183,13 +192,25 @@ private fun Centro(estado: AppState, nav: Navegacao, acoes: AcoesPrincipais, con
             if (dm != null) TelaDeDm(estado, dm, acoes.aoAbrirGaveta, conversa, acoes.conversa)
             else TelaDeAmigos(estado, nav.abaInicio, acoes.aoAbrirGaveta, acoes.amigos)
         }
+        is Destino.Voz -> {
+            val servidor = sn?.servers?.firstOrNull { it.id == d.servidor }
+            val canal = servidor?.channels?.firstOrNull { it.id == d.canal }
+            if (canal != null) {
+                val nomes = servidor.members.associate { it.id to it.name }
+                TelaDeVoz(
+                    voz.estado, canal.name, servidor.name, canal.id, estado.voz.filter { it.channelId == canal.id },
+                    nomeDe = { nomes[it] ?: estado.usuario(it)?.name ?: "?" }, euId = estado.eu?.id ?: 0L, agoraMs = voz.agoraMs,
+                    aoMenu = acoes.aoAbrirGaveta, acoes = acoes.voz, novidade = temNovidade(estado),
+                )
+            } else TelaDeAmigos(estado, nav.abaInicio, acoes.aoAbrirGaveta, acoes.amigos)
+        }
         Destino.Amigos -> TelaDeAmigos(estado, nav.abaInicio, acoes.aoAbrirGaveta, acoes.amigos)
     }
 }
 
 /** Gaveta: trilho de servidores à esquerda, painel de canais (ou do Início) ao lado, e os menus por cima do painel. */
 @Composable
-private fun Gaveta(estado: AppState, nav: Navegacao, recolhidas: Set<Long>, acoes: AcoesPrincipais, largura: Dp) {
+private fun Gaveta(estado: AppState, nav: Navegacao, recolhidas: Set<Long>, acoes: AcoesPrincipais, largura: Dp, voz: DadosDeVoz) {
     val sv = nav.servidorNoPainel?.let { id -> estado.snapshot?.servers?.firstOrNull { it.id == id } }
     Row(Modifier.fillMaxSize().background(Grafite.L1).windowInsetsPadding(WindowInsets.statusBars).windowInsetsPadding(WindowInsets.navigationBars)) {
         TrilhoDeServidores(estado, nav.servidorNoPainel, acoes.aoAbrirInicio, acoes.aoSelecionarServidor, acoes.aoAdicionarServidor)
@@ -202,7 +223,7 @@ private fun Gaveta(estado: AppState, nav: Navegacao, recolhidas: Set<Long>, acoe
                     aoAbrirMenuStatus = acoes.painel.aoAbrirMenuStatus, aoCriarCanal = acoes.painel.aoCriarCanal,
                     aoAbrirAmigos = acoes.painel.aoAbrirAmigos, aoAbrirDm = acoes.painel.aoAbrirDm,
                 ),
-                largura = largura - LARGURA_TRILHO.dp,
+                largura = largura - LARGURA_TRILHO.dp, voz = voz, acoesVoz = acoes.voz,
             )
             if (nav.menu != null) {
                 // toque fora do menu fecha
@@ -258,7 +279,7 @@ private fun FolhaDaMensagem(estado: AppState, id: Long, emojis: Boolean, a: Acoe
 
 /** Fixadas, Busca e Ajustes: telas cheias que precisam do estado do app (por isso não ficam em `DialogoAtual`). */
 @Composable
-private fun TelaCheiaDoDialogo(d: Dialogo, estado: AppState, conversa: DadosDaConversa, acoes: AcoesPrincipais) {
+private fun TelaCheiaDoDialogo(d: Dialogo, estado: AppState, conversa: DadosDaConversa, acoes: AcoesPrincipais, voz: DadosDeVoz) {
     val nomes = androidx.compose.runtime.remember(estado.snapshot) { nomesDeUsuarios(estado) }
     val canais = androidx.compose.runtime.remember(estado.snapshot) { estado.snapshot?.servers?.flatMap { it.channels }?.associate { it.id to it.name } ?: emptyMap() }
     val amb = AmbienteMd(nomeDoUsuario = { nomes[it] }, nomeDoCanal = { canais[it] }, agoraSeg = conversa.agoraMs / 1000, zona = conversa.zona)
@@ -269,7 +290,7 @@ private fun TelaCheiaDoDialogo(d: Dialogo, estado: AppState, conversa: DadosDaCo
             val servidor = estado.snapshot?.servers?.firstOrNull { sv -> sv.channels.any { it.id == estado.canalAberto } }
             TelaDeBusca(estado.busca, conversa.consultaDaBusca, conversa.buscaNoCanal, servidor != null, servidor?.name.orEmpty(), amb, conversa.agoraMs, conversa.zona, acoes.busca)
         }
-        Dialogo.Ajustes -> if (eu != null) TelaDeAjustes(eu, estado.sessoes, conversa.agoraMs, conversa.tamanhoDoTexto, conversa.senhaTrocada, acoes.ajustes)
+        Dialogo.Ajustes -> if (eu != null) TelaDeAjustes(eu, estado.sessoes, conversa.agoraMs, conversa.tamanhoDoTexto, conversa.senhaTrocada, acoes.ajustes, voz.estado.opcoes)
         else -> Unit
     }
 }

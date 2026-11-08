@@ -37,6 +37,7 @@ import app.telacast.proto.Channel
 import app.telacast.proto.FriendStatus
 import app.telacast.proto.ServerInfo
 import app.telacast.proto.Status
+import app.telacast.voz.EstadoDeVoz
 import app.telacast.tema.Formas
 import app.telacast.tema.Grafite
 import app.telacast.tema.Newsreader
@@ -49,7 +50,7 @@ const val ALTURA_LINHA = 40
 class AcoesPainel(
     val aoAbrirCanal: (servidor: Long, canal: Long) -> Unit = { _, _ -> },
     val aoAlternarCategoria: (Long) -> Unit = {},
-    val aoCliqueEmVoz: () -> Unit = {},
+    val aoCliqueEmVoz: (servidor: Long, canal: Long) -> Unit = { _, _ -> },
     val aoAbrirMenuServidor: () -> Unit = {},
     val aoAbrirMenuStatus: () -> Unit = {},
     val aoCriarCanal: (servidor: Long, categoria: Boolean, pai: Long?) -> Unit = { _, _, _ -> },
@@ -71,16 +72,19 @@ fun PainelDeCanais(
     acoes: AcoesPainel,
     modifier: Modifier = Modifier,
     largura: androidx.compose.ui.unit.Dp = LARGURA_PAINEL.dp,
+    voz: DadosDeVoz = DadosDeVoz(),
+    acoesVoz: AcoesDeVoz = AcoesDeVoz(),
 ) {
     Column(modifier.width(largura).fillMaxHeight().background(Grafite.L1)) {
         Column(Modifier.weight(1f)) {
             if (servidor != null) {
                 CabecalhoDoServidor(servidor.name, menuServidorAberto, acoes.aoAbrirMenuServidor)
-                ArvoreDeCanais(estado, servidor, destino, recolhidas, acoes, Modifier.weight(1f))
+                ArvoreDeCanais(estado, servidor, destino, recolhidas, acoes, Modifier.weight(1f), voz)
             } else {
                 ListaDeMensagensDiretas(estado, destino, acoes, Modifier.weight(1f))
             }
         }
+        if (voz.estado.naChamada) CartaoDeVoz(voz.estado, localDaVoz(estado, voz.estado.canal), voz.agoraMs, acoesVoz)
         CartaoDoUsuario(estado, acoes.aoAbrirMenuStatus)
     }
 }
@@ -112,9 +116,10 @@ fun ArvoreDeCanais(
     recolhidas: Set<Long>,
     acoes: AcoesPainel,
     modifier: Modifier = Modifier,
+    voz: DadosDeVoz = DadosDeVoz(),
 ) {
     val dono = sv.owner == estado.eu?.id
-    val atual = (destino as? Destino.Canal)?.takeIf { it.servidor == sv.id }?.canal
+    val atual = ((destino as? Destino.Canal)?.takeIf { it.servidor == sv.id }?.canal) ?: ((destino as? Destino.Voz)?.takeIf { it.servidor == sv.id }?.canal)
     val categorias = sv.channels.filter { it.kind == Channel.CATEGORIA }.sortedWith(compareBy({ it.position }, { it.id }))
     fun filhos(pai: Long?) = sv.channels.filter { c ->
         (c.kind == Channel.TEXTO || c.kind == Channel.VOZ) &&
@@ -123,7 +128,7 @@ fun ArvoreDeCanais(
 
     val soltos = filhos(null)
     LazyColumn(modifier, contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 8.dp)) {
-        items(soltos, key = { it.id }) { c -> LinhaDeCanal2(estado, sv, c, atual, acoes) }
+        items(soltos, key = { it.id }) { c -> LinhaDeCanal2(estado, sv, c, atual, acoes, voz) }
         categorias.forEachIndexed { i, cat ->
             val recolhida = cat.id in recolhidas
             item(key = "cat-${cat.id}") {
@@ -134,15 +139,15 @@ fun ArvoreDeCanais(
             val visiveis = filhos(cat.id).filter { c ->
                 !recolhida || c.id == atual || c.id in estado.naoLidos || estado.voz.any { it.channelId == c.id }
             }
-            items(visiveis, key = { it.id }) { c -> LinhaDeCanal2(estado, sv, c, atual, acoes) }
+            items(visiveis, key = { it.id }) { c -> LinhaDeCanal2(estado, sv, c, atual, acoes, voz) }
         }
     }
 }
 
 @Composable
-private fun LinhaDeCanal2(estado: AppState, sv: ServerInfo, c: Channel, atual: Long?, acoes: AcoesPainel) {
+private fun LinhaDeCanal2(estado: AppState, sv: ServerInfo, c: Channel, atual: Long?, acoes: AcoesPainel, voz: DadosDeVoz) {
     if (c.kind == Channel.VOZ) {
-        LinhaDeVoz(estado, sv, c, acoes)
+        LinhaDeVoz(estado, sv, c, acoes, voz.estado, selecionado = c.id == atual, euId = estado.eu?.id ?: 0L)
         return
     }
     val selecionado = c.id == atual
@@ -178,21 +183,27 @@ private fun LinhaDeCanal2(estado: AppState, sv: ServerInfo, c: Channel, atual: L
 }
 
 @Composable
-private fun LinhaDeVoz(estado: AppState, sv: ServerInfo, c: Channel, acoes: AcoesPainel) {
+private fun LinhaDeVoz(estado: AppState, sv: ServerInfo, c: Channel, acoes: AcoesPainel, voz: EstadoDeVoz, selecionado: Boolean, euId: Long) {
     val membros = estado.voz.filter { it.channelId == c.id }
-    Toque({ acoes.aoCliqueEmVoz() }, Modifier.fillMaxWidth().height(ALTURA_LINHA.dp), Formas.Linha, fundo = Grafite.L1, fundoPressionado = Grafite.L2) {
+    val nesteCanal = voz.naChamada && voz.canal == c.id
+    Toque({ acoes.aoCliqueEmVoz(sv.id, c.id) }, Modifier.fillMaxWidth().height(ALTURA_LINHA.dp), Formas.Linha, fundo = if (selecionado) Grafite.L3 else Grafite.L1, fundoPressionado = Grafite.L2) {
         Row(Modifier.fillMaxSize().padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.width(20.dp), contentAlignment = Alignment.CenterStart) { IconeAltoFalante(Grafite.Apagado) }
+            Box(Modifier.width(20.dp), contentAlignment = Alignment.CenterStart) { IconeAltoFalante(if (nesteCanal) Grafite.Ok else Grafite.Apagado) }
             Spacer(Modifier.width(8.dp))
-            Text(c.name, style = Tipos.Corpo.copy(color = Grafite.Texto2), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            Text(c.name, style = Tipos.Corpo.copy(color = if (selecionado || nesteCanal) Grafite.Texto else Grafite.Texto2), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
         }
     }
     for (v in membros) {
         val nome = sv.members.firstOrNull { it.id == v.userId }?.name ?: "?"
-        Row(Modifier.fillMaxWidth().height(32.dp).padding(start = 28.dp), verticalAlignment = Alignment.CenterVertically) {
-            Avatar(nome, v.userId, 22.dp, fundo = Grafite.L1)
+        val eu = v.userId == euId
+        val falando = if (eu) voz.euFalando && !voz.mudo && !voz.surdo else v.userId in voz.falando
+        val mudo = if (eu && nesteCanal) voz.mudo || voz.surdo else v.muted || v.deafened
+        Row(Modifier.fillMaxWidth().height(32.dp).padding(start = 28.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Avatar(nome, v.userId, 22.dp, fundo = Grafite.L1, falando = falando)
             Spacer(Modifier.width(8.dp))
-            Text(nome, style = Tipos.Corpo.copy(fontSize = 13.5.sp, color = if (v.muted || v.deafened) Grafite.Apagado else Grafite.Texto2), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(nome, style = Tipos.Corpo.copy(fontSize = 13.5.sp, color = if (mudo) Grafite.Apagado else Grafite.Texto2), maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            if (if (eu && nesteCanal) voz.surdo else v.deafened) IconeFones(Grafite.Apagado, cortado = true, tamanho = 14.dp)
+            else if (mudo) IconeMicrofone(Grafite.Apagado, cortado = true, tamanho = 14.dp)
         }
     }
 }

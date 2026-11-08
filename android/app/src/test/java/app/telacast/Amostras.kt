@@ -143,8 +143,11 @@ object AmostrasDeConversa {
     const val ID_IMAGEM_VERTICAL = 5002L
     const val ID_ARQUIVO = 5003L
     const val ID_TEXTO = 5004L
+    const val ID_FOTO_EXIF = 5005L
     val anexoImagem = app.telacast.proto.Attachment(ID_IMAGEM, "praia.png", "image/png", 482_913, 1280, 720)
     val anexoVertical = app.telacast.proto.Attachment(ID_IMAGEM_VERTICAL, "retrato.jpg", "image/jpeg", 220_000, 600, 900)
+    /** Foto de celular em pé: o arquivo é 900 x 600 cru (EXIF 6) e a miniatura do servidor já vem em pé (proporção 2:3). */
+    val anexoFotoExif = app.telacast.proto.Attachment(ID_FOTO_EXIF, "selfie.jpg", "image/jpeg", 3_100_000, 900, 600)
     val anexoPdf = app.telacast.proto.Attachment(ID_ARQUIVO, "relatório-final.pdf", "application/octet-stream", 1_048_576, 0, 0)
     val anexoTexto = app.telacast.proto.Attachment(ID_TEXTO, "Main.kt", "application/octet-stream", 1_900, 0, 0)
 
@@ -152,6 +155,10 @@ object AmostrasDeConversa {
         when (n) { 1 -> "package app.telacast"; 2 -> ""; 3 -> "fun main() {"; 14 -> "}"; else -> "    println(\"linha $n\")" }
     }
     val previaDeTexto = app.telacast.arquivos.PreviaDeTexto(textoDoAnexo, 14, 0)
+
+    val conversaFotoExif = listOf(
+        m(3101, marina, ms(7, 11, 0), "Selfie de hoje (a miniatura vem em pé):", anexos = listOf(anexoFotoExif)),
+    )
 
     val conversaAnexos = listOf(
         m(3001, marina, ms(7, 11, 0), "Fotos da viagem e o relatório:", anexos = listOf(anexoImagem, anexoPdf)),
@@ -174,8 +181,18 @@ object AmostrasDeConversa {
     val bmpRetrato by lazy { bitmap(300, 450, Color(0xFF3B3548), Color(0xFF4A3A36), Color(0xFFCFC6E6)) }
     val bmpMiniatura by lazy { bitmap(240, 240, Color(0xFF4B4530), Color(0xFF33404F), Color(0xFFEAD9A4)) }
 
+    private fun bitmapDe(id: Long) = when (id) { ID_IMAGEM -> bmpPaisagem; ID_IMAGEM_VERTICAL, ID_FOTO_EXIF -> bmpRetrato; else -> null }
+
+    /** Só as MINIATURAS na memória (o original ainda não chegou): a lista e a tela cheia mostram a miniatura. */
+    fun provedorSoMiniaturas() = app.telacast.ui.ProvedorDeAnexos(
+        miniaturaDoAnexoEmCache = { bitmapDe(it.id) },
+        imagem = { kotlinx.coroutines.awaitCancellation() }, // o original ainda está baixando
+        previaEmCache = { if (it.id == ID_TEXTO) previaDeTexto else null },
+    )
+
     fun provedor() = app.telacast.ui.ProvedorDeAnexos(
-        imagemEmCache = { when (it.id) { ID_IMAGEM -> bmpPaisagem; ID_IMAGEM_VERTICAL -> bmpRetrato; else -> null } },
+        imagemEmCache = { bitmapDe(it.id)?.takeIf { _ -> it.id != ID_FOTO_EXIF } },
+        miniaturaDoAnexoEmCache = { bitmapDe(it.id) },
         previaEmCache = { if (it.id == ID_TEXTO) previaDeTexto else null },
         miniaturaEmCache = { if (it.nome.endsWith(".png")) bmpMiniatura else null },
     )

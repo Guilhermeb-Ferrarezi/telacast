@@ -1,5 +1,7 @@
 package app.telacast.armazenamento
 
+import app.telacast.voz.OpcoesDeVoz
+
 /** Preferências simples do app (nada secreto aqui). Puro Kotlin: o Android entra só em [PreferenciasAndroid]. */
 interface Preferencias {
     /** Último servidor digitado (`host:porta` ou URL). */
@@ -13,6 +15,8 @@ interface Preferencias {
     var ultimoServidor: Long
     /** Tamanho do texto das mensagens: 0 pequeno, 1 normal, 2 grande. */
     var tamanhoDoTexto: Int
+    /** Opções de voz (supressão de ruído, eco, ganho, sensibilidade). */
+    var opcoesDeVoz: OpcoesDeVoz
     /** Rascunho do compositor por canal (some ao enviar). */
     fun rascunho(canal: Long): String
     fun salvarRascunho(canal: Long, texto: String)
@@ -32,6 +36,7 @@ class PreferenciasEmMemoria(
     override var ultimoCanal: Long = 0,
     override var ultimoServidor: Long = 0,
     override var tamanhoDoTexto: Int = 1,
+    override var opcoesDeVoz: OpcoesDeVoz = OpcoesDeVoz(),
 ) : Preferencias {
     private val rascunhos = HashMap<Long, String>()
     override fun rascunho(canal: Long) = rascunhos[canal].orEmpty()

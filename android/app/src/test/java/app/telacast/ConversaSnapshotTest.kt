@@ -48,10 +48,10 @@ class ConversaSnapshotTest {
                       spoilers: Set<Pair<Long, Int>> = emptySet(), textosAbertos: Set<Long> = emptySet(), reveladas: Set<Long> = emptySet(), foco: Boolean = false) =
         DadosDaConversa(compositor, anexos, spoilers, textosAbertos, reveladas, agora, AmostrasDeConversa.zona, foco)
 
-    private fun tela(nome: String, estado: app.telacast.data.AppState, nav: Navegacao = emCanal, dados: DadosDaConversa = dados(), aviso: String? = null) {
+    private fun tela(nome: String, estado: app.telacast.data.AppState, nav: Navegacao = emCanal, dados: DadosDaConversa = dados(), aviso: String? = null, provedor: app.telacast.ui.ProvedorDeAnexos = AmostrasDeConversa.provedor()) {
         paparazzi.snapshot(nome) {
             GrafiteTheme {
-                CompositionLocalProvider(LocalProvedorDeAnexos provides AmostrasDeConversa.provedor()) {
+                CompositionLocalProvider(LocalProvedorDeAnexos provides provedor) {
                     TelaPrincipal(estado, nav, emptySet(), aviso, AcoesPrincipais(), conversa = dados)
                 }
             }
@@ -140,4 +140,12 @@ class ConversaSnapshotTest {
     )
     @Test fun imagem_tela_cheia() = tela("imagem_tela_cheia", estado(AmostrasDeConversa.conversaAnexos), nav = emCanal.abrirDialogo(Dialogo.Imagem(AmostrasDeConversa.anexoImagem)))
     @Test fun texto_tela_cheia() = tela("texto_tela_cheia", estado(AmostrasDeConversa.conversaAnexos), nav = emCanal.abrirDialogo(Dialogo.Texto(AmostrasDeConversa.anexoTexto)))
+
+    // ---------------------------------------------------------------- C3: miniaturas
+    @Test fun imagem_tela_cheia_so_miniatura() = tela(
+        "imagem_tela_cheia_so_miniatura", estado(AmostrasDeConversa.conversaAnexos), nav = emCanal.abrirDialogo(Dialogo.Imagem(AmostrasDeConversa.anexoImagem)),
+        provedor = AmostrasDeConversa.provedorSoMiniaturas(),
+    )
+    @Test fun foto_com_eixos_trocados_pelo_exif() = tela("foto_com_eixos_trocados_pelo_exif", estado(AmostrasDeConversa.conversaFotoExif))
+    @Test fun lista_so_com_miniaturas() = tela("lista_so_com_miniaturas", estado(AmostrasDeConversa.conversaAnexos), provedor = AmostrasDeConversa.provedorSoMiniaturas())
 }

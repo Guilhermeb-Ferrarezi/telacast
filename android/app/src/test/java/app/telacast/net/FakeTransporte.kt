@@ -37,6 +37,15 @@ class FakeConexao(val url: String, private val ouvinte: OuvinteTransporte) : Con
         return true
     }
 
+    /** Quadros binários que o cliente mandou (voz). */
+    val binarios: MutableList<ByteArray> = Collections.synchronizedList(mutableListOf())
+
+    override fun enviarBinario(dados: ByteArray): Boolean {
+        if (fechada) return false
+        binarios += dados
+        return true
+    }
+
     override fun fechar() {
         if (!fechada) { fechada = true; ouvinte.aoFim("fechada (1000)") }
     }

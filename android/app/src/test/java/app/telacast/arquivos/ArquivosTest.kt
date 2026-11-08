@@ -18,13 +18,15 @@ import org.junit.Test
 class ApiFalsa : ApiDeArquivos {
     val downloads = mutableListOf<String>()
     var bytesDoDownload: ByteArray? = ByteArray(10)
+    /** Resposta específica por URL (ausente = `bytesDoDownload`). */
+    val respostas = mutableMapOf<String, ByteArray?>()
     val envios = mutableListOf<Pair<String, CompletableDeferred<Attachment>>>()
     var simultaneosMax = 0
     private var simultaneos = 0
     val previas = mutableListOf<String>()
     var previa: PreviaDeTexto? = PreviaDeTexto("a\nb", 2, 0)
 
-    override suspend fun baixar(url: String, maxBytes: Long): ByteArray? { downloads += url; kotlinx.coroutines.yield(); return bytesDoDownload }
+    override suspend fun baixar(url: String, maxBytes: Long): ByteArray? { downloads += url; kotlinx.coroutines.yield(); return if (url in respostas) respostas[url] else bytesDoDownload }
     override suspend fun previa(url: String, total: Long): PreviaDeTexto? { previas += url; return previa }
     override suspend fun enviar(url: String, fonte: FonteDeArquivo, progresso: (Long) -> Unit): Attachment {
         val d = CompletableDeferred<Attachment>()
@@ -101,6 +103,87 @@ class ArquivosTest {
         api.bytesDoDownload = ByteArray(3)
         val d = CarregadorDeImagens<String>(api, backgroundScope, { null }, { 1 })
         assertNull(d.obter(anexo(2), "u"))
+    }
+
+    // ---------------------------------------------------------------- miniaturas (C3)
+
+    @Test fun urlDaMiniaturaTemThumbEMantemATokenENome() {
+        val a = anexo(7, nome = "férias 1.png")
+        assertEquals("http://h/files/7/f%C3%A9rias%201.png?token=T&thumb=1", Arquivos.urlMiniatura("http://h", a, "T"))
+        assertEquals("o original continua sem thumb", "http://h/files/7/f%C3%A9rias%201.png?token=T", Arquivos.url("http://h", a, "T"))
+    }
+
+    @Test fun miniaturaEOriginalTemCachesSeparadosEDownloadsSeparados() = runTest {
+        val api = ApiFalsa().also { it.respostas["m"] = ByteArray(3); it.respostas["o"] = ByteArray(9) }
+        val c = CarregadorDeImagens<String>(api, backgroundScope, { "bmp${it.size}" }, { 10 })
+        val a = anexo(1)
+        assertNull(c.miniaturaEmCache(1)); assertNull(c.emCache(1))
+        assertEquals("bmp3", c.obterMiniatura(a, "m", "o"))
+        assertEquals("a miniatura não enche o cache do original", null, c.emCache(1))
+        assertEquals("bmp3", c.miniaturaEmCache(1))
+        assertEquals("bmp9", c.obter(a, "o"))
+        assertEquals("bmp9", c.emCache(1))
+        assertEquals("com o original na memória a lista usa ele", "bmp9", c.obterMiniatura(a, "m", "o"))
+        assertEquals(1, c.downloadsDeMiniatura)
+        assertEquals(listOf("m", "o"), api.downloads)
+    }
+
+    @Test fun miniaturaBaixaUmaVezSoMesmoComVariosPedidos() = runTest {
+        val api = ApiFalsa()
+        val c = CarregadorDeImagens<String>(api, backgroundScope, { "t${it.size}" }, { 10 })
+        val a = anexo(1)
+        val r = listOf(async { c.obterMiniatura(a, "m", "o") }, async { c.obterMiniatura(a, "m", "o") }, async { c.obterMiniatura(a, "m", "o") })
+        advanceUntilIdle()
+        assertEquals(3, r.map { it.await() }.size)
+        assertEquals(1, c.downloadsDeMiniatura)
+        assertEquals(0, c.downloads)
+    }
+
+    @Test fun seOOriginalJaEstaNaMemoriaAListaUsaEleENaoBaixaMiniatura() = runTest {
+        val api = ApiFalsa().also { it.respostas["o"] = ByteArray(9) }
+        val c = CarregadorDeImagens<String>(api, backgroundScope, { "bmp${it.size}" }, { 10 })
+        c.obter(anexo(1), "o")
+        assertEquals("bmp9", c.miniaturaEmCache(1))
+        assertEquals("bmp9", c.obterMiniatura(anexo(1), "m", "o"))
+        assertEquals(listOf("o"), api.downloads)
+    }
+
+    @Test fun servidorAntigoSemThumbDevolveOOriginalEServeIgual() = runTest {
+        // o servidor ignora `thumb` e manda o arquivo inteiro: o cliente só decodifica o que veio
+        val api = ApiFalsa().also { it.respostas["m"] = ByteArray(8_000) }
+        val c = CarregadorDeImagens<String>(api, backgroundScope, { "bmp${it.size}" }, { 10 })
+        assertEquals("bmp8000", c.obterMiniatura(anexo(1), "m", "o"))
+        assertEquals(listOf("m"), api.downloads)
+    }
+
+    @Test fun miniaturaQueFalhaCaiParaOOriginal() = runTest {
+        val api = ApiFalsa().also { it.respostas["m"] = null; it.respostas["o"] = ByteArray(9) }
+        val c = CarregadorDeImagens<String>(api, backgroundScope, { "bmp${it.size}" }, { 10 })
+        assertEquals("bmp9", c.obterMiniatura(anexo(1), "m", "o"))
+        assertEquals(listOf("m", "o"), api.downloads)
+    }
+
+    @Test fun semMiniaturaNemOriginalVoltaNulo() = runTest {
+        val api = ApiFalsa().also { it.bytesDoDownload = null }
+        val c = CarregadorDeImagens<String>(api, backgroundScope, { "x" }, { 1 })
+        assertNull(c.obterMiniatura(anexo(1), "m", "o"))
+    }
+
+    @Test fun dimensoesDeExibicaoFicamComAsDoAnexoQuandoAProporcaoBate() {
+        val a = anexo(1, w = 4000, h = 3000)
+        assertEquals(4000 to 3000, Arquivos.dimensoesDeExibicao(a, 1024, 768))
+        assertEquals("bitmap reduzido por inSampleSize", 4000 to 3000, Arquivos.dimensoesDeExibicao(a, 500, 375))
+    }
+
+    @Test fun dimensoesDeExibicaoTrocamQuandoAMiniaturaVemComEixosTrocados() {
+        // foto de celular em pé: o anexo diz 4000 x 3000 (cru, EXIF 6), a miniatura já vem em pé: 768 x 1024
+        val a = anexo(1, w = 4000, h = 3000)
+        assertEquals(3000 to 4000, Arquivos.dimensoesDeExibicao(a, 768, 1024))
+    }
+
+    @Test fun dimensoesDeExibicaoUsamOBitmapQuandoNadaBate() {
+        assertEquals(640 to 480, Arquivos.dimensoesDeExibicao(anexo(1, w = 100, h = 100), 640, 480))
+        assertEquals(10 to 20, Arquivos.dimensoesDeExibicao(anexo(1, w = 0, h = 0), 10, 20))
     }
 
     @Test fun previaTemCache() = runTest {

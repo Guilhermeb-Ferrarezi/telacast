@@ -29,6 +29,28 @@ object Arquivos {
     /** `GET /files/{id}/{nome}?token=` (o nome é decorativo). */
     fun url(base: String, a: Attachment, token: String) = "$base/files/${a.id}/${codificar(a.name)}?token=$token"
 
+    /**
+     * Miniatura de imagem (`&thumb=1`): o servidor devolve um JPEG/PNG de até 1024 px e, se não puder (imagem já pequena,
+     * GIF, animado, arquivo inválido, servidor antigo), devolve o ORIGINAL. O cliente tem que aceitar os dois.
+     */
+    fun urlMiniatura(base: String, a: Attachment, token: String) = url(base, a, token) + "&thumb=1"
+
+    /**
+     * Dimensões para desenhar a imagem já decodificada. `Attachment.width/height` são as CRUAS do arquivo; numa foto com
+     * orientação EXIF 5 a 8 a miniatura vem com largura e altura trocadas (o servidor aplica a orientação), e o bitmap
+     * decodificado pode ter sido reduzido por `inSampleSize`. Por isso o que manda é a proporção do bitmap: se bate com a
+     * do anexo, vale o tamanho do anexo; se bate com a trocada, vale o anexo trocado; senão, o próprio bitmap.
+     */
+    fun dimensoesDeExibicao(a: Attachment, bmpLargura: Int, bmpAltura: Int): Pair<Int, Int> {
+        if (bmpLargura <= 0 || bmpAltura <= 0 || a.width <= 0 || a.height <= 0) return bmpLargura to bmpAltura
+        fun parecido(w1: Int, h1: Int, w2: Int, h2: Int) = kotlin.math.abs(w1.toLong() * h2 - h1.toLong() * w2) * 50 <= maxOf(w1.toLong() * h2, h1.toLong() * w2)
+        return when {
+            parecido(bmpLargura, bmpAltura, a.width, a.height) -> a.width to a.height
+            parecido(bmpLargura, bmpAltura, a.height, a.width) -> a.height to a.width
+            else -> bmpLargura to bmpAltura
+        }
+    }
+
     fun urlDeUpload(base: String, token: String, canal: Long, nome: String) = "$base/upload?token=$token&channel=$canal&name=${codificar(nome)}"
 
     private val EXTENSOES_DE_TEXTO = setOf(

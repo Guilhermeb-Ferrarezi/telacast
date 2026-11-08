@@ -102,6 +102,13 @@ class Gateway(
         return c.enviar(Proto.escreverC2S(msg))
     }
 
+    /** Manda um quadro binário (áudio). `false` se não está autenticado. Não bloqueia. */
+    fun enviarBinario(dados: ByteArray): Boolean {
+        val c = conexao ?: return false
+        if (_estado.value != EstadoConexao.Conectado) return false
+        return c.enviarBinario(dados)
+    }
+
     /** `Logout` (revoga o token no servidor) e desconecta. */
     fun sair() {
         val c = conexao

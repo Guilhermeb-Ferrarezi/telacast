@@ -31,7 +31,8 @@ class CacheLru<V : Any>(private val maxBytes: Long, private val tamanho: (V) -> 
 }
 
 /**
- * Baixa e decodifica imagens de anexos (sem Coil): cache LRU em memória e um só download por anexo mesmo com vários
+ * Baixa e decodifica imagens de anexos (sem Coil). Duas camadas de cache em memória, separadas: a das MINIATURAS (a
+ * que a lista do chat usa) e a dos ORIGINAIS (tela cheia). Um só download por anexo e por camada, mesmo com vários
  * pedidos ao mesmo tempo. `T` é o bitmap da plataforma (`ImageBitmap` no app; qualquer coisa nos testes).
  */
 class CarregadorDeImagens<T : Any>(
@@ -40,23 +41,32 @@ class CarregadorDeImagens<T : Any>(
     private val decodificar: (ByteArray) -> T?,
     tamanho: (T) -> Long,
     maxBytesDeCache: Long = 48L shl 20,
+    maxBytesDeMiniaturas: Long = 32L shl 20,
 ) {
-    private val cache = CacheLru(maxBytesDeCache, tamanho)
-    private val emAndamento = HashMap<Long, Deferred<T?>>()
+    private class Camada<T : Any>(maxBytes: Long, tamanho: (T) -> Long) {
+        val cache = CacheLru(maxBytes, tamanho)
+        val emAndamento = HashMap<Long, Deferred<T?>>()
+    }
+
+    private val originais = Camada(maxBytesDeCache, tamanho)
+    private val miniaturas = Camada(maxBytesDeMiniaturas, tamanho)
+
+    /** Downloads do original e da miniatura (para os testes conferirem o "um só download"). */
     @Volatile var downloads = 0
         private set
+    @Volatile var downloadsDeMiniatura = 0
+        private set
 
-    /** `null` se não baixou ou não decodificou (a tela mostra o cartão de arquivo). */
-    suspend fun obter(a: Attachment, url: String): T? {
-        cache.obter(a.id)?.let { return it }
-        val d = synchronized(emAndamento) {
-            emAndamento.getOrPut(a.id) {
+    private suspend fun carregar(camada: Camada<T>, a: Attachment, url: String, contar: () -> Unit): T? {
+        camada.cache.obter(a.id)?.let { return it }
+        val d = synchronized(camada.emAndamento) {
+            camada.emAndamento.getOrPut(a.id) {
                 escopo.async {
-                    downloads++
+                    contar()
                     val bytes = api.baixar(url, Arquivos.MAX_IMAGEM_BYTES)
                     val bmp = bytes?.let(decodificar)
-                    if (bmp != null) cache.guardar(a.id, bmp)
-                    synchronized(emAndamento) { emAndamento.remove(a.id) }
+                    if (bmp != null) camada.cache.guardar(a.id, bmp)
+                    synchronized(camada.emAndamento) { camada.emAndamento.remove(a.id) }
                     bmp
                 }
             }
@@ -64,8 +74,25 @@ class CarregadorDeImagens<T : Any>(
         return d.await()
     }
 
-    fun emCache(id: Long): T? = cache.obter(id)
-    val bytesEmCache: Long get() = cache.bytes
+    /** O ORIGINAL. `null` se não baixou ou não decodificou (a tela mostra o cartão de arquivo, ou fica com a miniatura). */
+    suspend fun obter(a: Attachment, url: String): T? = carregar(originais, a, url) { downloads++ }
+
+    /**
+     * A MINIATURA (`urlMiniatura`). O servidor pode devolver o original no lugar (imagem pequena, GIF...): serve igual.
+     * Se o pedido falhar (servidor sem suporte a `thumb`, erro de rede), cai para o original em `urlOriginal`.
+     */
+    suspend fun obterMiniatura(a: Attachment, urlMiniatura: String, urlOriginal: String): T? {
+        originais.cache.obter(a.id)?.let { return it } // se o original já está na memória, nem baixa a miniatura
+        return carregar(miniaturas, a, urlMiniatura) { downloadsDeMiniatura++ } ?: obter(a, urlOriginal)
+    }
+
+    fun emCache(id: Long): T? = originais.cache.obter(id)
+
+    /** A melhor imagem que já está na memória para a lista: a miniatura, ou o original se for o que há. */
+    fun miniaturaEmCache(id: Long): T? = miniaturas.cache.obter(id) ?: originais.cache.obter(id)
+
+    val bytesEmCache: Long get() = originais.cache.bytes
+    val bytesEmMiniaturas: Long get() = miniaturas.cache.bytes
 }
 
 /** Prévias de texto (só o começo do arquivo), com cache simples. */

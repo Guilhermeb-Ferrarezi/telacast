@@ -33,6 +33,7 @@ import app.telacast.proto.User
 import app.telacast.tema.Formas
 import app.telacast.tema.Grafite
 import app.telacast.tema.Tipos
+import app.telacast.voz.OpcoesDeVoz
 
 class AcoesDeAjustes(
     val aoFechar: () -> Unit = {},
@@ -41,6 +42,7 @@ class AcoesDeAjustes(
     val aoEncerrarOutras: () -> Unit = {},
     val aoEscolherTamanho: (Int) -> Unit = {},
     val aoSair: () -> Unit = {},
+    val aoMudarVoz: ((OpcoesDeVoz) -> OpcoesDeVoz) -> Unit = {},
 )
 
 /** Multiplicador do tamanho do texto das mensagens: 0 pequeno, 1 normal, 2 grande. */
@@ -51,7 +53,7 @@ fun escalaDoTexto(nivel: Int): Float = when (nivel) { 0 -> 0.9f; 2 -> 1.15f; els
  * `senhaTrocada` muda quando o servidor confirma a troca, e então os campos de senha são limpos.
  */
 @Composable
-fun TelaDeAjustes(eu: User, sessoes: List<SessionInfo>, agoraMs: Long, tamanho: Int, senhaTrocada: Int, a: AcoesDeAjustes) {
+fun TelaDeAjustes(eu: User, sessoes: List<SessionInfo>, agoraMs: Long, tamanho: Int, senhaTrocada: Int, a: AcoesDeAjustes, voz: OpcoesDeVoz = OpcoesDeVoz()) {
     TelaCheia("Ajustes", a.aoFechar) {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Rotulo("Conta")
@@ -63,6 +65,10 @@ fun TelaDeAjustes(eu: User, sessoes: List<SessionInfo>, agoraMs: Long, tamanho: 
                     Text("@${eu.name} · ${eu.status.rotulo()}", style = Tipos.Pequeno.copy(color = Grafite.Apagado))
                 }
             }
+
+            Spacer(Modifier.height(8.dp))
+            Rotulo("Voz")
+            SecaoDeVoz(voz, a.aoMudarVoz)
 
             Spacer(Modifier.height(8.dp))
             Rotulo("Trocar senha")
@@ -122,5 +128,49 @@ private fun FormularioDeSenha(aoTrocar: (String, String) -> Unit) {
         Campo(repetir, { repetir = it }, "Repita a nova senha", senha = true, teclado = teclado)
         if (naoConfere) Text("As senhas não conferem.", style = Tipos.Corpo.copy(fontSize = 12.5.sp, color = Grafite.Vermelho))
         Botao("Trocar senha", TipoBotao.Primario, Modifier.fillMaxWidth(), habilitado = pronto, aoClicar = { aoTrocar(atual, nova) })
+    }
+}
+
+/** Opções do chat de voz: efeitos do Android (ruído, eco, ganho automático), sensibilidade do microfone e ganho de entrada. */
+@Composable
+fun SecaoDeVoz(o: OpcoesDeVoz, aoMudar: ((OpcoesDeVoz) -> OpcoesDeVoz) -> Unit) {
+    Column(Modifier.fillMaxWidth().background(Grafite.L3, Formas.Cartao).padding(vertical = 4.dp)) {
+        Interruptor("Supressão de ruído", "Filtra ruído de fundo (efeito do Android, se o aparelho tiver).", o.supressaoDeRuido) { v -> aoMudar { it.copy(supressaoDeRuido = v) } }
+        Interruptor("Cancelamento de eco", "Evita que a voz dos outros volte pelo seu microfone.", o.cancelamentoDeEco) { v -> aoMudar { it.copy(cancelamentoDeEco = v) } }
+        Interruptor("Ganho automático", "Mantém o volume da sua voz parecido.", o.ganhoAutomatico) { v -> aoMudar { it.copy(ganhoAutomatico = v) } }
+        DeslizanteDeVoz("Sensibilidade do microfone", "${(o.sensibilidade * 100).toInt()}%", o.sensibilidade, 0f..1f) { v -> aoMudar { it.copy(sensibilidade = v) } }
+        DeslizanteDeVoz("Ganho de entrada", "${"%.1f".format(o.ganhoDeEntrada)}x", o.ganhoDeEntrada, 0.5f..4f) { v -> aoMudar { it.copy(ganhoDeEntrada = v) } }
+    }
+}
+
+@Composable
+private fun Interruptor(titulo: String, descricao: String, ligado: Boolean, aoMudar: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(titulo, style = Tipos.Corpo.copy(fontSize = 14.5.sp))
+            Text(descricao, style = Tipos.Pequeno.copy(fontSize = 12.sp, color = Grafite.Apagado))
+        }
+        Spacer(Modifier.width(12.dp))
+        androidx.compose.material3.Switch(
+            ligado, aoMudar,
+            colors = androidx.compose.material3.SwitchDefaults.colors(
+                checkedThumbColor = Grafite.L0, checkedTrackColor = Grafite.Ambar, checkedBorderColor = Grafite.Ambar,
+                uncheckedThumbColor = Grafite.Texto2, uncheckedTrackColor = Grafite.L4, uncheckedBorderColor = Grafite.Linha2,
+            ),
+        )
+    }
+}
+
+@Composable
+private fun DeslizanteDeVoz(titulo: String, valor: String, atual: Float, faixa: ClosedFloatingPointRange<Float>, aoMudar: (Float) -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(titulo, style = Tipos.Corpo.copy(fontSize = 14.5.sp))
+            Text(valor, style = Tipos.Pequeno.copy(color = Grafite.Apagado))
+        }
+        androidx.compose.material3.Slider(
+            atual, aoMudar, valueRange = faixa,
+            colors = androidx.compose.material3.SliderDefaults.colors(thumbColor = Grafite.Ambar, activeTrackColor = Grafite.Ambar, inactiveTrackColor = Grafite.L4),
+        )
     }
 }

@@ -20,6 +20,9 @@ import app.telacast.estado.TextosDeErro
 import app.telacast.net.Credencial
 import app.telacast.proto.Channel
 import app.telacast.proto.Status
+import app.telacast.voz.EstadoDeVoz
+import app.telacast.voz.OpcoesDeVoz
+import app.telacast.voz.RotaDeAudio
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,6 +30,9 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -57,7 +63,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
     val recolhidas: StateFlow<Set<Long>> = _recolhidas.asStateFlow()
 
     private val _aviso = MutableStateFlow<String?>(null)
-    /** Aviso curto (erro do servidor, "voz em breve"); some sozinho. */
+    /** Aviso curto (erro do servidor ou da voz); some sozinho. */
     val aviso: StateFlow<String?> = _aviso.asStateFlow()
     private var jobAviso: Job? = null
 
@@ -76,6 +82,8 @@ class AppViewModel(private val c: Container) : ViewModel() {
     init {
         escopo.launch { repo.estado.collect { aoMudarEstado(it) } }
         escopo.launch { repo.avisos.collect { aoReceberAviso(it) } }
+        // erros da voz (permissão negada, microfone ocupado, queda) também viram aviso curto, mesmo fora da tela da voz
+        escopo.launch { c.voz.estado.map { it.erro }.distinctUntilChanged().filterNotNull().collect { mostrarAviso(it) } }
         retomarSessaoSalva()
     }
 
@@ -105,6 +113,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
 
     /** `Logout` (revoga o token) e volta ao formulário. */
     fun sair() {
+        c.voz.sair()
         repo.sair()
         c.cofre.apagar()
         retomando.value = false
@@ -155,6 +164,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
             Destino.Amigos -> true
             is Destino.Dm -> sn.dms.any { it.channelId == d.canal }
             is Destino.Canal -> sn.servers.any { sv -> sv.id == d.servidor && sv.channels.any { it.id == d.canal } }
+            is Destino.Voz -> sn.servers.any { sv -> sv.id == d.servidor && sv.channels.any { it.id == d.canal && it.kind == Channel.VOZ } }
         }
         if (!existe) { _nav.update { it.irPara(Destino.Amigos) }; repo.fecharCanal() }
         _nav.value.servidorNoPainel?.let { id -> if (sn.servers.none { it.id == id }) _nav.update { it.selecionarServidor(null) } }
@@ -214,6 +224,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
     val reveladas: StateFlow<Set<Long>> = _reveladas.asStateFlow()
 
     fun urlDoAnexo(a: Attachment): String = Arquivos.url(c.baseHttp(), a, repo.token.orEmpty())
+    fun urlDaMiniatura(a: Attachment): String = Arquivos.urlMiniatura(c.baseHttp(), a, repo.token.orEmpty())
 
     fun alternarSpoiler(mensagem: Long, id: Int) = _spoilers.update { val k = mensagem to id; if (k in it) it - k else it + k }
     fun alternarTexto(id: Long) = _textosAbertos.update { if (id in it) it - id else it + id }
@@ -367,7 +378,38 @@ class AppViewModel(private val c: Container) : ViewModel() {
         _nav.update { it.fecharMenu() }
     }
 
-    fun cliqueEmVoz() = mostrarAviso("Canais de voz chegam em breve.")
+    // ------------------------------------------------------------------ voz
+
+    val voz: StateFlow<EstadoDeVoz> = c.voz.estado
+
+    /** Abre a tela do canal de voz (não entra na chamada: quem entra é [entrarNaVoz], depois da permissão do microfone). */
+    fun abrirVoz(servidor: Long, canal: Long) {
+        _nav.update { it.irPara(Destino.Voz(servidor, canal)) }
+        repo.fecharCanal()
+    }
+
+    /** Toca na faixa ou no cartão da chamada: vai para a tela do canal em que você está. */
+    fun abrirTelaDaVoz() {
+        val canal = c.voz.estado.value.canal ?: return
+        val sv = repo.estado.value.snapshot?.servers?.firstOrNull { s -> s.channels.any { it.id == canal } } ?: return
+        abrirVoz(sv.id, canal)
+    }
+
+    fun entrarNaVoz(canal: Long) = c.voz.entrar(canal)
+    fun sairDaVoz() = c.voz.sair()
+    fun alternarMudo() = c.voz.alternarMudo()
+    fun alternarSurdo() = c.voz.alternarSurdo()
+    fun alternarRotaDoAudio() = c.voz.definirRota(if (c.voz.estado.value.rota == RotaDeAudio.AltoFalante) RotaDeAudio.Fone else RotaDeAudio.AltoFalante)
+    fun recusarMicrofone() = c.voz.recusar("Sem a permissão do microfone não dá para entrar na voz. Libere em Ajustes do Android > Apps > Telacast.")
+    fun abrirVolume(usuario: Long) = _nav.update { it.abrirVolume(usuario) }
+    fun fecharVolume() = _nav.update { it.fecharVolume() }
+    fun definirVolumeDe(usuario: Long, volume: Float) = c.voz.definirVolume(usuario, volume)
+
+    fun definirOpcoesDeVoz(f: (OpcoesDeVoz) -> OpcoesDeVoz) {
+        val novas = f(c.voz.estado.value.opcoes)
+        c.preferencias.opcoesDeVoz = novas
+        c.voz.definirOpcoes(novas)
+    }
 
     // amigos
     fun pedirAmizade(usuario: String) { if (usuario.isNotBlank()) repo.pedirAmizade(usuario) }

@@ -8,6 +8,8 @@ sealed interface Destino {
     data object Amigos : Destino
     data class Dm(val canal: Long) : Destino
     data class Canal(val servidor: Long, val canal: Long) : Destino
+    /** Tela de um canal de voz (participantes e botões da chamada). */
+    data class Voz(val servidor: Long, val canal: Long) : Destino
 }
 
 enum class AbaInicio(val rotulo: String) {
@@ -59,6 +61,8 @@ data class Navegacao(
     val dialogo: Dialogo? = null,
     val folha: FolhaDeMensagem? = null,
     val perfil: PerfilAberto? = null,
+    /** Folha de volume de um participante da voz. */
+    val volume: Long? = null,
     val abaInicio: AbaInicio = AbaInicio.Disponivel,
 ) {
     fun abrirGaveta() = copy(gavetaAberta = true, membrosAbertos = false, menu = null)
@@ -73,6 +77,7 @@ data class Navegacao(
     fun irPara(d: Destino): Navegacao {
         val painel = when (d) {
             is Destino.Canal -> d.servidor
+            is Destino.Voz -> d.servidor
             else -> null
         }
         return copy(destino = d, servidorNoPainel = painel, gavetaAberta = false, membrosAbertos = false, menu = null)
@@ -83,16 +88,19 @@ data class Navegacao(
     fun abrirDialogo(d: Dialogo) = copy(dialogo = d, menu = null, folha = null, perfil = null)
     fun abrirPerfil(usuario: Long, nome: String) = copy(perfil = PerfilAberto(usuario, nome), menu = null, folha = null)
     fun fecharPerfil() = copy(perfil = null)
+    fun abrirVolume(usuario: Long) = copy(volume = usuario, menu = null, folha = null)
+    fun fecharVolume() = copy(volume = null)
     fun abrirFolha(mensagem: Long, emojis: Boolean = false) = copy(folha = FolhaDeMensagem(mensagem, emojis), menu = null)
     fun fecharFolha() = copy(folha = null)
     fun fecharDialogo() = copy(dialogo = null)
     fun escolherAba(a: AbaInicio) = copy(abaInicio = a)
 
     /** Algo que o botão Voltar do sistema fecha antes de sair do app? */
-    val podeVoltar: Boolean get() = perfil != null || dialogo != null || folha != null || menu != null || membrosAbertos || gavetaAberta
+    val podeVoltar: Boolean get() = volume != null || perfil != null || dialogo != null || folha != null || menu != null || membrosAbertos || gavetaAberta
 
-    /** Voltar do sistema: fecha, nesta ordem, diálogo, folha, menu, painel de membros e gaveta. */
+    /** Voltar do sistema: fecha, nesta ordem, volume, perfil, diálogo, folha, menu, painel de membros e gaveta. */
     fun voltar(): Navegacao = when {
+        volume != null -> fecharVolume()
         perfil != null -> fecharPerfil()
         dialogo != null -> fecharDialogo()
         folha != null -> fecharFolha()

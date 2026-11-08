@@ -13,6 +13,9 @@ interface ConexaoTransporte {
     /** Enfileira um quadro de texto. `false` se a conexão já não aceita. Pode ser chamado de qualquer thread. */
     fun enviar(texto: String): Boolean
 
+    /** Enfileira um quadro binário (áudio de voz). `false` se a conexão já não aceita. Qualquer thread. */
+    fun enviarBinario(dados: ByteArray): Boolean
+
     /** Fecha com educação (o que já foi enfileirado sai antes). */
     fun fechar()
 

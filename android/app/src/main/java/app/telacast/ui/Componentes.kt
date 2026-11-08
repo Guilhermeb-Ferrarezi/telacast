@@ -55,7 +55,7 @@ fun Filete(modifier: Modifier = Modifier, cor: Color = Grafite.Linha) {
 
 /** Avatar redondo, cor suave por usuário, inicial no centro; `fundo` é a camada atrás (contorno da presença). */
 @Composable
-fun Avatar(nome: String, id: Long, tamanho: Dp = 40.dp, presenca: Presenca? = null, fundo: Color = Grafite.L2, modifier: Modifier = Modifier) {
+fun Avatar(nome: String, id: Long, tamanho: Dp = 40.dp, presenca: Presenca? = null, fundo: Color = Grafite.L2, modifier: Modifier = Modifier, falando: Boolean = false) {
     val (bg, fg) = Grafite.tomDoUsuario(id)
     val inicial = nome.trim().firstOrNull()?.uppercase() ?: "?"
     Box(
@@ -63,6 +63,11 @@ fun Avatar(nome: String, id: Long, tamanho: Dp = 40.dp, presenca: Presenca? = nu
             .size(tamanho)
             .drawBehind {
                 drawCircle(bg)
+                if (falando) { // anel verde de "falando", por dentro da borda (como `speaking_ring` do desktop)
+                    val larg = 2.5.dp.toPx(); val r = size.width / 2
+                    drawCircle(Grafite.Ok, r - larg / 2, style = androidx.compose.ui.graphics.drawscope.Stroke(larg))
+                    drawCircle(fundo, r - larg - 0.5f, style = androidx.compose.ui.graphics.drawscope.Stroke(1f))
+                }
                 if (presenca != null) desenharPresenca(presenca, fundo, tamanho.toPx())
             },
         contentAlignment = Alignment.Center,

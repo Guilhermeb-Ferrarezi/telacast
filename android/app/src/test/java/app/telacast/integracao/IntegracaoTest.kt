@@ -284,6 +284,88 @@ class IntegracaoTest {
         assertEquals(null, runBlocking { api.baixar(app.telacast.arquivos.Arquivos.url(app.telacast.arquivos.Arquivos.urlHttp(url!!), anexo, "invalido"), 1L shl 20) })
     }
 
+    // ------------------------------------------------------------------ miniaturas (C3)
+
+    /** JPEGs de `src/test/resources/imagens` (gerados uma vez com Pillow; o `exif6` leva Orientation = 6). */
+    private fun recurso(nome: String): ByteArray = IntegracaoTest::class.java.getResourceAsStream("/imagens/$nome")!!.use { it.readBytes() }
+
+    /** Largura e altura de um JPEG lendo o marcador SOF (sem AWT: o classpath do Android não tem). */
+    private fun dimensoes(b: ByteArray): Pair<Int, Int> {
+        var i = 2
+        while (i + 9 < b.size) {
+            if (b[i] != 0xFF.toByte()) { i++; continue }
+            val m = b[i + 1].toInt() and 0xFF
+            if (m in 0xC0..0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+                val h = ((b[i + 5].toInt() and 0xFF) shl 8) or (b[i + 6].toInt() and 0xFF)
+                val w = ((b[i + 7].toInt() and 0xFF) shl 8) or (b[i + 8].toInt() and 0xFF)
+                return w to h
+            }
+            i += 2 + (((b[i + 2].toInt() and 0xFF) shl 8) or (b[i + 3].toInt() and 0xFF))
+        }
+        throw AssertionError("JPEG sem SOF")
+    }
+
+    /** Contrato do servidor para `&thumb=1` e o jeito como o app usa (CarregadorDeImagens + OkHttpArquivos). */
+    @Test fun miniaturaDeImagemVemReduzidaEOOriginalContinuaIntacto() {
+        val canal = novoCanal()
+        ana.repo.abrirCanal(canal); bob.repo.abrirCanal(canal)
+        esperar("histórico") { if (ana.estado.mensagens.containsKey(canal) && bob.estado.mensagens.containsKey(canal)) true else null }
+        val grande = recurso("foto_2000x1500.jpg")
+        val pequena = recurso("foto_800x600.jpg")
+        val emPe = recurso("foto_exif6_2000x1500.jpg") // cru 2000 x 1500, mas "em pé" pelo EXIF
+        val api = app.telacast.arquivos.OkHttpArquivos()
+        val base = app.telacast.arquivos.Arquivos.urlHttp(url!!)
+        val enviador = app.telacast.arquivos.EnviadorDeAnexos(api, escopo, { base }, { ana.gateway.token })
+        assertEquals(null, enviador.adicionar(canal, listOf(
+            app.telacast.arquivos.FonteEmMemoria("grande.jpg", grande, ehImagem = true),
+            app.telacast.arquivos.FonteEmMemoria("pequena.jpg", pequena, ehImagem = true),
+            app.telacast.arquivos.FonteEmMemoria("em-pe.jpg", emPe, ehImagem = true),
+        )))
+        val prontos = esperar("3 uploads") { enviador.prontos(canal).takeIf { it.size == 3 } }
+        ana.repo.enviarMensagem(canal, "fotos", anexos = prontos)
+        esperar("bob recebe") { bob.estado.mensagens[canal]?.firstOrNull { it.content == "fotos" } }
+        val aGrande = prontos.first { it.name == "grande.jpg" }
+        val aPequena = prontos.first { it.name == "pequena.jpg" }
+        val aEmPe = prontos.first { it.name == "em-pe.jpg" }
+        assertEquals(2000 to 1500, aGrande.width to aGrande.height)
+        assertEquals("o anexo guarda as dimensões CRUAS", 2000 to 1500, aEmPe.width to aEmPe.height)
+
+        val http = okhttp3.OkHttpClient()
+        fun pegar(u: String): Triple<Int, String?, ByteArray> = http.newCall(okhttp3.Request.Builder().url(u).build()).execute().use { r -> Triple(r.code, r.header("X-Telacast-Thumb"), r.body!!.bytes()) }
+        val token = bob.gateway.token!!
+
+        val (c1, h1, miniGrande) = pegar(app.telacast.arquivos.Arquivos.urlMiniatura(base, aGrande, token))
+        assertEquals(200, c1); assertEquals("1", h1)
+        assertEquals("lado maior em 1024, proporção mantida", 1024 to 768, dimensoes(miniGrande))
+        assertTrue("a miniatura é bem menor que o original (${miniGrande.size} x ${grande.size})", miniGrande.size < grande.size)
+
+        val (c2, h2, original) = pegar(app.telacast.arquivos.Arquivos.url(base, aGrande, token))
+        assertEquals(200, c2); assertEquals("o original não leva o cabeçalho", null, h2)
+        assertEquals(grande.toList(), original.toList())
+
+        val (c3, h3, pedida) = pegar(app.telacast.arquivos.Arquivos.urlMiniatura(base, aPequena, token))
+        assertEquals(200, c3); assertEquals("imagem que já cabe volta como está, sem o cabeçalho", null, h3)
+        assertEquals(pequena.toList(), pedida.toList())
+
+        val (c4, h4, miniEmPe) = pegar(app.telacast.arquivos.Arquivos.urlMiniatura(base, aEmPe, token))
+        assertEquals(200, c4); assertEquals("1", h4)
+        assertEquals("o EXIF 6 vira a miniatura em pé: largura e altura trocadas em relação ao anexo", 768 to 1024, dimensoes(miniEmPe))
+        assertEquals("e o cliente dimensiona pelo bitmap", 1500 to 2000, app.telacast.arquivos.Arquivos.dimensoesDeExibicao(aEmPe, 768, 1024))
+
+        // sem token ou com token errado, a miniatura segue a mesma regra do download
+        assertEquals(401, pegar(app.telacast.arquivos.Arquivos.urlMiniatura(base, aGrande, "invalido")).first)
+
+        // o caminho do app: o carregador baixa a miniatura e, separado, o original
+        val carregador = app.telacast.arquivos.CarregadorDeImagens<String>(api, escopo, { b -> dimensoes(b).let { "${it.first}x${it.second}" } }, { 1 })
+        val m = runBlocking { carregador.obterMiniatura(aGrande, app.telacast.arquivos.Arquivos.urlMiniatura(base, aGrande, token), app.telacast.arquivos.Arquivos.url(base, aGrande, token)) }
+        assertEquals("1024x768", m)
+        assertEquals(null, carregador.emCache(aGrande.id))
+        val o = runBlocking { carregador.obter(aGrande, app.telacast.arquivos.Arquivos.url(base, aGrande, token)) }
+        assertEquals("2000x1500", o)
+        val p = runBlocking { carregador.obterMiniatura(aPequena, app.telacast.arquivos.Arquivos.urlMiniatura(base, aPequena, token), app.telacast.arquivos.Arquivos.url(base, aPequena, token)) }
+        assertEquals("a pequena veio inteira e serve igual", "800x600", p)
+    }
+
     // ------------------------------------------------------------------ amizade, bloqueio, fixadas, busca e conta (B7/B8)
 
     @Test fun amizadeDmEBloqueio() {
@@ -407,5 +489,78 @@ class IntegracaoTest {
         c.repo.entrar(url!!, Credencial.Registro("fulano_$sufixo", "senha-fulano", "XXXX-0000"))
         val e = esperar("convite recusado") { c.estado.erroDeEntrada }
         assertEquals(ErrorCode.InvalidInvite, e.codigo)
+    }
+
+    // ------------------------------------------------------------------ voz
+
+    private class DispositivoDeTeste : app.telacast.voz.DispositivoDeAudio {
+        override fun iniciar(): String? = null
+        override fun parar() = Unit
+        override fun definirRota(rota: app.telacast.voz.RotaDeAudio) = Unit
+        override fun aplicarOpcoes(opcoes: app.telacast.voz.OpcoesDeVoz) = Unit
+    }
+
+    /** Dois clientes reais no mesmo canal de voz: o áudio de um (seno gerado, codificado em Opus) chega ao outro, decodificado. */
+    @Test fun vozDeUmClienteChegaAoOutro() {
+        val nome = "voz-${System.nanoTime().toString().takeLast(5)}"
+        ana.repo.criarCanal(servidor, nome, Channel.VOZ)
+        val canal = esperar("canal de voz (ana)") { ana.canalPorNome(nome)?.id }
+        esperar("canal de voz (bob)") { bob.canalPorNome(nome) }
+        val anaId = ana.estado.eu!!.id
+        val bobId = bob.estado.eu!!.id
+
+        val motores = java.util.concurrent.ConcurrentHashMap<String, app.telacast.voz.MotorDeVoz>()
+        fun controlador(c: Cliente) = app.telacast.voz.ControladorDeVoz(
+            c.repo, escopo, app.telacast.voz.ConcentusOpus(),
+            { motor, _, _, _ -> motores[c.nome] = motor; DispositivoDeTeste() },
+            intervaloDoMedidorMs = 50,
+        )
+        val vozAna = controlador(ana)
+        val vozBob = controlador(bob)
+        try {
+            vozAna.entrar(canal); vozBob.entrar(canal)
+            esperar("ana conectada") { if (vozAna.estado.value.fase == app.telacast.voz.FaseDaVoz.Conectada) true else null }
+            esperar("bob conectado") { if (vozBob.estado.value.fase == app.telacast.voz.FaseDaVoz.Conectada) true else null }
+            esperar("o servidor mostra os dois na sala") { ana.estado.voz.count { it.channelId == canal }.takeIf { it == 2 } }
+            val motorAna = motores.getValue(ana.nome)
+            val motorBob = motores.getValue(bob.nome)
+
+            // ana "fala" (seno de 440 Hz, 20 ms por quadro); bob "toca" no mesmo ritmo, como o AudioTrack faria
+            val saida = ShortArray(app.telacast.voz.QUADRO)
+            var maiorRmsDeBob = 0.0
+            var maiorRmsDeAna = 0.0
+            var bobViuAnaFalando = false
+            for (q in 0 until 150) {
+                val quadro = ShortArray(app.telacast.voz.QUADRO) { i ->
+                    (0.3 * 32767 * kotlin.math.sin(2 * Math.PI * 440.0 * (q * app.telacast.voz.QUADRO + i) / app.telacast.voz.TAXA_DE_AMOSTRAGEM)).toInt().toShort()
+                }
+                motorAna.capturar(quadro)
+                motorBob.reproduzir(saida)
+                maiorRmsDeBob = maxOf(maiorRmsDeBob, Math.sqrt(saida.sumOf { it.toDouble() * it } / saida.size))
+                motorAna.reproduzir(saida)
+                maiorRmsDeAna = maxOf(maiorRmsDeAna, Math.sqrt(saida.sumOf { it.toDouble() * it } / saida.size))
+                if (anaId in vozBob.estado.value.falando) bobViuAnaFalando = true
+                Thread.sleep(20)
+            }
+            assertTrue("ana enviou pacotes (${motorAna.pacotesEnviados})", motorAna.pacotesEnviados > 50)
+            assertEquals("nenhum pacote do servidor foi rejeitado", 0, motorBob.quadrosIgnorados)
+            assertTrue("bob decodificou áudio com energia (rms $maiorRmsDeBob)", maiorRmsDeBob > 1_000)
+            assertTrue("bob viu ana falando", bobViuAnaFalando)
+            assertTrue("ana não ouve a si mesma (rms $maiorRmsDeAna)", maiorRmsDeAna < 1)
+
+            // mudo de ana chega ao bob pelo servidor
+            vozAna.alternarMudo()
+            esperar("bob vê ana muda") { bob.estado.voz.firstOrNull { it.userId == anaId }?.muted?.takeIf { it } }
+            vozAna.alternarSurdo()
+            esperar("bob vê ana surda") { bob.estado.voz.firstOrNull { it.userId == anaId }?.deafened?.takeIf { it } }
+
+            // sair: o servidor tira ana da sala e o estado local volta a Fora
+            vozAna.sair()
+            esperar("bob vê ana sair") { if (bob.estado.voz.none { it.userId == anaId && it.channelId == canal }) true else null }
+            assertEquals(app.telacast.voz.FaseDaVoz.Fora, vozAna.estado.value.fase)
+            assertTrue(bob.estado.voz.any { it.userId == bobId })
+        } finally {
+            vozAna.sair(); vozBob.sair()
+        }
     }
 }

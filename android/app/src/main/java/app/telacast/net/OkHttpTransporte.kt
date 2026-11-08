@@ -36,6 +36,7 @@ class OkHttpTransporte(
         })
         return object : ConexaoTransporte {
             override fun enviar(texto: String): Boolean = ws.send(texto)
+            override fun enviarBinario(dados: ByteArray): Boolean = ws.send(ByteString.of(*dados))
             override fun fechar() { ws.close(1000, null) }
             override fun cancelar() { ws.cancel() }
         }

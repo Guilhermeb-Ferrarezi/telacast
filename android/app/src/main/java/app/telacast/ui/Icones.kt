@@ -208,3 +208,63 @@ fun IconeVoltar(cor: Color, modifier: Modifier = Modifier, tamanho: Dp = 22.dp) 
         drawLine(cor, Offset(0.45f * s, 0.73f * s), Offset(0.22f * s, 0.5f * s), 1.9f * u, StrokeCap.Round)
     }
 }
+
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.riscoDeMudo(s: Float) {
+    drawLine(Grafite_Vermelho, Offset(0.12f * s, 0.12f * s), Offset(0.88f * s, 0.88f * s), maxOf(1.8f * density, 0.11f * s), StrokeCap.Round)
+}
+
+private val Grafite_Vermelho = app.telacast.tema.Grafite.Vermelho
+
+/** Microfone; `cortado` risca com a barra vermelha (mudo). */
+@Composable
+fun IconeMicrofone(cor: Color, cortado: Boolean = false, modifier: Modifier = Modifier, tamanho: Dp = 22.dp) {
+    Canvas(modifier.size(tamanho)) {
+        val s = size.width
+        val traco = maxOf(1.6f * density, 0.085f * s)
+        drawRoundRect(cor, Offset(0.36f * s, 0.14f * s), Size(0.28f * s, 0.46f * s), CornerRadius(0.14f * s))
+        drawArc(cor, 0f, 180f, false, Offset(0.25f * s, 0.30f * s), Size(0.50f * s, 0.42f * s), style = Stroke(traco, cap = StrokeCap.Round))
+        drawLine(cor, Offset(0.5f * s, 0.72f * s), Offset(0.5f * s, 0.86f * s), traco, StrokeCap.Round)
+        drawLine(cor, Offset(0.38f * s, 0.86f * s), Offset(0.62f * s, 0.86f * s), traco, StrokeCap.Round)
+        if (cortado) riscoDeMudo(s)
+    }
+}
+
+/** Fones de ouvido; `cortado` = surdo. */
+@Composable
+fun IconeFones(cor: Color, cortado: Boolean = false, modifier: Modifier = Modifier, tamanho: Dp = 22.dp) {
+    Canvas(modifier.size(tamanho)) {
+        val s = size.width
+        val traco = maxOf(1.6f * density, 0.085f * s)
+        drawArc(cor, 180f, 180f, false, Offset(0.16f * s, 0.18f * s), Size(0.68f * s, 0.66f * s), style = Stroke(traco, cap = StrokeCap.Round))
+        drawRoundRect(cor, Offset(0.12f * s, 0.52f * s), Size(0.17f * s, 0.30f * s), CornerRadius(0.05f * s))
+        drawRoundRect(cor, Offset(0.71f * s, 0.52f * s), Size(0.17f * s, 0.30f * s), CornerRadius(0.05f * s))
+        if (cortado) riscoDeMudo(s)
+    }
+}
+
+/** Telefone desligado (sair da voz). */
+@Composable
+fun IconeDesligar(cor: Color, modifier: Modifier = Modifier, tamanho: Dp = 22.dp) {
+    Canvas(modifier.size(tamanho)) {
+        val s = size.width
+        val traco = maxOf(2.2f * density, 0.17f * s)
+        val p = Path().apply {
+            moveTo(0.10f * s, 0.60f * s); lineTo(0.22f * s, 0.44f * s); lineTo(0.40f * s, 0.38f * s)
+            lineTo(0.60f * s, 0.38f * s); lineTo(0.78f * s, 0.44f * s); lineTo(0.90f * s, 0.60f * s)
+        }
+        drawPath(p, cor, style = Stroke(traco, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+    }
+}
+
+/** Sinal de conexão: três barras. */
+@Composable
+fun IconeSinal(cor: Color, modifier: Modifier = Modifier, tamanho: Dp = 18.dp) {
+    Canvas(modifier.size(tamanho)) {
+        val u = density
+        val x0 = size.width / 2 - 7f * u
+        for ((i, h) in listOf(5f, 9f, 13f).withIndex()) {
+            val x = x0 + i * 5f * u
+            drawRoundRect(cor, Offset(x, size.height / 2 + 6.5f * u - h * u), Size(3f * u, h * u), CornerRadius(1f * u))
+        }
+    }
+}

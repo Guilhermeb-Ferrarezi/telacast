@@ -42,6 +42,9 @@ class Repository(
     private val _avisos = Channel<Aviso>(Channel.UNLIMITED)
     val avisos: Flow<Aviso> = _avisos.receiveAsFlow()
 
+    /** Quem recebe os quadros binários do gateway (voz). Chamado da thread de rede: não pode bloquear. */
+    @Volatile var ouvinteBinario: ((ByteArray) -> Unit)? = null
+
     private var ultimoNonce = 0L
     private var seqNonce = 0L
     private val jobsDigitando = HashMap<Pair<Long, Long>, Job>()
@@ -219,6 +222,12 @@ class Repository(
     fun aceitarAmigo(usuario: Long) { gateway.enviar(C2S.FriendAccept(usuario)) }
     /** Remove amigo, recusa ou cancela pedido. */
     fun removerAmigo(usuario: Long) { gateway.enviar(C2S.FriendRemove(usuario)) }
+    // ---- voz
+    fun entrarNaVoz(canal: Long): Boolean = gateway.enviar(C2S.VoiceJoin(canal))
+    fun sairDaVoz() { gateway.enviar(C2S.VoiceLeave) }
+    fun definirVoz(mudo: Boolean, surdo: Boolean) { gateway.enviar(C2S.VoiceSet(mudo, surdo)) }
+    fun enviarBinario(quadro: ByteArray): Boolean = gateway.enviarBinario(quadro)
+
     fun bloquear(usuario: Long) { gateway.enviar(C2S.Block(usuario)) }
     fun desbloquear(usuario: Long) { gateway.enviar(C2S.Unblock(usuario)) }
     fun trocarSenha(atual: String, nova: String) { gateway.enviar(C2S.ChangePassword(atual, nova)) }
@@ -248,7 +257,7 @@ class Repository(
                 erroDeEntrada = ErroDeEntrada(ev.code, ev.msg, ev.sessaoInvalida),
                 autenticado = _estado.value.autenticado && !ev.sessaoInvalida,
             )
-            is EventoGateway.Binario -> Unit // voz: ainda não
+            is EventoGateway.Binario -> ouvinteBinario?.invoke(ev.bytes)
             is EventoGateway.Recebido -> mensagemDoServidor(ev.msg)
         }
     }

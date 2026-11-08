@@ -1,6 +1,12 @@
 package app.telacast.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.compose.BackHandler
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.core.content.ContextCompat
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
@@ -46,7 +52,33 @@ fun RaizDoApp(vm: AppViewModel) {
             val buscaNoCanal by vm.buscaNoCanal.collectAsState()
             val tamanhoTexto by vm.tamanhoDoTexto.collectAsState()
             val senhaTrocada by vm.senhaTrocada.collectAsState()
+            val vozEstado by vm.voz.collectAsState()
             val contexto = LocalContext.current
+            // RECORD_AUDIO só é pedida quando a pessoa entra na voz (nunca ao abrir o app). POST_NOTIFICATIONS (Android 13+)
+            // vai junto, para a notificação da chamada aparecer; negá-la não impede a voz.
+            var canalPendente by remember { mutableStateOf<Long?>(null) }
+            val pedirPermissoes = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r ->
+                val canal = canalPendente; canalPendente = null
+                if (canal != null) {
+                    if (r[Manifest.permission.RECORD_AUDIO] == true) vm.entrarNaVoz(canal) else vm.recusarMicrofone()
+                }
+            }
+            val entrarNaVoz: (Long) -> Unit = { canal ->
+                if (ContextCompat.checkSelfPermission(contexto, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) vm.entrarNaVoz(canal)
+                else {
+                    canalPendente = canal
+                    val pedir = buildList {
+                        add(Manifest.permission.RECORD_AUDIO)
+                        if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                    pedirPermissoes.launch(pedir.toTypedArray())
+                }
+            }
+            // tocar num canal de voz abre a tela dele e entra (como no desktop); se já está nele, só abre
+            val abrirVoz: (Long, Long) -> Unit = { servidor, canal ->
+                vm.abrirVoz(servidor, canal)
+                if (!(vozEstado.naChamada && vozEstado.canal == canal)) entrarNaVoz(canal)
+            }
             val area = LocalClipboardManager.current
             val links = LocalUriHandler.current
             // só há relógio correndo enquanto existe mensagem pendente (para "Enviando…" virar "Não foi enviada.")
@@ -62,6 +94,8 @@ fun RaizDoApp(vm: AppViewModel) {
                 ProvedorDeAnexos(
                     imagemEmCache = { vm.imagens.emCache(it.id) },
                     imagem = { vm.imagens.obter(it, vm.urlDoAnexo(it)) },
+                    miniaturaDoAnexoEmCache = { vm.imagens.miniaturaEmCache(it.id) },
+                    miniaturaDoAnexo = { vm.imagens.obterMiniatura(it, vm.urlDaMiniatura(it), vm.urlDoAnexo(it)) },
                     previaEmCache = { vm.previas.emCache(it) },
                     previa = { vm.previas.obter(it, vm.urlDoAnexo(it)) },
                     miniatura = { f -> (f as? FonteUri)?.miniatura() },
@@ -73,8 +107,9 @@ fun RaizDoApp(vm: AppViewModel) {
             CompositionLocalProvider(LocalProvedorDeAnexos provides provedor, LocalEscalaDoTexto provides escalaDoTexto(tamanhoTexto)) {
                 TelaPrincipal(
                     estado, nav, recolhidas, aviso,
-                    acoesDe(vm, copiar = { area.setText(AnnotatedString(it)) }, abrirLink = { runCatching { links.openUri(it) } }, anexar = { seletor.launch("*/*") }, baixar = baixar),
+                    acoesDe(vm, copiar = { area.setText(AnnotatedString(it)) }, abrirLink = { runCatching { links.openUri(it) } }, anexar = { seletor.launch("*/*") }, baixar = baixar, aoAbrirVoz = abrirVoz, aoEntrarNaVoz = entrarNaVoz),
                     conversa = DadosDaConversa(compositor, anexos, spoilers, textos, reveladas, agora, consultaDaBusca = consulta, buscaNoCanal = buscaNoCanal, tamanhoDoTexto = tamanhoTexto, senhaTrocada = senhaTrocada),
+                    voz = DadosDeVoz(vozEstado),
                 )
             }
         }
@@ -87,11 +122,13 @@ private fun acoesDe(
     abrirLink: (String) -> Unit,
     anexar: () -> Unit,
     baixar: (app.telacast.proto.Attachment) -> Unit,
+    aoAbrirVoz: (Long, Long) -> Unit,
+    aoEntrarNaVoz: (Long) -> Unit,
 ) = AcoesPrincipais(
     painel = AcoesPainel(
         aoAbrirCanal = vm::abrirCanal,
         aoAlternarCategoria = vm::alternarCategoria,
-        aoCliqueEmVoz = vm::cliqueEmVoz,
+        aoCliqueEmVoz = aoAbrirVoz,
         aoAbrirMenuServidor = { vm.abrirMenu(MenuAberto.Servidor) },
         aoAbrirMenuStatus = { vm.abrirMenu(MenuAberto.Status) },
         aoCriarCanal = { sv, categoria, pai -> vm.abrirDialogo(Dialogo.CriarCanal(sv, categoria, pai)) },
@@ -182,10 +219,22 @@ private fun acoesDe(
         aoEncerrarSessao = vm::encerrarSessao,
         aoEncerrarOutras = vm::encerrarOutrasSessoes,
         aoEscolherTamanho = vm::definirTamanhoDoTexto,
+        aoMudarVoz = vm::definirOpcoesDeVoz,
         aoSair = { vm.abrirDialogo(Dialogo.ConfirmarSair) },
     ),
     aoAbrirAjustes = vm::abrirAjustes,
     aoAbrirPerfil = vm::abrirPerfil,
+    voz = AcoesDeVoz(
+        aoEntrar = aoEntrarNaVoz,
+        aoSair = vm::sairDaVoz,
+        aoAlternarMudo = vm::alternarMudo,
+        aoAlternarSurdo = vm::alternarSurdo,
+        aoAlternarRota = vm::alternarRotaDoAudio,
+        aoAbrirTela = vm::abrirTelaDaVoz,
+        aoEscolherVolume = vm::abrirVolume,
+        aoMudarVolume = vm::definirVolumeDe,
+        aoFecharVolume = vm::fecharVolume,
+    ),
     folha = AcoesDaFolha(
         aoFechar = vm::fecharFolha,
         aoResponder = { vm.nav.value.folha?.let { vm.responderA(it.mensagem) } },

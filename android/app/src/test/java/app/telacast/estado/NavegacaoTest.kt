@@ -48,4 +48,21 @@ class NavegacaoTest {
         assertEquals(null, n.abrirMenu(MenuAberto.Servidor).menu)
         assertEquals(MenuAberto.Status, n.abrirMenu(MenuAberto.Status).menu)
     }
+
+    @Test fun irParaVozMostraOServidorDoCanalEFechaAGaveta() {
+        val n = Navegacao(gavetaAberta = true, servidorNoPainel = 9).irPara(Destino.Voz(7, 77))
+        assertEquals(Destino.Voz(7, 77), n.destino)
+        assertEquals(7L, n.servidorNoPainel)
+        assertFalse(n.gavetaAberta)
+    }
+
+    @Test fun folhaDeVolumeFechaPrimeiroNoVoltar() {
+        val n = Navegacao(destino = Destino.Voz(1, 2)).abrirVolume(55)
+        assertEquals(55L, n.volume)
+        assertTrue(n.podeVoltar)
+        val v = n.voltar()
+        assertEquals(null, v.volume)
+        assertEquals(Destino.Voz(1, 2), v.destino)
+        assertFalse(v.podeVoltar)
+    }
 }

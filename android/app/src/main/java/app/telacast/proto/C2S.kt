@@ -62,6 +62,11 @@ sealed class C2S {
     @Serializable data class FriendAccept(val userId: Long) : C2S()
     @Serializable data class FriendRemove(val userId: Long) : C2S()
     @Serializable data class OpenDm(val userId: Long) : C2S()
+    /** Push (D1): registra o token do FCM desta instalação; `platform` é "fcm". */
+    @Serializable data class PushRegister(val token: String, val platform: String) : C2S()
+    @Serializable data class PushUnregister(val token: String) : C2S()
+    /** Esta conexão está com o app em primeiro plano e visível? O servidor só manda push a quem não tem conexão com `focused = true`. */
+    @Serializable data class SetFocus(val focused: Boolean) : C2S()
 
     companion object {
         /** Todas as etiquetas de variante (para o teste que confere as fixtures; precisa acompanhar o enum do Rust). */
@@ -122,6 +127,9 @@ internal object C2SCodec {
             "FriendRequest" -> json.decodeFromJsonElement(C2S.FriendRequest.serializer(), Etiquetado.corpo(tag, corpo))
             "FriendAccept" -> json.decodeFromJsonElement(C2S.FriendAccept.serializer(), Etiquetado.corpo(tag, corpo))
             "FriendRemove" -> json.decodeFromJsonElement(C2S.FriendRemove.serializer(), Etiquetado.corpo(tag, corpo))
+            "PushRegister" -> json.decodeFromJsonElement(C2S.PushRegister.serializer(), Etiquetado.corpo(tag, corpo))
+            "PushUnregister" -> json.decodeFromJsonElement(C2S.PushUnregister.serializer(), Etiquetado.corpo(tag, corpo))
+            "SetFocus" -> json.decodeFromJsonElement(C2S.SetFocus.serializer(), Etiquetado.corpo(tag, corpo))
             "OpenDm" -> json.decodeFromJsonElement(C2S.OpenDm.serializer(), Etiquetado.corpo(tag, corpo))
             else -> throw kotlinx.serialization.SerializationException("variante de C2S desconhecida: $tag")
         }
@@ -160,5 +168,8 @@ internal object C2SCodec {
         is C2S.FriendAccept -> Etiquetado.com("FriendAccept", json.encodeToJsonElement(C2S.FriendAccept.serializer(), c))
         is C2S.FriendRemove -> Etiquetado.com("FriendRemove", json.encodeToJsonElement(C2S.FriendRemove.serializer(), c))
         is C2S.OpenDm -> Etiquetado.com("OpenDm", json.encodeToJsonElement(C2S.OpenDm.serializer(), c))
+        is C2S.PushRegister -> Etiquetado.com("PushRegister", json.encodeToJsonElement(C2S.PushRegister.serializer(), c))
+        is C2S.PushUnregister -> Etiquetado.com("PushUnregister", json.encodeToJsonElement(C2S.PushUnregister.serializer(), c))
+        is C2S.SetFocus -> Etiquetado.com("SetFocus", json.encodeToJsonElement(C2S.SetFocus.serializer(), c))
     }
 }

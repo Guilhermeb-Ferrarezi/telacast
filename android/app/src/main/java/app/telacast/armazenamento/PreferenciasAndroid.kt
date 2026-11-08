@@ -1,6 +1,7 @@
 package app.telacast.armazenamento
 
 import android.content.Context
+import app.telacast.voz.OpcoesDeVoz
 
 /** [Preferencias] em SharedPreferences privadas do app. */
 class PreferenciasAndroid(contexto: Context) : Preferencias {
@@ -29,6 +30,16 @@ class PreferenciasAndroid(contexto: Context) : Preferencias {
     override var tamanhoDoTexto: Int
         get() = p.getInt("tamanho_texto", 1)
         set(v) { p.edit().putInt("tamanho_texto", v.coerceIn(0, 2)).apply() }
+
+    override var opcoesDeVoz: OpcoesDeVoz
+        get() = OpcoesDeVoz(
+            supressaoDeRuido = p.getBoolean("voz_ruido", true), cancelamentoDeEco = p.getBoolean("voz_eco", true),
+            ganhoAutomatico = p.getBoolean("voz_agc", true), sensibilidade = p.getFloat("voz_sens", 0.7f), ganhoDeEntrada = p.getFloat("voz_ganho", 1f),
+        )
+        set(v) {
+            p.edit().putBoolean("voz_ruido", v.supressaoDeRuido).putBoolean("voz_eco", v.cancelamentoDeEco).putBoolean("voz_agc", v.ganhoAutomatico)
+                .putFloat("voz_sens", v.sensibilidade).putFloat("voz_ganho", v.ganhoDeEntrada).apply()
+        }
 
     private val rascunhos = contexto.getSharedPreferences("telacast_rascunhos", Context.MODE_PRIVATE)
 
