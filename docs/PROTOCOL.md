@@ -227,6 +227,8 @@ Todos aplicados no servidor; excesso gera `Error{code: RateLimited}` (ou erro de
 | `React` | 30 por 10 s; emoji de 1 a 8 caracteres, sem letras/números ASCII, espaço ou controle |
 | `Ack` | 120 por 10 s (excesso ignorado em silêncio) |
 | `Typing` | 20 por 10 s (excesso ignorado em silêncio); reenviar a cada poucos segundos |
+| `PushRegister` / `PushUnregister` | 20 por minuto (juntos); token de 1 a 4096 bytes, até 10 por conta |
+| `SetFocus` | 60 por 10 s (excesso ignorado em silêncio) |
 | `SetStatus` | 30 por 60 s; `Offline` não é aceito (use `Invisible`) |
 | `Block` | 20 por 60 s |
 | `FriendRequest` | 20 por hora |
@@ -279,6 +281,9 @@ Fixtures em `proto/fixtures/c2s/<Variante>.json` (casos extras: `<Variante>.<cas
 | `FriendAccept{user_id}` | Aceita um pedido recebido |
 | `FriendRemove{user_id}` | Remove amigo, recusa ou cancela pedido |
 | `OpenDm{user_id}` | Abre (ou acha) a DM; responde `DmOpened` e `Snapshot` |
+| `PushRegister{token, platform}` | Registra o token de push do aparelho (`platform` = `"fcm"`); sem resposta em caso de sucesso (seção 11) |
+| `PushUnregister{token}` | Apaga o token (mande antes do `Logout`); sem resposta |
+| `SetFocus{focused}` | Este app está em primeiro plano e visível? Estado por conexão, padrão `false`; sem resposta (seção 11) |
 
 ## 9. Variantes de `S2C` (servidor para cliente)
 
@@ -322,3 +327,87 @@ Fixtures em `proto/fixtures/s2c/<Variante>.json`.
 - Mudou o protocolo: `UPDATE_FIXTURES=1 cargo test -p telacast-proto -j2`, confira o diff, e o teste Kotlin
   (que lê os mesmos arquivos) mostra o que o cliente precisa acompanhar. Mudança que quebra cliente antigo
   sobe `PROTO_VERSION`.
+
+## 11. Notificações push (FCM)
+
+Para o app Android receber aviso com o aplicativo fechado. O servidor só envia se a credencial do Firebase
+estiver configurada (`docs/DEPLOY.md`); sem ela o push fica desligado e os três comandos abaixo continuam
+sendo aceitos (o token fica guardado). Mudança **só de adição**: não sobe `PROTO_VERSION`; um servidor
+antigo ignora em silêncio os três comandos, um cliente antigo nunca os manda.
+
+### 11.1 Comandos
+
+- `PushRegister{token, platform}`: `platform` é `"fcm"` (outro valor dá `Error InvalidInput`). Mande a cada
+  abertura do app depois do `Auth` e sempre que o FCM trocar o token (`onNewToken`). **Idempotente**: repetir
+  o mesmo token só renova. Um token novo do mesmo aparelho convive com o antigo; a conta guarda no máximo
+  **10** tokens e os mais antigos (pelo último registro) saem. Um token pertence a uma conta: se outra conta
+  registrar o mesmo, ele **muda de dono**. Token vazio, com espaço ou controle, ou com mais de **4096 bytes**:
+  `Error InvalidInput`. Sucesso é **silencioso** (o protocolo não tem `S2C` de confirmação; use um comando com
+  resposta, como `ListSessions`, se precisar saber que foi aplicado: as mensagens de uma conexão são tratadas em
+  ordem). 20 comandos de push por minuto.
+- `PushUnregister{token}`: apaga o token **da própria conta** (token desconhecido não é erro). Faça isso antes do
+  `Logout`: o servidor **não** apaga tokens ao revogar a sessão (nem no `Logout`, nem em `RevokeSession`), então
+  sem o `PushUnregister` o aparelho continua recebendo avisos da conta que saiu.
+- `SetFocus{focused}`: "o app está em primeiro plano **e** visível". Estado **por conexão** WebSocket e começa
+  `false` em toda conexão (mais seguro: melhor avisar de mais do que perder). Mande `true` ao ir para primeiro
+  plano e `false` ao ir para segundo plano ou apagar a tela. Some quando a conexão fecha. Enquanto **alguma**
+  conexão da conta estiver com `true`, a conta não recebe push (quem está olhando o app já vê a mensagem).
+  O app Android em segundo plano mantém o socket por alguns minutos com `focused=false` e **recebe** o push.
+
+### 11.2 O que é enviado: `PushData`
+
+Mensagem de **dados** do FCM (sem bloco `notification`: o app monta a notificação), prioridade alta, validade de
+1 hora (`ttl`), `collapse_key` = `ch-<channel_id>` (ou `friend-<author_id>` no pedido de amizade). O objeto
+`data` tem **só strings** (exigência do FCM); ids são decimais em texto; campos que não se aplicam vêm `""`.
+Exemplos exatos: `proto/fixtures/push/PushData.{dm,mention,friend_request}.json` (tipo `PushData` em `proto/src/lib.rs`).
+
+| Campo | Valor |
+|---|---|
+| `kind` | `dm`, `mention`, `friend_request` (e `message`, reservado: hoje o servidor não manda). Valor desconhecido: trate como `message` |
+| `channel_id` | canal da mensagem; `""` em `friend_request` |
+| `message_id` | a mensagem; `""` em `friend_request` |
+| `server_id` | servidor do canal; `""` em DM e em `friend_request` |
+| `title` | DM: nome do autor. Canal: `autor em #canal (servidor)`. Amizade: `Pedido de amizade` |
+| `body` | texto simples (abaixo), no máximo **180 caracteres**; amizade: `<nome> quer ser seu amigo` |
+| `author_id` | quem escreveu (ou pediu amizade) |
+| `ts` | milissegundos desde 1970 (para a mensagem, o mesmo `ts` do `Message`) |
+
+Exemplo (o objeto `data` de uma menção; o corpo HTTP completo para o FCM é
+`{"message":{"token":"...","data":{...},"android":{"priority":"HIGH","ttl":"3600s","collapse_key":"ch-112623700000000012"}}}`):
+
+```json
+{"kind":"mention","channel_id":"112623700000000012","message_id":"112624001234567905","server_id":"112623700000000001","title":"marina.souza em #geral (Turma do Telacast)","body":"@guilherme olha isso: spoiler oculto 📎 foto da praia.png","author_id":"112623612862660617","ts":"1762512435678"}
+```
+
+`body`, a partir do texto cru da mensagem (mesmo Markdown do chat, `telacast-md`): sem marcas de formatação;
+`||spoiler||` vira `spoiler oculto`; `<@id>` vira `@nome` (id desconhecido: `@usuário`); código, citação, lista e
+título viram texto; quebras de linha e espaços repetidos viram um espaço; cada anexo vira `📎 <nome do arquivo>`
+(vários: `📎 primeiro.png (+2)`); acima de 180 caracteres corta em fronteira de **caractere** (nunca de byte) e
+termina em `…`. Mensagens de sistema (entrou, fixou) não geram push.
+
+### 11.3 Quem é avisado
+
+Para cada pessoa que **tem token**, **não é o autor** e **não tem nenhuma conexão com `focused=true`**, e que
+não está em **Não perturbe** nem **bloqueou o autor**:
+
+- **DM**: sempre (`kind = dm`).
+- **Canal de servidor**: só se a mensagem a **menciona** (`<@id>`), **responde a uma mensagem dela**, ou usa
+  `@everyone` (todos que veem o canal) ou `@here` (só quem tem alguma conexão aberta): `kind = mention`.
+  Canal comum sem menção **não** avisa. (Ponto de extensão: `server/src/push.rs`, `ChannelNotify`; o chamador
+  usa sempre `MentionsOnly` até existirem preferências por canal/servidor e "silenciar".)
+- **Pedido de amizade** novo (não o aceite automático de um pedido cruzado): `kind = friend_request`.
+
+Quem fica online só com conexões `focused=false` recebe. Não existe confirmação de leitura: se o app abrir e
+ler o canal (`Ack`), cabe ao app cancelar a notificação que já mostrou.
+
+### 11.4 Anti-spam e entrega
+
+- **Agrupamento**: por (pessoa, canal), o primeiro aviso abre uma janela de **3 s**; os que chegam nela
+  substituem o conteúdo (o **último vence**) e a janela fecha com **um** envio. Logo, todo push sai 3 s depois
+  da mensagem. Cada pedido de amizade tem a sua janela.
+- No máximo **20 pushes por minuto** por pessoa; o excesso é descartado em silêncio.
+- O envio é feito por uma fila em tarefa própria (não trava o gateway), com 1000 avisos no máximo (o mais antigo
+  sai) e no máximo 4 envios simultâneos. Erro 5xx/429 do FCM: **uma** nova tentativa e depois descarta. Token
+  recusado (`404`/`UNREGISTERED`, ou `INVALID_ARGUMENT` que cita o token) é apagado do banco.
+- A entrega é "melhor esforço": não há reenvio depois do descarte nem aviso de perda; ao reabrir, o app
+  recarrega o `Snapshot`/`History` como sempre.

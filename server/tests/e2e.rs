@@ -43,6 +43,8 @@ impl Env {
             .env("TELACAST_ADDR", format!("127.0.0.1:{port}"))
             .env("RUST_LOG", "warn")
             .env("TELACAST_FILES_DIR", &files)
+            // vazio = push desligado, mesmo que um .env acima do repositório defina a credencial
+            .env("TELACAST_FCM_SERVICE_ACCOUNT", "")
             .envs(extra.iter().copied())
             .stdout(Stdio::null())
             .spawn()
@@ -1555,4 +1557,555 @@ fn transmissao_espectadores() {
     drop(view);
     ana.wait("lista vazia", |m| matches!(m, S2C::Viewers { users, .. } if users.is_empty()).then_some(()));
     let _ = (ana_id, pubws.close(None));
+}
+
+
+// ------------------------------------------------------------------ notificações push (FCM)
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use std::{
+    collections::VecDeque,
+    io::{Read, Write},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+};
+
+/// Uma requisição que o servidor falso recebeu.
+#[derive(Clone, Debug)]
+struct Req {
+    path: String,
+    auth: String,
+    body: String,
+}
+
+/// Servidor HTTP local que faz o papel do Google: `POST /token` (OAuth2) e `POST /v1/projects/*/messages:send` (FCM).
+struct Fake {
+    port: u16,
+    reqs: Arc<Mutex<Vec<Req>>>,
+    /// Status das próximas respostas do FCM; esgotado, responde 200.
+    script: Arc<Mutex<VecDeque<u16>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Fake {
+    fn start() -> Fake {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (reqs, script, stop) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(VecDeque::new())), Arc::new(AtomicBool::new(false)));
+        let (r2, s2, st2) = (reqs.clone(), script.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !st2.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((conn, _)) => {
+                        let (r, s) = (r2.clone(), s2.clone());
+                        std::thread::spawn(move || Fake::serve(conn, r, s));
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+        Fake { port, reqs, script, stop }
+    }
+
+    fn serve(mut conn: TcpStream, reqs: Arc<Mutex<Vec<Req>>>, script: Arc<Mutex<VecDeque<u16>>>) {
+        conn.set_nonblocking(false).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        let cut = loop {
+            if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i;
+            }
+            match conn.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+            }
+        };
+        let head = String::from_utf8_lossy(&raw[..cut]).to_string();
+        let header = |name: &str| {
+            head.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+            })
+        };
+        let len: usize = header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut body = raw[cut + 4..].to_vec();
+        while body.len() < len {
+            match conn.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body.extend_from_slice(&buf[..n]),
+            }
+        }
+        let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+        reqs.lock().unwrap().push(Req { path: path.clone(), auth: header("authorization").unwrap_or_default(), body: String::from_utf8_lossy(&body).to_string() });
+        let (status, text) = if path.contains(":send") {
+            match script.lock().unwrap().pop_front().unwrap_or(200) {
+                200 => (200, r#"{"name":"projects/telacast-test/messages/0:1"}"#.to_string()),
+                404 => (404, r#"{"error":{"code":404,"status":"NOT_FOUND","details":[{"errorCode":"UNREGISTERED"}]}}"#.to_string()),
+                n => (n, r#"{"error":{"status":"UNAVAILABLE"}}"#.to_string()),
+            }
+        } else {
+            (200, r#"{"access_token":"fake-access-token","expires_in":3600,"token_type":"Bearer"}"#.to_string())
+        };
+        let _ = write!(conn, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+    }
+
+    fn sends(&self) -> Vec<Req> {
+        self.reqs.lock().unwrap().iter().filter(|r| r.path.contains(":send")).cloned().collect()
+    }
+
+    fn token_reqs(&self) -> Vec<Req> {
+        self.reqs.lock().unwrap().iter().filter(|r| r.path == "/token").cloned().collect()
+    }
+
+    /// Espera até haver `n` envios (e devolve todos).
+    fn wait_sends(&self, n: usize) -> Vec<Req> {
+        let start = Instant::now();
+        loop {
+            let s = self.sends();
+            if s.len() >= n {
+                return s;
+            }
+            assert!(start.elapsed() < Duration::from_secs(12), "esperava {n} envios ao FCM, houve {}", s.len());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Confere que nada novo é enviado durante `dur` (as janelas de teste são de 400 ms).
+    fn still_at(&self, n: usize, dur: Duration) {
+        std::thread::sleep(dur);
+        assert_eq!(self.sends().len(), n, "não devia haver envio novo: {:?}", self.sends().last());
+    }
+}
+
+impl Drop for Fake {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Conta de serviço de mentira: par RSA gerado agora (openssl) só para o teste.
+struct Cred {
+    dir: std::path::PathBuf,
+    json: String,
+    /// Chave pública em DER (RSAPublicKey), para conferir a assinatura do JWT.
+    public: Vec<u8>,
+}
+
+impl Cred {
+    fn new() -> Cred {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::path::PathBuf::from(format!("/tmp/telacast_test_fcm_{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("key.pem");
+        let ok = |st: std::io::Result<std::process::ExitStatus>| st.expect("o teste precisa do comando openssl").success();
+        assert!(ok(Command::new("openssl").args(["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out"]).arg(&key).status()));
+        let pubder = dir.join("pub.der");
+        assert!(ok(Command::new("openssl").arg("rsa").arg("-in").arg(&key).args(["-RSAPublicKey_out", "-outform", "DER", "-out"]).arg(&pubder).stderr(Stdio::null()).status()));
+        let sa = serde_json::json!({
+            "type": "service_account",
+            "project_id": "telacast-test",
+            "client_email": "push@telacast-test.iam.gserviceaccount.com",
+            "private_key": std::fs::read_to_string(&key).unwrap(),
+            "token_uri": "https://oauth2.googleapis.com/token",
+        });
+        let json = dir.join("service-account.json");
+        std::fs::write(&json, sa.to_string()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&json, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let public = std::fs::read(&pubder).unwrap();
+        std::fs::remove_file(&key).unwrap();
+        Cred { json: json.to_string_lossy().to_string(), dir, public }
+    }
+}
+
+impl Drop for Cred {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Sobe o servidor de verdade apontando para o Google falso. `coalesce_ms` é a janela do anti-spam.
+fn start_push(fake: &Fake, cred: &Cred, coalesce_ms: &str) -> Env {
+    let endpoint = format!("http://127.0.0.1:{}/v1/projects/{{project_id}}/messages:send", fake.port);
+    let token_uri = format!("http://127.0.0.1:{}/token", fake.port);
+    Env::start_with(&[
+        ("TELACAST_FCM_SERVICE_ACCOUNT", &cred.json),
+        ("TELACAST_FCM_ENDPOINT", &endpoint),
+        ("TELACAST_FCM_TOKEN_URI", &token_uri),
+        ("TELACAST_FCM_RETRY_MS", "100"),
+        ("TELACAST_PUSH_COALESCE_MS", coalesce_ms),
+    ])
+}
+
+impl Env {
+    fn tokens(&self, user_id: i64) -> Vec<String> {
+        self.rt.block_on(async {
+            let pool = sqlx::PgPool::connect(&self.db_url).await.unwrap();
+            let rows: Vec<(String,)> = sqlx::query_as("SELECT token FROM push_tokens WHERE user_id = $1 ORDER BY last_seen")
+                .bind(user_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+            rows.into_iter().map(|r| r.0).collect()
+        })
+    }
+}
+
+impl Client {
+    /// Manda `m` e espera uma resposta qualquer do servidor sobre ela (`ListSessions` volta `Sessions`):
+    /// as mensagens de uma conexão são tratadas em ordem, então tudo o que veio antes já foi aplicado.
+    fn sync(&mut self) {
+        self.send(C2S::ListSessions);
+        self.wait("Sessions", |m| matches!(m, S2C::Sessions { .. }).then_some(()));
+    }
+
+    fn push_register(&mut self, token: &str) {
+        self.send(C2S::PushRegister { token: token.into(), platform: "fcm".into() });
+        self.sync();
+    }
+
+    fn texto(&mut self, canal: i64, texto: &str) -> i64 {
+        self.send(C2S::Send { channel_id: canal, content: texto.into(), reply_to: None, nonce: 0, attachments: vec![] });
+        let t = texto.to_string();
+        self.wait("a própria mensagem", |m| match m {
+            S2C::Message(x) if x.content == t => Some(x.id),
+            _ => None,
+        })
+    }
+}
+
+/// Ana (dona), Beto e Carla no servidor "Casa"; Ana e Beto já têm uma DM.
+struct Cena {
+    ana: Client,
+    beto: Client,
+    carla: Client,
+    ana_id: i64,
+    beto_id: i64,
+    carla_id: i64,
+    server_id: i64,
+    geral: i64,
+    dm: i64,
+}
+
+fn cena(env: &Env) -> Cena {
+    let code = env.invite(3);
+    let (mut ana, mut beto, mut carla) = (env.client(), env.client(), env.client());
+    let (_, ana_id) = ana.register("ana", &code);
+    let (_, beto_id) = beto.register("beto", &code);
+    let (_, carla_id) = carla.register("carla", &code);
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    let geral = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
+    for c in [&mut beto, &mut carla] {
+        c.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
+        c.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+    }
+    ana.send(C2S::OpenDm { user_id: beto_id });
+    let dm = ana.wait("DmOpened", |m| if let S2C::DmOpened { channel_id } = m { Some(*channel_id) } else { None });
+    Cena { ana, beto, carla, ana_id, beto_id, carla_id, server_id: snap.servers[0].id, geral, dm }
+}
+
+fn json(r: &Req) -> serde_json::Value {
+    serde_json::from_str(&r.body).unwrap_or_else(|e| panic!("corpo não é JSON ({e}): {}", r.body))
+}
+
+/// Confere a assinatura RS256 do JWT enviado na troca de credencial e devolve os campos (`iss`, `aud`...).
+fn confere_jwt(req: &Req, cred: &Cred, aud: &str) {
+    let (grant, assertion) = req.body.split_once("&assertion=").expect("corpo form com grant_type e assertion");
+    assert_eq!(grant, "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer");
+    let parts: Vec<&str> = assertion.split('.').collect();
+    assert_eq!(parts.len(), 3, "JWT tem 3 partes");
+    let header: serde_json::Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+    assert_eq!(header, serde_json::json!({"alg": "RS256", "typ": "JWT"}));
+    let claims: serde_json::Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+    assert_eq!(claims["iss"], "push@telacast-test.iam.gserviceaccount.com");
+    assert_eq!(claims["scope"], "https://www.googleapis.com/auth/firebase.messaging");
+    assert_eq!(claims["aud"], aud);
+    let (iat, exp) = (claims["iat"].as_u64().unwrap(), claims["exp"].as_u64().unwrap());
+    assert_eq!(exp - iat, 3600);
+    let agora = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert!(agora.abs_diff(iat) < 30, "iat é de agora");
+    let sig = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+    let signed = format!("{}.{}", parts[0], parts[1]);
+    ring::signature::UnparsedPublicKey::new(&ring::signature::RSA_PKCS1_2048_8192_SHA256, &cred.public)
+        .verify(signed.as_bytes(), &sig)
+        .expect("a assinatura RS256 do JWT confere com a chave pública");
+}
+
+#[test]
+fn push_sem_credencial_nada_e_enviado() {
+    let fake = Fake::start();
+    let endpoint = format!("http://127.0.0.1:{}/v1/projects/{{project_id}}/messages:send", fake.port);
+    // endpoints configurados, mas SEM TELACAST_FCM_SERVICE_ACCOUNT: push desligado
+    let env = Env::start_with(&[("TELACAST_FCM_ENDPOINT", &endpoint), ("TELACAST_PUSH_COALESCE_MS", "300")]);
+    let mut c = cena(&env);
+    c.beto.push_register("tok-beto");
+    assert_eq!(env.tokens(c.beto_id), vec!["tok-beto"], "o registro funciona mesmo com o push desligado");
+    c.ana.texto(c.dm, "oi beto");
+    c.ana.texto(c.geral, &format!("oi <@{}>", c.beto_id));
+    c.ana.send(C2S::FriendRequest { username: "beto".into() });
+    c.ana.sync();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(fake.reqs.lock().unwrap().is_empty(), "nada pode ser enviado nem pedido ao Google sem credencial");
+}
+
+#[test]
+fn push_registro_de_tokens_e_limites() {
+    let env = Env::start();
+    let mut c = cena(&env);
+    let tok = |i: usize| format!("tok-{i:02}");
+    for i in 0..=10 {
+        c.beto.send(C2S::PushRegister { token: tok(i), platform: "fcm".into() });
+    }
+    c.beto.sync();
+    let t = env.tokens(c.beto_id);
+    assert_eq!(t.len(), 10, "no máximo 10 tokens por conta");
+    assert!(!t.contains(&tok(0)), "o mais antigo saiu");
+    assert!(t.contains(&tok(10)));
+    // repetir é idempotente e renova: o 1 vira o mais novo e o 2 é quem sai quando entra um novo
+    c.beto.push_register(&tok(1));
+    assert_eq!(env.tokens(c.beto_id).len(), 10);
+    c.beto.push_register(&tok(11));
+    let t = env.tokens(c.beto_id);
+    assert!(t.contains(&tok(1)) && !t.contains(&tok(2)) && t.contains(&tok(11)), "{t:?}");
+    // um token pertence a uma conta: se a Ana registra o do Beto, ele muda de dono
+    c.ana.push_register(&tok(10));
+    assert_eq!(env.tokens(c.ana_id), vec![tok(10)]);
+    assert!(!env.tokens(c.beto_id).contains(&tok(10)));
+    // desregistrar só apaga token da própria conta; token desconhecido não é erro
+    c.ana.send(C2S::PushUnregister { token: tok(3) });
+    c.ana.send(C2S::PushUnregister { token: "nao-existe".into() });
+    c.ana.sync();
+    assert!(env.tokens(c.beto_id).contains(&tok(3)), "a Ana não apaga token do Beto");
+    c.beto.send(C2S::PushUnregister { token: tok(3) });
+    c.beto.sync();
+    assert!(!env.tokens(c.beto_id).contains(&tok(3)));
+    // entradas inválidas
+    for (token, platform) in [(String::new(), "fcm"), ("   ".into(), "fcm"), ("x".repeat(4097), "fcm"), ("abc".into(), "apns"), ("a b".into(), "fcm")] {
+        c.beto.send(C2S::PushRegister { token, platform: platform.into() });
+        assert_eq!(c.beto.error_code().0, ErrorCode::InvalidInput);
+    }
+    c.beto.push_register(&"y".repeat(4096));
+    assert!(env.tokens(c.beto_id).iter().any(|t| t.len() == 4096));
+    // sem login, nada disso vale
+    let mut anon = env.client();
+    anon.send(C2S::PushRegister { token: "x".into(), platform: "fcm".into() });
+    assert_eq!(anon.error_code().0, ErrorCode::NotAuthenticated);
+}
+
+#[test]
+fn push_dm_foco_e_token_em_cache() {
+    let fake = Fake::start();
+    let cred = Cred::new();
+    let env = start_push(&fake, &cred, "400");
+    let mut c = cena(&env);
+    c.beto.push_register("tok-beto-1");
+
+    // 1) o Beto está conectado mas em segundo plano (padrão focused=false): recebe
+    let texto = format!("**oi** ||segredo|| <@{}>", c.beto_id);
+    let id = c.ana.texto(c.dm, &texto);
+    let msg_ts = c.beto.wait("a DM", |m| match m {
+        S2C::Message(x) if x.id == id => Some(x.ts),
+        _ => None,
+    });
+    let envios = fake.wait_sends(1);
+    let r = &envios[0];
+    assert_eq!(r.path, "/v1/projects/telacast-test/messages:send");
+    assert_eq!(r.auth, "Bearer fake-access-token");
+    let b = json(r);
+    assert_eq!(
+        b["message"]["data"],
+        serde_json::json!({
+            "kind": "dm",
+            "channel_id": c.dm.to_string(),
+            "message_id": id.to_string(),
+            "server_id": "",
+            "title": "ana",
+            "body": "oi spoiler oculto @beto",
+            "author_id": c.ana_id.to_string(),
+            "ts": msg_ts.to_string(),
+        })
+    );
+    assert_eq!(b["message"]["token"], "tok-beto-1");
+    assert_eq!(b["message"]["android"], serde_json::json!({"priority": "HIGH", "ttl": "3600s", "collapse_key": format!("ch-{}", c.dm)}));
+    assert!(b["message"].get("notification").is_none(), "só mensagem de dados");
+    // o JWT trocado pelo token de acesso está assinado de verdade
+    let trocas = fake.token_reqs();
+    assert_eq!(trocas.len(), 1);
+    confere_jwt(&trocas[0], &cred, &format!("http://127.0.0.1:{}/token", fake.port));
+
+    // 2) com o app em primeiro plano o Beto não recebe
+    c.beto.send(C2S::SetFocus { focused: true });
+    c.beto.sync();
+    c.ana.texto(c.dm, "segunda");
+    fake.still_at(1, Duration::from_millis(1500));
+
+    // 3) voltou para o segundo plano: recebe de novo, e o token de acesso veio do cache
+    c.beto.send(C2S::SetFocus { focused: false });
+    c.beto.sync();
+    c.ana.texto(c.dm, "terceira");
+    let envios = fake.wait_sends(2);
+    assert_eq!(json(&envios[1])["message"]["data"]["body"], "terceira");
+    assert_eq!(fake.token_reqs().len(), 1, "o token de acesso fica em cache");
+
+    // 4) foco é por conexão: a conexão em foco cai e o estado some com ela
+    let mut outra = env.client();
+    outra.resume(&{
+        // sessão nova do Beto
+        c.beto.send(C2S::Logout);
+        let mut x = env.client();
+        x.send(C2S::Login { username: "beto".into(), password: "segredo-forte-1".into(), proto: telacast_proto::PROTO_VERSION });
+        x.wait("Auth", |m| if let S2C::Auth { token, .. } = m { Some(token.clone()) } else { None })
+    });
+    outra.send(C2S::SetFocus { focused: true });
+    outra.sync();
+    c.ana.texto(c.dm, "quarta");
+    fake.still_at(2, Duration::from_millis(1500));
+    drop(outra); // a conexão fecha: o foco some
+    std::thread::sleep(Duration::from_millis(300));
+    // 5) offline (sem conexão nenhuma) também recebe
+    c.ana.texto(c.dm, "quinta");
+    let envios = fake.wait_sends(3);
+    assert_eq!(json(&envios[2])["message"]["data"]["body"], "quinta");
+}
+
+#[test]
+fn push_regras_de_quem_e_avisado() {
+    let fake = Fake::start();
+    let cred = Cred::new();
+    let env = start_push(&fake, &cred, "400");
+    let mut c = cena(&env);
+    c.beto.push_register("tok-beto");
+    let beto = c.beto_id;
+    let janela = Duration::from_millis(1400);
+    let ultimo = |n: usize| json(&fake.wait_sends(n)[n - 1])["message"]["data"].clone();
+
+    // canal comum sem menção: ninguém é avisado
+    c.ana.texto(c.geral, "bom dia pessoal");
+    fake.still_at(0, janela);
+
+    // menção direta
+    let id = c.ana.texto(c.geral, &format!("oi <@{beto}>, olha **isso**"));
+    let d = ultimo(1);
+    assert_eq!(d["kind"], "mention");
+    assert_eq!(d["title"], "ana em #geral (Casa)");
+    assert_eq!(d["body"], "oi @beto, olha isso");
+    assert_eq!(d["channel_id"], c.geral.to_string());
+    assert_eq!(d["server_id"], c.server_id.to_string());
+    assert_eq!(d["message_id"], id.to_string());
+
+    // @everyone e @here (o Beto está conectado, então os dois valem)
+    c.ana.texto(c.geral, "@everyone reunião agora");
+    assert_eq!(ultimo(2)["kind"], "mention");
+    c.ana.texto(c.geral, "@here quem está aí?");
+    assert_eq!(ultimo(3)["body"], "@here quem está aí?");
+
+    // resposta a uma mensagem do Beto
+    let pergunta = c.beto.texto(c.geral, "alguém viu o relatório?");
+    c.ana.wait("a pergunta do Beto", |m| matches!(m, S2C::Message(x) if x.id == pergunta).then_some(()));
+    fake.still_at(3, Duration::from_millis(500));
+    c.ana.send(C2S::Send { channel_id: c.geral, content: "vi sim".into(), reply_to: Some(pergunta), nonce: 0, attachments: vec![] });
+    let d = ultimo(4);
+    assert_eq!((d["kind"].as_str(), d["body"].as_str()), (Some("mention"), Some("vi sim")));
+
+    // o autor nunca é avisado da própria menção
+    c.beto.texto(c.geral, &format!("eu mesmo <@{beto}>"));
+    fake.still_at(4, janela);
+
+    // não perturbe
+    c.beto.send(C2S::SetStatus { status: telacast_proto::Status::Dnd });
+    c.beto.wait("status DND", |m| matches!(m, S2C::Snapshot(s) if s.me.status == telacast_proto::Status::Dnd).then_some(()));
+    c.ana.texto(c.dm, "dm com DND");
+    c.ana.texto(c.geral, &format!("<@{beto}> com DND"));
+    fake.still_at(4, janela);
+    c.beto.send(C2S::SetStatus { status: telacast_proto::Status::Online });
+    c.beto.wait("status online", |m| matches!(m, S2C::Snapshot(s) if s.me.status == telacast_proto::Status::Online).then_some(()));
+
+    // bloqueio: quem o Beto bloqueou não o faz receber push, nem citando
+    c.beto.send(C2S::Block { user_id: c.carla_id });
+    c.beto.wait("bloqueio", |m| matches!(m, S2C::Snapshot(s) if !s.blocked.is_empty()).then_some(()));
+    c.carla.texto(c.geral, &format!("<@{beto}> ei"));
+    fake.still_at(4, janela);
+    c.beto.send(C2S::Unblock { user_id: c.carla_id });
+    c.beto.wait("desbloqueio", |m| matches!(m, S2C::Snapshot(s) if s.blocked.is_empty()).then_some(()));
+    c.carla.texto(c.geral, &format!("<@{beto}> agora vai"));
+    assert_eq!(ultimo(5)["title"], "carla em #geral (Casa)");
+
+    // pedido de amizade
+    c.ana.send(C2S::FriendRequest { username: "beto".into() });
+    let d = ultimo(6);
+    assert_eq!(d["kind"], "friend_request");
+    assert_eq!(d["title"], "Pedido de amizade");
+    assert_eq!(d["body"], "ana quer ser seu amigo");
+    assert_eq!(d["author_id"], c.ana_id.to_string());
+    assert_eq!((d["channel_id"].as_str(), d["message_id"].as_str(), d["server_id"].as_str()), (Some(""), Some(""), Some("")));
+    // aceitar o pedido (ou pedir de volta) não gera aviso novo para quem pediu: ela não tem token
+    c.beto.send(C2S::FriendAccept { user_id: c.ana_id });
+    c.beto.sync();
+    fake.still_at(6, Duration::from_millis(800));
+}
+
+#[test]
+fn push_token_invalido_e_apagado_e_tentativas() {
+    let fake = Fake::start();
+    let cred = Cred::new();
+    let env = start_push(&fake, &cred, "300");
+    let mut c = cena(&env);
+    c.beto.push_register("tok-morto");
+    fake.script.lock().unwrap().push_back(404);
+    c.ana.texto(c.dm, "um");
+    fake.wait_sends(1);
+    let t = Instant::now();
+    while !env.tokens(c.beto_id).is_empty() {
+        assert!(t.elapsed() < Duration::from_secs(5), "o token inválido devia ter sido apagado");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(fake.sends().len(), 1, "404 não é repetido");
+
+    // 503 uma vez: tenta de novo e o token fica
+    c.beto.push_register("tok-bom");
+    fake.script.lock().unwrap().extend([503, 200]);
+    c.ana.texto(c.dm, "dois");
+    fake.wait_sends(3);
+    fake.still_at(3, Duration::from_millis(800));
+    assert_eq!(env.tokens(c.beto_id), vec!["tok-bom"]);
+
+    // 429 duas vezes: uma nova tentativa só, depois descarta (e o token continua)
+    fake.script.lock().unwrap().extend([429, 429]);
+    c.ana.texto(c.dm, "tres");
+    fake.wait_sends(5);
+    fake.still_at(5, Duration::from_millis(1000));
+    assert_eq!(env.tokens(c.beto_id), vec!["tok-bom"]);
+}
+
+#[test]
+fn push_duas_mensagens_em_3s_viram_um_envio() {
+    let fake = Fake::start();
+    let cred = Cred::new();
+    let env = start_push(&fake, &cred, "3000"); // a janela padrão do contrato
+    let mut c = cena(&env);
+    c.beto.push_register("tok-beto");
+    let t0 = Instant::now();
+    c.ana.texto(c.dm, "primeira");
+    c.ana.texto(c.dm, "segunda");
+    // outro canal não entra no mesmo grupo
+    c.ana.texto(c.geral, &format!("<@{}> aqui", c.beto_id));
+    let envios = fake.wait_sends(2);
+    assert!(t0.elapsed() >= Duration::from_millis(2900), "a janela de 3 s segura o envio");
+    fake.still_at(2, Duration::from_millis(1200));
+    let bodies: Vec<String> = fake.sends().iter().map(|r| json(r)["message"]["data"]["body"].as_str().unwrap().to_string()).collect();
+    assert!(bodies.contains(&"segunda".to_string()), "o último vence: {bodies:?}");
+    assert!(!bodies.contains(&"primeira".to_string()), "{bodies:?}");
+    assert_eq!(envios.len(), 2);
 }

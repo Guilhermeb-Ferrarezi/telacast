@@ -43,6 +43,8 @@ TELACAST_FILES_DIR=/var/lib/telacast/files
 # TELACAST_MAX_UPLOAD_MB=10
 ```
 
+Notificações push (opcional): seção 8. Sem `TELACAST_FCM_SERVICE_ACCOUNT` o push fica desligado e o log mostra um aviso na subida.
+
 Miniaturas: não há variável nova. O servidor decodifica até 2 imagens ao mesmo tempo, cada uma de até 64 megapixels (pico de ~250 MB de RAM por imagem, mais a miniatura); numa VPS com pouca memória isso é o teto de uso extra.
 
 `/etc/systemd/system/telacast.service`:
@@ -121,6 +123,53 @@ O app **recusa** `ws://` para qualquer servidor fora da sua máquina e da rede l
 - [ ] Login pelo app com `wss://` funciona; com `ws://` o app recusa.
 - [ ] Backup restaurado uma vez num banco de teste.
 - [ ] Senha do Postgres trocada e `/etc/telacast.env` com permissão 600.
+
+## 8. Notificações push (Android, Firebase Cloud Messaging)
+
+O servidor manda o aviso ao FCM; o Google o entrega ao aparelho. **Opcional**: sem a credencial tudo funciona, só
+não há push. Protocolo e regras de quem é avisado: `docs/PROTOCOL.md`, seção 11.
+
+1. Em <https://console.firebase.google.com> crie um projeto (pode ser sem Analytics) e **adicione o app Android**
+   (o nome do pacote é o do APK, `app.telacast`). Baixe o `google-services.json` e entregue a quem compila o app
+   (ele vai no app, não no servidor; não vai para o repositório).
+2. **Configurações do projeto > Contas de serviço > Gerar nova chave privada**. Baixa um JSON com `project_id`,
+   `client_email` e `private_key`. Confira em *Cloud Messaging* que a **API Firebase Cloud Messaging (v1)** está
+   ativa (a API antiga "legada" não serve).
+3. Na VPS, guarde a chave fora do repositório e só legível pelo serviço:
+
+```bash
+sudo install -d -m 755 /etc/telacast
+sudo install -m 600 -o telacast -g telacast service-account.json /etc/telacast/service-account.json
+shred -u service-account.json            # apague a cópia baixada
+```
+
+4. Em `/etc/telacast.env` acrescente e reinicie (`sudo systemctl restart telacast`):
+
+```
+TELACAST_FCM_SERVICE_ACCOUNT=/etc/telacast/service-account.json
+```
+
+   O log deve mostrar `push ligado (FCM, projeto ...)`. Se aparecer `push desligado: ...` o motivo vem na mesma
+   linha (arquivo ilegível, JSON sem `private_key`, chave que não é RSA). O conteúdo da chave nunca é escrito no log.
+   Se o `ProtectSystem=strict` do serviço impedir a leitura, `/etc` já é legível; não precisa de `ReadWritePaths`.
+5. Teste: instale o app num celular, entre na conta, bloqueie a tela e peça a outra pessoa que mande uma DM.
+
+Detalhes:
+
+- A chave de serviço dá poder de enviar push em nome do projeto: trate como senha (permissão 600, fora do git, fora
+  do backup público). Se vazar, apague-a em *Contas de serviço* e gere outra.
+- O servidor assina um JWT (RS256) com essa chave, troca por um token de acesso em `oauth2.googleapis.com` (guardado
+  em memória até 1 minuto antes de vencer) e envia por HTTPS a `fcm.googleapis.com` (HTTP v1). Precisa de saída
+  HTTPS para esses dois nomes.
+- Variáveis para teste/rede especial: `TELACAST_FCM_ENDPOINT` (endereço completo do envio; `{project_id}` é trocado
+  pelo projeto), `TELACAST_FCM_TOKEN_URI` (endereço da troca de credencial). Ajustes finos: `TELACAST_PUSH_COALESCE_MS`
+  (janela de agrupamento, padrão 3000) e `TELACAST_FCM_RETRY_MS` (espera antes da nova tentativa, padrão 2000).
+- O banco ganha a tabela `push_tokens` na próxima subida do servidor (migração `0008`, automática).
+
+**Privacidade:** o aviso leva o **texto da mensagem** (até 180 caracteres, sem Markdown), o nome do autor e o nome
+do canal e do servidor, e esses dados **passam pelos servidores do Google** até chegar ao aparelho. Quem não quiser
+isso deve deixar o push desligado. Opção futura: enviar só um "toque" sem texto (o app acorda, abre o socket e
+monta a notificação sozinho), que evitaria expor o conteúdo ao Google ao custo de depender da conexão do app.
 
 ## Atualização do app (verificador de hash)
 

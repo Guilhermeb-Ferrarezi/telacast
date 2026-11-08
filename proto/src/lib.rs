@@ -292,6 +292,16 @@ pub enum C2S {
     /// Remove amigo, recusa ou cancela pedido.
     FriendRemove { user_id: i64 },
     OpenDm { user_id: i64 },
+    /// Registra o token de notificação push deste aparelho (`platform` = `"fcm"`). Idempotente: repetir o
+    /// mesmo token só renova; um token novo do mesmo aparelho convive com o antigo até o limite de 10 por
+    /// conta (os mais antigos saem). Sucesso é silencioso; token vazio, com mais de 4096 bytes ou
+    /// plataforma desconhecida dá `Error InvalidInput`. Ver `docs/PROTOCOL.md`, seção 11.
+    PushRegister { token: String, platform: String },
+    /// Apaga o token (mande antes de `Logout`). Token desconhecido não é erro.
+    PushUnregister { token: String },
+    /// Estado POR CONEXÃO: o app está em primeiro plano e visível. Começa `false` em toda conexão; enquanto
+    /// alguma conexão da conta estiver com `true`, a conta não recebe push. Some ao fechar a conexão.
+    SetFocus { focused: bool },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -328,6 +338,50 @@ pub enum S2C {
     Typing { channel_id: i64, user_id: i64 },
     DmOpened { channel_id: i64 },
     ServerJoined { server_id: i64 },
+}
+
+/// Tipos de notificação push (`PushData.kind`).
+pub const PUSH_KIND_DM: &str = "dm";
+pub const PUSH_KIND_MENTION: &str = "mention";
+/// Reservado para uma configuração futura ("avisar todas as mensagens deste canal"); hoje o servidor não manda.
+pub const PUSH_KIND_MESSAGE: &str = "message";
+pub const PUSH_KIND_FRIEND_REQUEST: &str = "friend_request";
+
+/// Plataformas aceitas em `C2S::PushRegister`.
+pub const PUSH_PLATFORM_FCM: &str = "fcm";
+/// Tamanho máximo do token de push, em bytes.
+pub const PUSH_TOKEN_MAX_BYTES: usize = 4096;
+/// Tokens por conta; o registro de um novo expulsa o mais antigo.
+pub const PUSH_MAX_TOKENS_PER_USER: usize = 10;
+/// Tamanho máximo de `PushData.body`, em caracteres.
+pub const PUSH_BODY_MAX_CHARS: usize = 180;
+
+/// Dados de uma notificação push, como o servidor os manda ao FCM (mensagem de dados, sem bloco
+/// `notification`: o app monta a notificação). **Todos os valores são strings**, exigência do FCM; ids são
+/// números decimais em texto e `ts` é milissegundos desde 1970. Campos que não se aplicam vêm `""`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct PushData {
+    /// `dm`, `mention`, `message` ou `friend_request` (ver `PUSH_KIND_*`). Valor novo: trate como `message`.
+    pub kind: String,
+    /// Canal da mensagem. Vazio em `friend_request`.
+    #[serde(default)]
+    pub channel_id: String,
+    /// Mensagem que originou o aviso. Vazio em `friend_request`.
+    #[serde(default)]
+    pub message_id: String,
+    /// Servidor do canal. Vazio em DM e em `friend_request`.
+    #[serde(default)]
+    pub server_id: String,
+    #[serde(default)]
+    pub title: String,
+    /// Texto simples (sem Markdown), no máximo `PUSH_BODY_MAX_CHARS` caracteres.
+    #[serde(default)]
+    pub body: String,
+    /// Quem escreveu a mensagem (ou pediu amizade).
+    #[serde(default)]
+    pub author_id: String,
+    #[serde(default)]
+    pub ts: String,
 }
 
 #[cfg(test)]

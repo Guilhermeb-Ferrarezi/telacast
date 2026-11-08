@@ -22,9 +22,9 @@ Atualizado em 2026-11-07 (marcas: `[x]` pronto, `[~]` parcial, `[ ]` pendente).
 | Social | amigos (pedir/aceitar/remover), DMs 1:1, presença com **status manual** (online, ausente, não perturbe, invisível) e **ausente automático** |
 | Vídeo | transmissão de tela por canal: captura X11, NVENC, relay por WebSocket, fallback openh264 |
 | Interface | tema **Grafite** (camadas de cinza, âmbar, serifa), barra de servidores com pílula 8/20/40 e sigla, cabeçalho do servidor com menu, canais com categorias, painel de membros, login, modais, barra de ações no hover |
-| Infra | Postgres 18, ids snowflake `i64`, migrações embutidas, **heartbeat e reconexão automática**, testes unitários e **22 e2e**, TLS (wss, guia em `docs/DEPLOY.md`, ainda não testado numa VPS de verdade) |
+| Infra | Postgres 18, ids snowflake `i64`, migrações embutidas, **heartbeat e reconexão automática**, testes unitários e **28 e2e**, TLS (wss, guia em `docs/DEPLOY.md`, ainda não testado numa VPS de verdade) |
 
-Lacunas grandes: **sem áudio, sem cargos/permissões, sem moderação, sem tópicos/threads, sem notificações.** (Anexos, busca, reações, fixadas e bloqueio já existem.)
+Lacunas grandes: **sem áudio, sem cargos/permissões, sem moderação, sem tópicos/threads; notificações do sistema só no desktop (sem som, sem silenciar canal).** (Anexos, busca, reações, fixadas e bloqueio já existem.)
 
 ## Decisões já tomadas
 
@@ -140,8 +140,9 @@ Prioridade máxima do [R02]; moderação do [R07].
 ## Fase 4 — Social, perfil, interface e sistema
 
 **Social ([R05])**
-- [~] P0: **status manual** (online/ausente/não perturbe/invisível: feito, salvo na conta, menu no cartão do usuário, bolinha com forma própria) e **ausente automático** (10 min sem entrada, conta suspensão do PC; feito); **bloquear usuário feito** (some a amizade; ninguém abre DM nem manda mensagem privada ao outro; o bloqueado não descobre; mensagens dele em servidores ficam escondidas com "Mostrar mensagem"; aba "Bloqueados" no Início; menu do botão direito em membros e amigos). **Falta** o não perturbe silenciar notificações (ainda não há notificações). **S / M**
-- [ ] P1: silenciar servidor/canal/DM, **notificação desktop + som** respeitando DND, abas Bloqueados/busca em amigos. **S–M**
+- [~] P0: **status manual** (online/ausente/não perturbe/invisível: feito, salvo na conta, menu no cartão do usuário, bolinha com forma própria) e **ausente automático** (10 min sem entrada, conta suspensão do PC; feito); **bloquear usuário feito** (some a amizade; ninguém abre DM nem manda mensagem privada ao outro; o bloqueado não descobre; mensagens dele em servidores ficam escondidas com "Mostrar mensagem"; aba "Bloqueados" no Início; menu do botão direito em membros e amigos). O não perturbe já silencia o **push do Android** (servidor); e a **notificação desktop** (feita, ver abaixo). **S / M**
+- [~] **Push no servidor para o Android (FCM) feito** (2026-11-07): `PushRegister`/`PushUnregister`/`SetFocus`, tabela `push_tokens` (máx. 10 por conta), decisão pura de quem é avisado (`server/src/push.rs`: DM, menção/resposta/`@everyone`/`@here`, pedido de amizade; nunca o autor, quem tem o app em foco, bloqueado ou DND), corpo sem Markdown, anti-spam (janela de 3 s por canal, 20/min), envio HTTP v1 com OAuth2 RS256 em fila própria, token inválido apagado, 6 e2e com Google falso. Contrato em `docs/PROTOCOL.md` seção 11, configuração em `docs/DEPLOY.md` seção 8. **Falta:** o cliente Android registrar o token e montar a notificação; **preferências** de notificação por canal/servidor (o ponto de extensão é `ChannelNotify` em `push.rs`, sem tabela ainda) e **silenciar** servidor/canal/DM; **push para o desktop** (hoje a notificação desktop precisa do app aberto); modo "só um toque, sem texto" por privacidade; cancelar a notificação quando outro aparelho lê o canal; não enviar a tokens de sessões já revogadas.
+- [~] P1: **notificação desktop feita** (2026-11-07, `docs/NOTIFICACOES.md`: DM, menção/resposta/`@everyone`/`@here` e pedido de amizade com a janela fora de foco, nunca em DND/bloqueado/próprio/histórico, 1 por canal a cada 3 s e 10 por minuto, clique abre o canal, contador `(N) Telacast` no título, ligar/desligar em "Minha conta"); **faltam** silenciar servidor/canal/DM, **som**, abas Bloqueados/busca em amigos. **S–M**
 - [ ] P2: **DM em grupo**, status personalizado, níveis de notificação, privacidade (quem me adiciona/manda DM), ignorar. **S–L**
 - [ ] P3: chamadas em DM (depende da Fase 2), atividade/rich presence, sugestões de amigos
 
@@ -157,7 +158,7 @@ Prioridade máxima do [R02]; moderação do [R07].
 - [ ] P3: i18n, atalhos remapeáveis, "modo desenvolvedor".
 
 **Sistema ([R09])**
-- [ ] P1: **bandeja + fechar para a bandeja**, **notificações nativas**, **atalhos globais no X11** (mutar, PTT), arrastar-e-soltar. **S–M**
+- [~] P1: **bandeja + fechar para a bandeja**, **notificações nativas feitas no Linux (D-Bus, testado) e no Windows (toast, só compila; falta rodar num Windows)**, **atalhos globais no X11** (mutar, PTT), arrastar-e-soltar. **S–M**
 - [ ] P2: detecção de jogo por `/proc` ("Jogando X"), autostart, **deep link `telacast://`** para convites, aviso de nova versão, ausente automático por suspensão. **S–M**
 - [ ] P3: RPC local `telacast-ipc`, janela de overlay flutuante, auto-update assinado, atalhos no Wayland. **M–L**
 - Arquitetura: manter captura + NVENC em thread/processo auxiliar, para uma falha do driver não derrubar a UI ([R09]).
@@ -209,7 +210,7 @@ Fica relevante só para 4K ou 144 fps.
 
 **Plano detalhado:** [`docs/MOBILE-PLAN.md`](docs/MOBILE-PLAN.md) (stack, passos A1–D3, protocolo de execução sem supervisão, riscos). Resumo:
 - App nativo **Kotlin + Jetpack Compose** com o tema Grafite; mesmo protocolo JSON/WebSocket do desktop, garantido por arquivos de exemplo (`proto/fixtures/`) lidos pelo Rust e pelo Kotlin; telas conferidas por captura (Paparazzi), sem aparelho.
-- Vídeo por `MediaCodec` (assistir) e `MediaProjection` (transmitir); notificações locais primeiro, push (FCM) só depois do servidor público.
+- Vídeo por `MediaCodec` (assistir) e `MediaProjection` (transmitir); notificações locais primeiro; **o servidor já sabe mandar push (FCM)**, falta o app registrar o token (ver Fase 4, Social).
 - Egui no Android descartado (sem campo de texto nativo nem acessibilidade; tudo de vídeo e notificação viraria JNI).
 
 **Exigências para o servidor** (entram nas Fases 0 a 4 do desktop, para o mobile não pedir retrabalho): TLS (`wss://`, o Android bloqueia `ws://` fora de debug), protocolo **versionado** e estável, token por dispositivo, histórico paginado por id, e push (Firebase ou serviço próprio) quando houver servidor público.

@@ -125,6 +125,9 @@ variantes!(nome_c2s, TODAS_C2S, C2S;
     C2S::FriendAccept { .. } => "FriendAccept",
     C2S::FriendRemove { .. } => "FriendRemove",
     C2S::OpenDm { .. } => "OpenDm",
+    C2S::PushRegister { .. } => "PushRegister",
+    C2S::PushUnregister { .. } => "PushUnregister",
+    C2S::SetFocus { .. } => "SetFocus",
 );
 
 variantes!(nome_s2c, TODAS_S2C, S2C;
@@ -357,6 +360,15 @@ fn amostras_c2s() -> Vec<(&'static str, C2S)> {
         ("FriendAccept", C2S::FriendAccept { user_id: ANA }),
         ("FriendRemove", C2S::FriendRemove { user_id: ANA }),
         ("OpenDm", C2S::OpenDm { user_id: MARINA }),
+        ("PushRegister", C2S::PushRegister {
+            token: "fWk3p0Q9R2eT:APA91bHn5xYc7LmZ1vUq8dJ4sOa2GtB6iNwKrE3yXf0hCzVpMu9lDjS7oIgTaQeW1bR5nYkHcL8mXvZ2dJq4sPa6tUo3iEwBrN0yKfG7hCzVlM9uDjSxIgTaQeW".into(),
+            platform: PUSH_PLATFORM_FCM.into(),
+        }),
+        ("PushUnregister", C2S::PushUnregister {
+            token: "fWk3p0Q9R2eT:APA91bHn5xYc7LmZ1vUq8dJ4sOa2GtB6iNwKrE3yXf0hCzVpMu9lDjS7oIgTaQeW1bR5nYkHcL8mXvZ2dJq4sPa6tUo3iEwBrN0yKfG7hCzVlM9uDjSxIgTaQeW".into(),
+        }),
+        ("SetFocus", C2S::SetFocus { focused: true }),
+        ("SetFocus.segundo_plano", C2S::SetFocus { focused: false }),
     ]
 }
 
@@ -450,6 +462,46 @@ fn fixtures_s2c() {
 fn fixtures_http() {
     confere_pasta("http/upload", vec![("UploadResponse", imagem())]);
     confere_pasta("http/update", vec![("UpdateManifest", manifesto())]);
+}
+
+/// Dados do push (FCM data message): o objeto `data` inteiro, só strings. Um arquivo por tipo de aviso.
+#[test]
+fn fixtures_push() {
+    let base = PushData {
+        kind: PUSH_KIND_DM.into(),
+        channel_id: DM_MARINA.to_string(),
+        message_id: MSG3.to_string(),
+        server_id: String::new(),
+        title: "marina.souza".into(),
+        body: "Bom dia, pessoal! Segue a foto da viagem e o relatório. Valeu @guilherme 🎉".into(),
+        author_id: MARINA.to_string(),
+        ts: (TS + 90_000).to_string(),
+    };
+    let mencao = PushData {
+        kind: PUSH_KIND_MENTION.into(),
+        channel_id: GERAL.to_string(),
+        server_id: SERVIDOR.to_string(),
+        title: "marina.souza em #geral (Turma do Telacast)".into(),
+        body: "@guilherme olha isso: spoiler oculto 📎 foto da praia.png".into(),
+        ..base.clone()
+    };
+    let amizade = PushData {
+        kind: PUSH_KIND_FRIEND_REQUEST.into(),
+        channel_id: String::new(),
+        message_id: String::new(),
+        server_id: String::new(),
+        title: "Pedido de amizade".into(),
+        body: "ana-clara quer ser seu amigo".into(),
+        author_id: ANA.to_string(),
+        ts: (TS + 120_000).to_string(),
+    };
+    for d in [&base, &mencao, &amizade] {
+        // o FCM só aceita strings: nada de número ou null no objeto
+        let v: serde_json::Value = serde_json::to_value(d).unwrap();
+        assert!(v.as_object().unwrap().values().all(|x| x.is_string()));
+        assert!(d.body.chars().count() <= PUSH_BODY_MAX_CHARS);
+    }
+    confere_pasta("push", vec![("PushData.dm", base), ("PushData.mention", mencao), ("PushData.friend_request", amizade)]);
 }
 
 /// Os ids grandes precisam sobreviver na fixture como números inteiros (o Kotlin lê como Long).

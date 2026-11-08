@@ -898,7 +898,8 @@ impl Store {
     // --------------------------------------------------------------- amizades
 
     /// Pedido de `a` para `b`. Se `b` já tinha pedido a `a`, vira amizade.
-    pub async fn friend_request(&self, a: i64, b: i64) -> R<()> {
+    /// Devolve `true` só quando nasceu um pedido pendente novo (é o que merece aviso push).
+    pub async fn friend_request(&self, a: i64, b: i64) -> R<bool> {
         let mut tx = self.pool.begin().await?;
         let accepted = sqlx::query("UPDATE friendships SET accepted = true WHERE requester_id = $2 AND target_id = $1")
             .bind(a)
@@ -906,16 +907,20 @@ impl Store {
             .execute(&mut *tx)
             .await?
             .rows_affected();
+        let mut created = false;
         if accepted == 0 {
-            sqlx::query(
+            created = sqlx::query(
                 "INSERT INTO friendships(requester_id, target_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             )
             .bind(a)
             .bind(b)
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected()
+                > 0;
         }
-        tx.commit().await
+        tx.commit().await?;
+        Ok(created)
     }
 
     /// `me` aceita o pedido que `other` enviou.
@@ -1089,6 +1094,85 @@ impl Store {
         .bind(me)
         .fetch_all(&self.pool)
         .await?;
+        Ok(r.into_iter().map(|x| x.0).collect())
+    }
+
+    // ----------------------------------------------------------------- push
+
+    /// Registra (ou renova) o token de `user`. Se o token era de outra conta, passa para esta. Depois
+    /// apaga os mais antigos além de `max` tokens da conta.
+    pub async fn push_register(&self, user: i64, token: &str, platform: &str, max: usize) -> R<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO push_tokens(user_id, token, platform) VALUES ($1, $2, $3)
+             ON CONFLICT (token) DO UPDATE SET
+                 created_at = CASE WHEN push_tokens.user_id = EXCLUDED.user_id THEN push_tokens.created_at ELSE now() END,
+                 user_id = EXCLUDED.user_id, platform = EXCLUDED.platform, last_seen = now()",
+        )
+        .bind(user)
+        .bind(token)
+        .bind(platform)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM push_tokens WHERE user_id = $1 AND token NOT IN (
+                 SELECT token FROM push_tokens WHERE user_id = $1 ORDER BY last_seen DESC, created_at DESC, token LIMIT $2)",
+        )
+        .bind(user)
+        .bind(max as i64)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
+    }
+
+    /// Apaga um token da própria conta.
+    pub async fn push_unregister(&self, user: i64, token: &str) -> R<()> {
+        sqlx::query("DELETE FROM push_tokens WHERE user_id = $1 AND token = $2").bind(user).bind(token).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Apaga um token que o FCM disse não existir mais.
+    pub async fn push_delete_token(&self, token: &str) -> R<()> {
+        sqlx::query("DELETE FROM push_tokens WHERE token = $1").bind(token).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// (usuário, token) de cada aparelho registrado dos usuários dados.
+    pub async fn push_tokens_for(&self, users: &[i64]) -> R<Vec<(i64, String)>> {
+        sqlx::query_as("SELECT user_id, token FROM push_tokens WHERE user_id = ANY($1) ORDER BY user_id, last_seen DESC")
+            .bind(users)
+            .fetch_all(&self.pool)
+            .await
+    }
+
+    /// Dados do canal para montar o aviso: (tipo, servidor, nome do canal, nome do servidor).
+    pub async fn push_channel_info(&self, channel: i64) -> R<Option<(i16, Option<i64>, String, Option<String>)>> {
+        sqlx::query_as(
+            "SELECT c.kind, c.server_id, c.name, s.name FROM channels c LEFT JOIN servers s ON s.id = c.server_id WHERE c.id = $1",
+        )
+        .bind(channel)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Nomes de exibição dos usuários dados.
+    pub async fn display_names(&self, ids: &[i64]) -> R<Vec<(i64, String)>> {
+        sqlx::query_as("SELECT id, display_name FROM users WHERE id = ANY($1)").bind(ids).fetch_all(&self.pool).await
+    }
+
+    /// Autor de uma mensagem.
+    pub async fn message_author(&self, id: i64) -> R<Option<i64>> {
+        let r: Option<(i64,)> = sqlx::query_as("SELECT author_id FROM messages WHERE id = $1").bind(id).fetch_optional(&self.pool).await?;
+        Ok(r.map(|x| x.0))
+    }
+
+    /// Dos `users` dados, quem bloqueou `blocked`.
+    pub async fn blockers_among(&self, blocked: i64, users: &[i64]) -> R<Vec<i64>> {
+        let r: Vec<(i64,)> = sqlx::query_as("SELECT user_id FROM blocks WHERE blocked_id = $1 AND user_id = ANY($2)")
+            .bind(blocked)
+            .bind(users)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(r.into_iter().map(|x| x.0).collect())
     }
 }

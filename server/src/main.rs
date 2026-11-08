@@ -2,6 +2,7 @@
 mod auth;
 mod ids;
 mod files;
+mod push;
 mod thumbs;
 mod updates;
 mod store;
@@ -160,6 +161,10 @@ struct App {
     dummy_hash: String,
     /// Quem está em canal de voz (só em memória): usuário -> estado.
     voice: Mutex<HashMap<i64, VoiceEntry>>,
+    /// Conexões em primeiro plano (`SetFocus{true}`); toda conexão começa fora daqui.
+    focused: Mutex<HashSet<u64>>,
+    /// Notificações push; `None` sem `TELACAST_FCM_SERVICE_ACCOUNT`.
+    push: Option<push::PushService>,
 }
 
 /// Estado de voz de um usuário no servidor, mais o balde de fichas que limita os quadros dele.
@@ -498,6 +503,7 @@ impl App {
     fn disconnect(self: &Arc<Self>, uid: i64, cid: u64) {
         self.conn_tokens.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
         self.idle.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
+        self.focused.lock().unwrap_or_else(|e| e.into_inner()).remove(&cid);
         let last = {
             let mut c = self.conns.lock().unwrap_or_else(|e| e.into_inner());
             match c.get_mut(&uid) {
@@ -684,6 +690,7 @@ async fn serve(store: Store, sf: ids::Snowflake) {
     let addr = std::env::var("TELACAST_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let permits = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 4);
     let dummy_hash = auth::hash_password("senha-falsa-para-igualar-o-tempo").expect("argon2");
+    let push = push::PushService::from_env(store.clone());
     let app = Arc::new(App {
         store,
         sf,
@@ -701,6 +708,8 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         nonces: Mutex::new(Default::default()),
         dummy_hash,
         voice: Mutex::new(HashMap::new()),
+        focused: Mutex::new(HashSet::new()),
+        push,
     });
     let router = Router::new()
         .route("/ws", get(gateway))
@@ -1305,6 +1314,7 @@ async fn handle_authed(
                         error!("add_mentions: {e}");
                     }
                     let to = app.store.participants(channel_id).await.unwrap_or_default();
+                    app.notify_message(msg.clone());
                     let out = S2C::Message(msg);
                     for u in to {
                         app.send_to(u, &out);
@@ -1549,10 +1559,16 @@ async fn handle_authed(
                 err(ErrorCode::NotFound, "Usuário não encontrado");
             } else if app.store.are_friends(me, other).await.unwrap_or(false) {
                 err(ErrorCode::InvalidInput, "Vocês já são amigos");
-            } else if let Err(e) = app.store.friend_request(me, other).await {
-                db_err("friend_request", e);
             } else {
-                app.push_many(&[me, other]).await;
+                match app.store.friend_request(me, other).await {
+                    Err(e) => db_err("friend_request", e),
+                    Ok(created) => {
+                        app.push_many(&[me, other]).await;
+                        if created {
+                            app.notify_friend_request(me, other);
+                        }
+                    }
+                }
             }
         }
         C2S::FriendAccept { user_id } => {
@@ -1582,6 +1598,39 @@ async fn handle_authed(
                         let _ = tx.send(S2C::DmOpened { channel_id });
                     }
                     Err(e) => db_err("open_dm", e),
+                }
+            }
+        }
+        C2S::PushRegister { token, platform } => {
+            if busy("push", 20, 60) {
+                err(ErrorCode::RateLimited, ERR_BUSY);
+                return true;
+            }
+            match push::validate_registration(&token, &platform) {
+                Err(msg) => err(ErrorCode::InvalidInput, msg),
+                Ok(token) => {
+                    if let Err(e) = app.store.push_register(me, token, &platform, p::PUSH_MAX_TOKENS_PER_USER).await {
+                        db_err("push_register", e);
+                    }
+                }
+            }
+        }
+        C2S::PushUnregister { token } => {
+            if busy("push", 20, 60) {
+                err(ErrorCode::RateLimited, ERR_BUSY);
+                return true;
+            }
+            if let Err(e) = app.store.push_unregister(me, token.trim()).await {
+                db_err("push_unregister", e);
+            }
+        }
+        C2S::SetFocus { focused } => {
+            if !busy("focus", 60, 10) {
+                let mut set = app.focused.lock().unwrap_or_else(|e| e.into_inner());
+                if focused {
+                    set.insert(cid);
+                } else {
+                    set.remove(&cid);
                 }
             }
         }

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 argon2 = "0.6.0"
+base64 = "0.22"
 axum = { version = "0.8.9", features = ["ws"] }
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
@@ -17,10 +18,13 @@ sha2 = "0.11.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 imagesize = "0.13"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros"] }
+telacast-md = { version = "0.1.0", path = "../md" }
 telacast-proto = { version = "0.1.0", path = "../proto" }
 tokio = { version = "1.54.1", features = ["full"] }
+ring = "0.17"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
 
 [dev-dependencies]
 tungstenite = "0.30.0"
