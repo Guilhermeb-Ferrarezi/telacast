@@ -72,6 +72,8 @@ class Container(
     apiDeAtualizacao: app.telacast.atualizacao.ApiDeAtualizacao? = null,
     /** Relatório do último crash (no app, o arquivo privado). */
     val relatorioDeCrash: app.telacast.diagnostico.RelatorioDeCrash? = null,
+    /** Serviço em primeiro plano "Telacast conectado" (no app: `FachadaDoServicoDeConexao`). */
+    servicoDeConexao: app.telacast.conexao.ServicoPersistente = app.telacast.conexao.ServicoPersistenteNulo,
 ) {
     val gateway = Gateway(escopo, transporte, relogio)
     val repositorio = Repository(escopo, gateway, relogio)
@@ -112,4 +114,30 @@ class Container(
         app.telacast.atualizacao.VerificadorDeAtualizacao(app.telacast.atualizacao.hexParaBytes(chaveDeAtualizacao)),
         instaladorDeApk, versaoDoApp, pastaDeAtualizacao, { preferencias.versaoVista }, { preferencias.versaoVista = it }, relogio,
     )
+
+    // ---- notificações locais e "Manter conectado" (C8)
+
+    /** Opção "Manter conectado" (Ajustes > Notificações). */
+    private val _manterConectado = kotlinx.coroutines.flow.MutableStateFlow(preferencias.manterConectado)
+    val manterConectado: kotlinx.coroutines.flow.StateFlow<Boolean> = _manterConectado
+    fun definirManterConectado(ligado: Boolean) { preferencias.manterConectado = ligado; _manterConectado.value = ligado }
+
+    val conexaoPersistente = app.telacast.conexao.GerenciadorDaConexaoPersistente(escopo, repositorio.estado, manterConectado, servicoDeConexao)
+
+    /** As mesmas regras do push do servidor, decididas aqui a partir do WebSocket vivo (sem Firebase); duplicatas com o FCM caem em `message_id`. */
+    val receptorLocal = app.telacast.notificacao.ReceptorLocal(receptorDePush, { foco.emPrimeiroPlano }, relogio).also { r ->
+        repositorio.aoMensagemAoVivo = r::aoMensagemAoVivo
+        repositorio.aoPedidoDeAmizade = r::aoPedidoDeAmizade
+    }
+
+    /** Retoma a sessão salva sem a interface (o serviço reiniciado pelo sistema, ou depois de ligar o aparelho). `true` se começou a conectar. */
+    fun retomarSessaoSalva(): Boolean {
+        val estado = repositorio.estado.value
+        if (estado.autenticado || estado.conexao !is app.telacast.net.EstadoConexao.Desconectado) return false
+        val token = cofre.ler() ?: return false
+        val servidor = preferencias.servidor.ifBlank { servidorPadrao }
+        if (servidor.isBlank()) return false
+        repositorio.entrar(servidor, app.telacast.net.Credencial.Retomar(token))
+        return true
+    }
 }

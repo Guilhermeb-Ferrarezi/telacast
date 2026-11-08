@@ -518,6 +518,76 @@ class IntegracaoTest {
         assertNull("plataforma sem publicação", runBlocking { api.manifesto("android-x86") })
     }
 
+    // ------------------------------------------------------------------ notificações locais (C8)
+
+    private class NotificadorGravador : app.telacast.push.Notificador {
+        val vistas = CopyOnWriteArrayList<app.telacast.push.ModeloDeNotificacao>()
+        override fun mostrar(modelo: app.telacast.push.ModeloDeNotificacao) { vistas += modelo }
+        override fun limparCanal(canal: Long) = Unit
+        override fun limparPedidos() = Unit
+    }
+
+    /** Com o app em segundo plano (sem FCM), a DM e a menção de outra pessoa viram notificação local com as regras e o texto do push do servidor. */
+    @Test fun notificacaoLocalDeDmEMencaoComOAppEmSegundoPlano() {
+        val anaId = ana.estado.eu!!.id; val bobId = bob.estado.eu!!.id
+        // amigos (a DM exige): tolera o que já exista de outros testes e desfaz no fim
+        ana.repo.pedirAmizade(bob.nome)
+        esperar("bob vê o pedido") { bob.estado.snapshot?.friends?.firstOrNull { it.user.id == anaId && it.status == app.telacast.proto.FriendStatus.Incoming } }
+        bob.repo.aceitarAmigo(anaId)
+        esperar("são amigos") { ana.estado.snapshot?.friends?.firstOrNull { it.user.id == bobId && it.status == app.telacast.proto.FriendStatus.Friend } }
+
+        val gravador = NotificadorGravador()
+        var naFrente = false
+        val push = app.telacast.push.ReceptorDePush(gravador, { naFrente })
+        val local = app.telacast.notificacao.ReceptorLocal(push, { naFrente }, antiSpam = app.telacast.notificacao.AntiSpam(janelaMs = 0))
+        bob.repo.aoMensagemAoVivo = local::aoMensagemAoVivo
+        bob.repo.aoPedidoDeAmizade = local::aoPedidoDeAmizade
+        try {
+            // --- DM
+            val antes = ana.avisos.size
+            ana.repo.abrirDm(bobId)
+            val dmId = esperar("DM aberta") { ana.avisos.drop(antes).filterIsInstance<Aviso.DmAberta>().firstOrNull() }.canal
+            esperar("bob conhece a DM") { bob.estado.snapshot?.dms?.firstOrNull { it.channelId == dmId } }
+            ana.repo.abrirCanal(dmId)
+            esperar("histórico da DM") { if (ana.estado.mensagens.containsKey(dmId)) true else null }
+            ana.repo.enviarMensagem(dmId, "oi **bob**, ||segredo|| tudo bem?")
+            val n = esperar("notificação local da DM") { gravador.vistas.firstOrNull { it.canal == app.telacast.push.CanalDeNotificacao.Dms } }
+            assertEquals(ana.nome, n.titulo); assertEquals("oi bob, spoiler oculto tudo bem?", n.texto); assertEquals("c:$dmId", n.tag)
+            assertEquals(app.telacast.push.DestinoDoToque.Dm(dmId), n.destino)
+
+            // --- o FCM entregando a mesma mensagem depois não duplica
+            val msgId = esperar("a DM no histórico de ana") { ana.estado.lista(dmId).firstOrNull { it.content.startsWith("oi ") } }.id
+            assertEquals(app.telacast.push.ResultadoDoPush.Duplicada, push.processar(mapOf("kind" to "dm", "channel_id" to "$dmId", "message_id" to "$msgId", "title" to ana.nome, "body" to "x", "author_id" to "$anaId")))
+
+            // --- app na frente: não notifica
+            naFrente = true; val tinha = gravador.vistas.size
+            ana.repo.enviarMensagem(dmId, "outra com o app aberto")
+            esperar("a mensagem chegou ao bob") { bob.estado.snapshot?.dms?.firstOrNull { it.channelId == dmId }?.let { if (bob.estado.naoLidos.contains(dmId)) true else null } }
+            Thread.sleep(300)
+            assertEquals("app na frente não notifica", tinha, gravador.vistas.size)
+            naFrente = false
+
+            // --- canal: sem menção não avisa; com menção avisa
+            val canal = novoCanal()
+            ana.repo.abrirCanal(canal); bob.repo.abrirCanal(canal) // bob "lê" o canal: o histórico não vira notificação
+            esperar("histórico no canal") { if (ana.estado.mensagens.containsKey(canal) && bob.estado.mensagens.containsKey(canal)) true else null }
+            bob.repo.fecharCanal() // e depois sai dele: em segundo plano
+            val tinha2 = gravador.vistas.size
+            ana.repo.enviarMensagem(canal, "bom dia, galera")
+            esperar("a conversa chegou") { ana.estado.mensagens[canal]?.firstOrNull { it.content == "bom dia, galera" } }
+            Thread.sleep(300)
+            assertEquals("canal sem menção não avisa", tinha2, gravador.vistas.size)
+            ana.repo.enviarMensagem(canal, "<@$bobId> olha **isso** @everyone")
+            val m = esperar("notificação da menção") { gravador.vistas.drop(tinha2).firstOrNull { it.canal == app.telacast.push.CanalDeNotificacao.Mencoes } }
+            assertEquals("${ana.nome} em #${ana.estado.snapshot!!.servers.flatMap { it.channels }.first { it.id == canal }.name} (Turma IT)", m.titulo)
+            assertEquals("@${bob.nome} olha isso @everyone", m.texto)
+        } finally {
+            bob.repo.aoMensagemAoVivo = null; bob.repo.aoPedidoDeAmizade = null
+            ana.repo.removerAmigo(bobId)
+            esperar("amizade desfeita") { if (ana.estado.snapshot?.friends?.none { it.user.id == bobId } == true) true else null }
+        }
+    }
+
     // ------------------------------------------------------------------ amizade, bloqueio, fixadas, busca e conta (B7/B8)
 
     @Test fun amizadeDmEBloqueio() {

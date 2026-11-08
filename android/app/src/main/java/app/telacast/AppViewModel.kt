@@ -441,6 +441,11 @@ class AppViewModel(private val c: Container) : ViewModel() {
         abrirVoz(sv.id, canal)
     }
 
+    // ------------------------------------------------------------------ notificações locais e "Manter conectado" (C8)
+
+    val manterConectado: StateFlow<Boolean> = c.manterConectado
+    fun definirManterConectado(ligado: Boolean) = c.definirManterConectado(ligado)
+
     // ------------------------------------------------------------------ atualização do app e relatório de crash (C7)
 
     val atualizacao: StateFlow<app.telacast.atualizacao.EstadoDaAtualizacao> = c.atualizacao.estado

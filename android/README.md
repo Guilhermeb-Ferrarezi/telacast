@@ -58,6 +58,11 @@ uma atualização que o Android aceite por cima da versão instalada: o amigo te
    (`telacast-server invite --uses 1 --days 2 --label amigo`).
 4. As permissões só são pedidas quando usadas: notificações ao entrar, microfone ao entrar numa chamada de voz, captura de tela ao transmitir.
 
+## Notificações
+
+- **Sem Firebase (padrão)**: Ajustes > Notificações > **Manter conectado** (ligado de fábrica) mantém um serviço discreto "Telacast conectado" e o app avisa de DMs, menções e pedidos de amizade com o app fechado, com as mesmas regras do push do servidor. Se as notificações atrasarem com a tela apagada, libere o Telacast da otimização de bateria do Android (botão no mesmo lugar).
+- **Com Firebase (opcional)**, abaixo: o servidor manda o push mesmo se o celular estiver sem conexão. O app deduplica: nunca aparecem duas notificações da mesma mensagem.
+
 ## Notificações (push) pelo Firebase
 
 Sem configuração o app funciona normalmente, mas **sem push com o app fechado** (as notificações só chegam enquanto o app está aberto ou na chamada de voz). Para ligar:

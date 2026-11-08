@@ -128,6 +128,8 @@ data class ModeloDeNotificacao(
     /** Conversas (dm, mention, message) viram `MessagingStyle` com até [MAX_LINHAS] linhas; pedido de amizade é texto simples. */
     val conversa: Boolean,
     val linha: LinhaDeMensagem,
+    /** Atualização dentro da janela anti-spam (notificação local): troca o texto sem tocar o som de novo. */
+    val silenciosa: Boolean = false,
     /** `#canal (servidor)` nas menções (o título do servidor é `autor em #canal (servidor)`); `null` em DM e pedido. */
     val tituloDaConversa: String? = null,
 ) {
@@ -158,7 +160,7 @@ data class ModeloDeNotificacao(
             val (autor, local) = if (d.tipo == TipoDePush.Mencao || d.tipo == TipoDePush.Mensagem) partirTitulo(titulo) else titulo to null
             return ModeloDeNotificacao(
                 canal, if (conversa) tagDoCanal(d.canal) else tagDoPedido(d.autor), titulo, texto, ts, DestinoDoToque.de(d), conversa,
-                LinhaDeMensagem(autor, texto, ts, d.mensagem), local,
+                LinhaDeMensagem(autor, texto, ts, d.mensagem), tituloDaConversa = local,
             )
         }
     }
@@ -191,18 +193,30 @@ object NotificadorNulo : Notificador {
 }
 
 /** Resultado de [ReceptorDePush.processar] (o receiver de teste imprime). */
-enum class ResultadoDoPush { Mostrada, AppEmPrimeiroPlano, Invalida }
+enum class ResultadoDoPush { Mostrada, AppEmPrimeiroPlano, Invalida, Duplicada }
 
-/** Junta as decisões puras: valida, aplica a política e manda para o [Notificador]. */
+/**
+ * Junta as decisões puras: valida, aplica a política, tira duplicatas e manda para o [Notificador]. É o MESMO caminho para o FCM e para as
+ * notificações locais (WebSocket vivo): a mesma mensagem (`message_id`; pedido de amizade por autor) só vira uma notificação, venha por onde vier.
+ */
 class ReceptorDePush(
     private val notificador: Notificador,
     private val emPrimeiroPlano: () -> Boolean,
     private val relogio: () -> Long = System::currentTimeMillis,
 ) {
+    private val vistos = object : LinkedHashMap<String, Unit>(256, 0.75f, false) { override fun removeEldestEntry(e: MutableMap.MutableEntry<String, Unit>?) = size > 300 }
+
     fun processar(dados: Map<String, String>, forcar: Boolean = false): ResultadoDoPush {
         val d = DadosDePush.de(dados) ?: return ResultadoDoPush.Invalida
+        return entregar(d, forcar)
+    }
+
+    @Synchronized fun entregar(d: DadosDePush, forcar: Boolean = false, silenciosa: Boolean = false): ResultadoDoPush {
         if (!PoliticaDePush.mostrar(emPrimeiroPlano(), forcar)) return ResultadoDoPush.AppEmPrimeiroPlano
-        notificador.mostrar(ModeloDeNotificacao.de(d, relogio()))
+        val chave = if (d.mensagem != 0L) "m:${d.mensagem}" else "f:${d.autor}"
+        if (!forcar && vistos.containsKey(chave)) return ResultadoDoPush.Duplicada
+        vistos[chave] = Unit
+        notificador.mostrar(ModeloDeNotificacao.de(d, relogio()).copy(silenciosa = silenciosa))
         return ResultadoDoPush.Mostrada
     }
 }

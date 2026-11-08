@@ -38,6 +38,7 @@ class DadosDaConversa(
     val buscaNoCanal: Boolean = false,
     val tamanhoDoTexto: Int = 1,
     val senhaTrocada: Int = 0,
+    val notificacoes: DadosDeNotificacoes = DadosDeNotificacoes(),
 )
 
 class AcoesDaConversa(

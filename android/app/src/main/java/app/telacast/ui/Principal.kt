@@ -302,7 +302,7 @@ private fun TelaCheiaDoDialogo(d: Dialogo, estado: AppState, conversa: DadosDaCo
             val servidor = estado.snapshot?.servers?.firstOrNull { sv -> sv.channels.any { it.id == estado.canalAberto } }
             TelaDeBusca(estado.busca, conversa.consultaDaBusca, conversa.buscaNoCanal, servidor != null, servidor?.name.orEmpty(), amb, conversa.agoraMs, conversa.zona, acoes.busca)
         }
-        Dialogo.Ajustes -> if (eu != null) TelaDeAjustes(eu, estado.sessoes, conversa.agoraMs, conversa.tamanhoDoTexto, conversa.senhaTrocada, acoes.ajustes, voz.estado.opcoes)
+        Dialogo.Ajustes -> if (eu != null) TelaDeAjustes(eu, estado.sessoes, conversa.agoraMs, conversa.tamanhoDoTexto, conversa.senhaTrocada, acoes.ajustes, voz.estado.opcoes, conversa.notificacoes)
         else -> Unit
     }
 }

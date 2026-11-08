@@ -8,6 +8,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- "Manter conectado": serviço mínimo que segura o processo e o WebSocket vivos para as notificações locais (sem Firebase) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- atualização pelo próprio app: o Android só deixa instalar se a pessoa liberar "instalar apps desconhecidos" para o Telacast -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
@@ -30,6 +33,15 @@
             </intent-filter>
         </service>
         <receiver android:name=".atualizacao.ReceptorDeInstalacao" android:exported="false" />
+        <receiver android:name=".conexao.ReceptorDeInicializacao" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+        <service android:name=".conexao.ServicoDeConexao" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Conexão persistente de chat para avisar de mensagens sem depender do Firebase" />
+        </service>
         <service
             android:name=".tela.ServicoDeProjecao"
             android:exported="false"

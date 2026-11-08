@@ -31,6 +31,10 @@ class PreferenciasAndroid(contexto: Context) : Preferencias {
         get() = p.getLong("ultima_dm", 0)
         set(v) { p.edit().putLong("ultima_dm", v).apply() }
 
+    override var manterConectado: Boolean
+        get() = p.getBoolean("manter_conectado", true)
+        set(v) { p.edit().putBoolean("manter_conectado", v).apply() }
+
     override var versaoVista: String
         get() = p.getString("versao_vista", "") ?: ""
         set(v) { p.edit().putString("versao_vista", v).apply() }

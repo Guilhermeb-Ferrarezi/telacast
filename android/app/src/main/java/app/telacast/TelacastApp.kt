@@ -21,6 +21,7 @@ class TelacastApp : Application() {
         app.telacast.push.criarCanaisDeNotificacao(this)
         app.telacast.tela.ServicoDeProjecao.criarCanal(this)
         app.telacast.atualizacao.criarCanalDeAtualizacao(this)
+        app.telacast.conexao.criarCanalDaConexao(this)
         container = Container(
             preferencias = PreferenciasAndroid(this),
             cofre = CofreKeystore(this),
@@ -31,7 +32,7 @@ class TelacastApp : Application() {
             notificador = app.telacast.push.NotificadorAndroid(this),
             provedorDeToken = app.telacast.push.ProvedorFirebase(this),
             fabricaDeSupressor = app.telacast.voz.SupressorRnnoise,
-            relatorioDeCrash = crash, chaveDeAtualizacao = BuildConfig.CHAVE_DE_ATUALIZACAO, versaoDoApp = BuildConfig.VERSION_NAME,
+            servicoDeConexao = app.telacast.conexao.FachadaDoServicoDeConexao(this), relatorioDeCrash = crash, chaveDeAtualizacao = BuildConfig.CHAVE_DE_ATUALIZACAO, versaoDoApp = BuildConfig.VERSION_NAME,
             instaladorDeApk = app.telacast.atualizacao.InstaladorAndroid(this), pastaDeAtualizacao = java.io.File(cacheDir, "atualizacao"),
             fabricaDeFonte = { app.telacast.tela.FonteAndroid(this) },
             fabricaDeDecodificador = { app.telacast.tela.DecodificadorAndroid() },

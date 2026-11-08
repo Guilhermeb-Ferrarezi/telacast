@@ -48,6 +48,7 @@ class NotificadorAndroid(private val ctx: Context) : Notificador {
             .setContentIntent(aoTocar(modelo))
             .setAutoCancel(true)
             .setWhen(modelo.ts).setShowWhen(true)
+            .setOnlyAlertOnce(modelo.silenciosa)
             .setCategory(if (modelo.conversa) NotificationCompat.CATEGORY_MESSAGE else NotificationCompat.CATEGORY_SOCIAL)
             .setPriority(if (modelo.canal.importancia == Importancia.Alta) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)
         if (modelo.conversa) {

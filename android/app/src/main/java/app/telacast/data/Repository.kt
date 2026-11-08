@@ -76,6 +76,11 @@ class Repository(
     /** Token da sessão atual (para guardar cifrado e usar no HTTP). */
     val token: String? get() = gateway.token
 
+    /** Mensagem NOVA ao vivo (`S2C::Message`, nunca histórico) já aplicada ao estado: as notificações locais ouvem aqui. */
+    @Volatile var aoMensagemAoVivo: ((Message, AppState) -> Unit)? = null
+    /** Pedido de amizade que chegou numa atualização (entre dois snapshots). */
+    @Volatile var aoPedidoDeAmizade: ((app.telacast.proto.User, AppState) -> Unit)? = null
+
     fun limparErroDeEntrada() = modificar { it.copy(erroDeEntrada = null) }
 
     // ------------------------------------------------------------------ navegação e leitura
@@ -338,10 +343,12 @@ class Repository(
         val mencoes = (sn.servers.flatMap { sv -> sv.channels.map { it.id to it.mentions } } + sn.dms.map { it.channelId to it.mentions })
             .filter { (id, n) -> n > 0 && id != aberto }.toMap()
         val existe = aberto != null && (sn.servers.any { sv -> sv.channels.any { it.id == aberto } } || sn.dms.any { it.channelId == aberto })
+        val anterior = s.snapshot
         _estado.value = s.copy(
             snapshot = sn, eu = sn.me, voz = sn.voice, naoLidos = naoLidos, mencoes = mencoes,
             canalAberto = if (existe) aberto else null,
         )
+        for (u in app.telacast.notificacao.RegrasLocais.pedidosNovos(anterior, sn)) aoPedidoDeAmizade?.invoke(u, _estado.value)
     }
 
     private fun mensagemNova(s: AppState, m: Message) {
@@ -364,6 +371,7 @@ class Repository(
             }
         }
         _estado.value = novo
+        if (!minha) aoMensagemAoVivo?.invoke(m, novo)
     }
 
     private fun historico(s: AppState, h: S2C.History) {

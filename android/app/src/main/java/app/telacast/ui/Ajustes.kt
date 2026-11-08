@@ -43,7 +43,13 @@ class AcoesDeAjustes(
     val aoEscolherTamanho: (Int) -> Unit = {},
     val aoSair: () -> Unit = {},
     val aoMudarVoz: ((OpcoesDeVoz) -> OpcoesDeVoz) -> Unit = {},
+    val aoManterConectado: (Boolean) -> Unit = {},
+    val aoAbrirConfigDeNotificacoes: () -> Unit = {},
+    val aoAbrirBateria: () -> Unit = {},
 )
+
+/** O que a seção Notificações mostra: a opção "Manter conectado" e se o Android deixa o app notificar. */
+class DadosDeNotificacoes(val manterConectado: Boolean = true, val permitidas: Boolean = true)
 
 /** Multiplicador do tamanho do texto das mensagens: 0 pequeno, 1 normal, 2 grande. */
 fun escalaDoTexto(nivel: Int): Float = when (nivel) { 0 -> 0.9f; 2 -> 1.15f; else -> 1f }
@@ -53,7 +59,7 @@ fun escalaDoTexto(nivel: Int): Float = when (nivel) { 0 -> 0.9f; 2 -> 1.15f; els
  * `senhaTrocada` muda quando o servidor confirma a troca, e então os campos de senha são limpos.
  */
 @Composable
-fun TelaDeAjustes(eu: User, sessoes: List<SessionInfo>, agoraMs: Long, tamanho: Int, senhaTrocada: Int, a: AcoesDeAjustes, voz: OpcoesDeVoz = OpcoesDeVoz()) {
+fun TelaDeAjustes(eu: User, sessoes: List<SessionInfo>, agoraMs: Long, tamanho: Int, senhaTrocada: Int, a: AcoesDeAjustes, voz: OpcoesDeVoz = OpcoesDeVoz(), notificacoes: DadosDeNotificacoes = DadosDeNotificacoes()) {
     TelaCheia("Ajustes", a.aoFechar) {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Rotulo("Conta")
@@ -65,6 +71,10 @@ fun TelaDeAjustes(eu: User, sessoes: List<SessionInfo>, agoraMs: Long, tamanho: 
                     Text("@${eu.name} · ${eu.status.rotulo()}", style = Tipos.Pequeno.copy(color = Grafite.Apagado))
                 }
             }
+
+            Spacer(Modifier.height(8.dp))
+            Rotulo("Notificações")
+            SecaoDeNotificacoes(notificacoes, a)
 
             Spacer(Modifier.height(8.dp))
             Rotulo("Voz")
@@ -172,5 +182,29 @@ private fun DeslizanteDeVoz(titulo: String, valor: String, atual: Float, faixa: 
             atual, aoMudar, valueRange = faixa,
             colors = androidx.compose.material3.SliderDefaults.colors(thumbColor = Grafite.Ambar, activeTrackColor = Grafite.Ambar, inactiveTrackColor = Grafite.L4),
         )
+    }
+}
+
+/** "Manter conectado" (padrão ligado) e o estado da permissão de notificações do Android. */
+@Composable
+fun SecaoDeNotificacoes(n: DadosDeNotificacoes, a: AcoesDeAjustes) {
+    Column(Modifier.fillMaxWidth().background(Grafite.L3, Formas.Cartao).padding(vertical = 4.dp)) {
+        Interruptor("Manter conectado", "Deixa o Telacast conectado em segundo plano para avisar de mensagens, menções e pedidos de amizade com o app fechado, sem depender do Google. Mostra um ícone discreto “Telacast conectado” na barra e gasta um pouco de bateria.", n.manterConectado, a.aoManterConectado)
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Notificações do Android", style = Tipos.Corpo.copy(fontSize = 14.5.sp))
+                Text(if (n.permitidas) "Ativadas." else "Desativadas: o Android não deixa o Telacast avisar. Ative nas configurações.", style = Tipos.Pequeno.copy(fontSize = 12.sp, color = if (n.permitidas) Grafite.Apagado else Grafite.Vermelho))
+            }
+            Spacer(Modifier.width(8.dp))
+            Botao("Abrir", TipoBotao.Quieto, altura = 34.dp, aoClicar = a.aoAbrirConfigDeNotificacoes)
+        }
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Economia de bateria", style = Tipos.Corpo.copy(fontSize = 14.5.sp))
+                Text("Se as notificações atrasarem com a tela apagada, tire o Telacast da otimização de bateria do Android (opcional).", style = Tipos.Pequeno.copy(fontSize = 12.sp, color = Grafite.Apagado))
+            }
+            Spacer(Modifier.width(8.dp))
+            Botao("Abrir", TipoBotao.Quieto, altura = 34.dp, aoClicar = a.aoAbrirBateria)
+        }
     }
 }

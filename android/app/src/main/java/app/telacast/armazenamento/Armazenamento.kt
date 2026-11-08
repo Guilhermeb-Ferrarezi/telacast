@@ -15,6 +15,8 @@ interface Preferencias {
     var ultimoServidor: Long
     /** Última conversa direta aberta (0 = a última foi um canal): o app reabre onde parou depois de o processo morrer. */
     var ultimaDm: Long
+    /** "Manter conectado": serviço em primeiro plano que mantém o WebSocket vivo para as notificações locais (padrão ligado). */
+    var manterConectado: Boolean
     /** Última versão nova cuja folha "O que mudou" já foi mostrada. */
     var versaoVista: String
     /** Tamanho do texto das mensagens: 0 pequeno, 1 normal, 2 grande. */
@@ -44,6 +46,7 @@ class PreferenciasEmMemoria(
     override var ultimoCanal: Long = 0,
     override var ultimoServidor: Long = 0,
     override var ultimaDm: Long = 0,
+    override var manterConectado: Boolean = true,
     override var versaoVista: String = "",
     override var tamanhoDoTexto: Int = 1,
     override var opcoesDeVoz: OpcoesDeVoz = OpcoesDeVoz(),

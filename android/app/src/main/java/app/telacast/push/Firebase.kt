@@ -1,6 +1,7 @@
 package app.telacast.push
 
 import android.content.Context
+import android.util.Log
 import app.telacast.TelacastApp
 import com.google.firebase.FirebaseApp
 import com.google.firebase.messaging.FirebaseMessaging
@@ -20,7 +21,10 @@ class ProvedorFirebase(private val ctx: Context) : ProvedorDeToken {
         if (!disponivel()) return null
         return runCatching {
             suspendCancellableCoroutine<String?> { c ->
-                FirebaseMessaging.getInstance().token.addOnCompleteListener { t -> if (c.isActive) c.resume(if (t.isSuccessful) t.result else null) }
+                FirebaseMessaging.getInstance().token.addOnCompleteListener { t ->
+                    if (t.isSuccessful) Log.i("TelacastPush", "token FCM obtido: ${t.result.take(8)}…") else Log.w("TelacastPush", "sem token FCM: ${t.exception?.message}")
+                    if (c.isActive) c.resume(if (t.isSuccessful) t.result else null)
+                }
             }
         }.getOrNull()
     }
@@ -39,7 +43,7 @@ class ProvedorFirebase(private val ctx: Context) : ProvedorDeToken {
 class ServicoDePush : FirebaseMessagingService() {
     private val container get() = (application as TelacastApp).container
 
-    override fun onNewToken(token: String) { container.push.aoNovoToken(token) }
+    override fun onNewToken(token: String) { Log.i("TelacastPush", "token FCM novo: ${token.take(8)}…"); container.push.aoNovoToken(token) }
 
     override fun onMessageReceived(message: RemoteMessage) { container.receptorDePush.processar(message.data) }
 }

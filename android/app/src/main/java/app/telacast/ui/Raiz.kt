@@ -74,6 +74,16 @@ private fun ConteudoDoApp(vm: AppViewModel) {
             val vozEstado by vm.voz.collectAsState()
             val telaTransmissao by vm.transmissao.collectAsState()
             val atualizacaoEstado by vm.atualizacao.collectAsState()
+            val manterConectado by vm.manterConectado.collectAsState()
+            // volta das configurações do Android: reavalia se as notificações estão permitidas
+            var retomadas by remember { mutableStateOf(0) }
+            val dono = androidx.lifecycle.compose.LocalLifecycleOwner.current
+            androidx.compose.runtime.DisposableEffect(dono) {
+                val o = androidx.lifecycle.LifecycleEventObserver { _, e -> if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) retomadas++ }
+                dono.lifecycle.addObserver(o); onDispose { dono.lifecycle.removeObserver(o) }
+            }
+            val ctxNotif = LocalContext.current
+            val permitidas = remember(retomadas, nav.dialogo) { androidx.core.app.NotificationManagerCompat.from(ctxNotif).areNotificationsEnabled() }
             val telaPlayer by vm.player.collectAsState()
             // permissão de captura da tela: o Android pede de novo a cada transmissão (diálogo próprio dele)
             val ctxTela = LocalContext.current
@@ -159,8 +169,10 @@ private fun ConteudoDoApp(vm: AppViewModel) {
             CompositionLocalProvider(LocalProvedorDeAnexos provides provedor, LocalEscalaDoTexto provides escalaDoTexto(tamanhoTexto)) {
                 TelaPrincipal(
                     estado, nav, recolhidas, aviso,
-                    acoesDe(vm, copiar = { area.setText(AnnotatedString(it)) }, abrirLink = { runCatching { links.openUri(it) } }, anexar = { seletor.launch("*/*") }, baixar = baixar, aoAbrirVoz = abrirVoz, aoEntrarNaVoz = entrarNaVoz, aoTelaCheia = { telaCheia = !telaCheia }),
-                    conversa = DadosDaConversa(compositor, anexos, spoilers, textos, reveladas, agora, consultaDaBusca = consulta, buscaNoCanal = buscaNoCanal, tamanhoDoTexto = tamanhoTexto, senhaTrocada = senhaTrocada),
+                    acoesDe(vm, copiar = { area.setText(AnnotatedString(it)) }, abrirLink = { runCatching { links.openUri(it) } }, anexar = { seletor.launch("*/*") }, baixar = baixar, aoAbrirVoz = abrirVoz, aoEntrarNaVoz = entrarNaVoz, aoTelaCheia = { telaCheia = !telaCheia },
+                        abrirConfig = { acao, comPacote -> runCatching { ctxTela.startActivity(android.content.Intent(acao).apply { if (comPacote) putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, ctxTela.packageName) }.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) } },
+                    ),
+                    conversa = DadosDaConversa(compositor, anexos, spoilers, textos, reveladas, agora, consultaDaBusca = consulta, buscaNoCanal = buscaNoCanal, tamanhoDoTexto = tamanhoTexto, senhaTrocada = senhaTrocada, notificacoes = DadosDeNotificacoes(manterConectado, permitidas)),
                     voz = DadosDeVoz(vozEstado),
                     atualizacao = atualizacaoEstado,
                     dadosDeTela = DadosDeTela(
@@ -195,6 +207,7 @@ private fun acoesDe(
     aoAbrirVoz: (Long, Long) -> Unit,
     aoEntrarNaVoz: (Long) -> Unit,
     aoTelaCheia: () -> Unit,
+    abrirConfig: (String, Boolean) -> Unit = { _, _ -> },
 ) = AcoesPrincipais(
     painel = AcoesPainel(
         aoAbrirCanal = vm::abrirCanal,
@@ -291,6 +304,9 @@ private fun acoesDe(
         aoEncerrarOutras = vm::encerrarOutrasSessoes,
         aoEscolherTamanho = vm::definirTamanhoDoTexto,
         aoMudarVoz = vm::definirOpcoesDeVoz,
+        aoManterConectado = vm::definirManterConectado,
+        aoAbrirConfigDeNotificacoes = { abrirConfig(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS, true) },
+        aoAbrirBateria = { abrirConfig(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS, false) },
         aoSair = { vm.abrirDialogo(Dialogo.ConfirmarSair) },
     ),
     aoAbrirAjustes = vm::abrirAjustes,

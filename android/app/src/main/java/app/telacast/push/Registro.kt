@@ -43,6 +43,7 @@ class GerenciadorDePush(
     private suspend fun registrar() {
         val token = prefs.tokenDePush.ifEmpty { provedor.obter() ?: return }
         prefs.tokenDePush = token
+        runCatching { android.util.Log.i("TelacastPush", "PushRegister enviado (token ${token.take(8)}…)") }
         repo.registrarPush(token)
     }
 
