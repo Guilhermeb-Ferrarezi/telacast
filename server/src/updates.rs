@@ -46,6 +46,42 @@ pub async fn file(Path(hash): Path<String>) -> Response {
     }
 }
 
+/// `GET /download/{plataforma}`: baixa a versão mais recente já com nome e tipo certos (link para mandar a um amigo:
+/// `https://servidor/download/android-arm64`). Não confere a assinatura (o app confere ao se atualizar).
+pub async fn download(Path(platform): Path<String>) -> Response {
+    if !valid_platform(&platform) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Ok(raw) = tokio::fs::read(dir().join(format!("manifest-{platform}.json"))).await else { return StatusCode::NOT_FOUND.into_response() };
+    let Ok(m) = serde_json::from_slice::<UpdateManifest>(&raw) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response() };
+    if !valid_hash(&m.sha256) || !valid_version(&m.version) {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let Ok(bytes) = tokio::fs::read(dir().join(&m.sha256)).await else { return StatusCode::NOT_FOUND.into_response() };
+    let (tipo, ext) = if platform.starts_with("android") {
+        ("application/vnd.android.package-archive", "apk")
+    } else if platform.starts_with("windows") {
+        ("application/octet-stream", "exe")
+    } else {
+        ("application/octet-stream", "bin")
+    };
+    let nome = format!("telacast-{}-{}.{}", m.version, platform, ext);
+    (
+        [
+            (header::CONTENT_TYPE, tipo.to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{nome}\"")),
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+/// Versão só com dígitos, pontos e hífen/letras simples (vira parte do nome do arquivo no cabeçalho).
+fn valid_version(v: &str) -> bool {
+    !v.is_empty() && v.len() <= 32 && v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }

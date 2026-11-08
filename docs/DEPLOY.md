@@ -182,6 +182,7 @@ O servidor entrega os executáveis do app; o app confere antes de trocar o próp
    `TELACAST_UPDATE_KEY_FILE=~/.config/telacast/update.key telacast-server publish-update --file target/release/telacast --version 0.2.0 --notes "o que mudou"`
    (plataforma padrão: a desta máquina, por exemplo `linux-x86_64`; `--platform` troca). Os arquivos ficam em
    `TELACAST_UPDATES_DIR` (padrão `./updates`, ignorado pelo git): o executável com o SHA-256 como nome e `manifest-<plataforma>.json`.
+3b. **Link para um amigo baixar:** `https://SEU-SERVIDOR/download/<plataforma>` (ex.: `/download/android-arm64`) devolve a versão mais recente já como arquivo (`telacast-<versão>-<plataforma>.apk`/`.exe`), sem precisar do app. O app confere a assinatura ao se atualizar; o link em si não confere.
 4. O app consulta `GET /update/manifest?platform=...` ao entrar. Havendo versão mais nova, mostra a faixa
    "Nova versão X disponível"; "Atualizar agora" baixa `GET /update/file/<sha256>` calculando o SHA-256 no caminho e
    **só instala se** o tamanho e o hash batem com o manifesto **e** a assinatura Ed25519 do manifesto é válida
