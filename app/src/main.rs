@@ -8,6 +8,7 @@ mod memoria;
 mod net;
 mod publisher;
 mod quick;
+mod rolagem;
 mod update;
 mod voice;
 mod single;
@@ -1540,6 +1541,11 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Roda do mouse: passo maior, aceleração e deslizamento suave (ver `rolagem.rs`).
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        rolagem::filtrar(ctx, raw_input);
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("voice_ll", if self.voice_ll { "1" } else { "0" }.into());
         storage.set_string("voice_ns", if self.voice_ns { "1" } else { "0" }.into());
