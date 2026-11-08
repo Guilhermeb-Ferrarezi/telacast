@@ -1,5 +1,5 @@
 //! Anexos: envio e download por HTTP (fora do WebSocket), com o arquivo em disco endereçado pelo hash.
-use crate::{auth, App};
+use crate::{auth, thumbs, App};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -42,7 +42,7 @@ fn sniff(b: &[u8]) -> &'static str {
     }
 }
 
-fn path_for(hash: &str) -> PathBuf {
+pub(crate) fn path_for(hash: &str) -> PathBuf {
     files_dir().join(&hash[..2]).join(hash)
 }
 
@@ -96,18 +96,37 @@ pub async fn upload(State(app): State<Arc<App>>, Query(q): Query<HashMap<String,
     ([(header::CONTENT_TYPE, "application/json")], json.to_string()).into_response()
 }
 
-/// `GET /files/{id}/{nome}?token=T`: só quem pode ler o canal da mensagem baixa o arquivo.
+/// `GET /files/{id}/{nome}?token=T[&thumb=1]`: só quem pode ler o canal da mensagem baixa o arquivo.
+/// Com `thumb=1` devolve a miniatura (com `X-Telacast-Thumb: 1`) quando ela existe; senão, o original.
 pub async fn download(State(app): State<Arc<App>>, Path((id, _name)): Path<(i64, String)>, Query(q): Query<HashMap<String, String>>) -> Response {
     let Some(uid) = auth_user(&app, &q).await else { return StatusCode::UNAUTHORIZED.into_response() };
     let Ok(Some((channel, name, mime, hash))) = app.store.attachment_row(id).await else { return StatusCode::NOT_FOUND.into_response() };
     if !app.store.can_access(channel, uid).await.unwrap_or(false) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Ok(bytes) = tokio::fs::read(path_for(&hash)).await else { return StatusCode::NOT_FOUND.into_response() };
+    let original = path_for(&hash);
+    let thumb = match q.get("thumb").map(String::as_str) {
+        Some("1") => match thumbs::get(&hash, &mime, &original).await {
+            thumbs::Outcome::Thumb(t) => Some(t),
+            thumbs::Outcome::Original => None,
+        },
+        _ => None,
+    };
+    let is_thumb = thumb.is_some();
+    let (bytes, mime) = match thumb {
+        Some(t) => (t.bytes, t.mime.to_string()),
+        None => match tokio::fs::read(&original).await {
+            Ok(b) => (b, mime),
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        },
+    };
     let mut h = HeaderMap::new();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_str(&mime).unwrap_or(HeaderValue::from_static("application/octet-stream")));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=31536000, immutable"));
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    if is_thumb {
+        h.insert("x-telacast-thumb", HeaderValue::from_static("1"));
+    }
     let inline = mime.starts_with("image/");
     let safe: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ')).collect();
     let disp = format!("{}; filename=\"{}\"", if inline { "inline" } else { "attachment" }, if safe.is_empty() { "arquivo" } else { &safe });

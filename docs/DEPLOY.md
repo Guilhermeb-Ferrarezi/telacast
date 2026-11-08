@@ -43,6 +43,8 @@ TELACAST_FILES_DIR=/var/lib/telacast/files
 # TELACAST_MAX_UPLOAD_MB=10
 ```
 
+Miniaturas: não há variável nova. O servidor decodifica até 2 imagens ao mesmo tempo, cada uma de até 64 megapixels (pico de ~250 MB de RAM por imagem, mais a miniatura); numa VPS com pouca memória isso é o teto de uso extra.
+
 `/etc/systemd/system/telacast.service`:
 
 ```ini
@@ -107,7 +109,7 @@ O app **recusa** `ws://` para qualquer servidor fora da sua máquina e da rede l
 
 ## 6. Manutenção
 
-- **Backup** diário: `pg_dump -Fc telacast > /var/backups/telacast-$(date +%F).dump` (cron) **e** a pasta dos anexos (`/var/lib/telacast/files`), guardando uma cópia fora da VPS.
+- **Backup** diário: `pg_dump -Fc telacast > /var/backups/telacast-$(date +%F).dump` (cron) **e** a pasta dos anexos (`/var/lib/telacast/files`), guardando uma cópia fora da VPS. A subpasta `files/thumbs/` guarda as miniaturas geradas sob demanda (cada uma de ~20 a 150 KB, uma por imagem PNG/JPEG/WebP já pedida); pode ficar fora do backup e pode ser apagada a qualquer momento, o servidor gera de novo no próximo pedido.
 - **Atualizar**: `git pull && cargo build --release -p telacast-server && sudo install ... && sudo systemctl restart telacast`.
 - **Logs**: `journalctl -u telacast`. `RUST_LOG=info` (ou `debug`) no arquivo de ambiente aumenta o detalhe.
 - **Certificado próprio** (CA interna, sem Let's Encrypt): no app, defina `TELACAST_CA_FILE=/caminho/ca.pem`.

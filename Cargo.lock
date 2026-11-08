@@ -4837,6 +4837,7 @@ dependencies = [
  "dotenvy",
  "ed25519-dalek",
  "getrandom 0.4.3",
+ "image",
  "imagesize",
  "serde",
  "serde_json",

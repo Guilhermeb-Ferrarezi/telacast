@@ -2,6 +2,7 @@
 mod auth;
 mod ids;
 mod files;
+mod thumbs;
 mod updates;
 mod store;
 

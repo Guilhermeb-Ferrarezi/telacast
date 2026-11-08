@@ -35,6 +35,20 @@ pub fn url(base: &str, a: &p::Attachment, token: &str) -> String {
     format!("{base}/files/{}/{}?token={token}", a.id, enc(&a.name))
 }
 
+/// Endereço da miniatura (`thumb=1`): o servidor devolve uma versão de até 1024 px, ou o original se não der
+/// para reduzir (GIF, imagem pequena...). Servidor antigo ignora o parâmetro e devolve o original.
+pub fn thumb_url(base: &str, a: &p::Attachment, token: &str) -> String {
+    format!("{}&thumb=1", url(base, a, token))
+}
+
+/// O servidor só gera miniatura de PNG, JPEG e WebP (GIF fica de fora para não perder a animação).
+fn thumbable(a: &p::Attachment) -> bool {
+    matches!(a.mime.as_str(), "image/png" | "image/jpeg" | "image/webp")
+}
+
+/// Lado maior da miniatura do servidor: imagem que já cabe aqui vem inteira, miniatura e original são iguais.
+const THUMB_SIDE: u32 = 1024;
+
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().tls_config(crate::net::tls_config()).timeout(std::time::Duration::from_secs(60)).build()
 }
@@ -161,12 +175,18 @@ impl Images {
         }
     }
 
+    /// Imagem do chat: baixa a miniatura do servidor (chave `id`).
     pub fn get(&mut self, ctx: &egui::Context, base: &str, token: &str, a: &p::Attachment) -> &Img {
-        self.load(a.id, ctx, url(base, a, token), (1200, 900))
+        let u = if thumbable(a) { thumb_url(base, a, token) } else { url(base, a, token) };
+        self.load(a.id, ctx, u, (1200, 900))
     }
 
-    /// Versão grande para a prévia (até 4096 px de lado). Fica sob a chave `-id`.
+    /// Original para a prévia ampliada (até 4096 px de lado). Fica sob a chave `-id` e só é pedido quando a
+    /// prévia abre. Se a imagem já cabe na miniatura, ela é o original e não baixa de novo.
     pub fn get_full(&mut self, ctx: &egui::Context, base: &str, token: &str, a: &p::Attachment) -> &Img {
+        if a.width > 0 && a.width.max(a.height) <= THUMB_SIDE {
+            return self.get(ctx, base, token, a);
+        }
         self.load(-a.id, ctx, url(base, a, token), (4096, 4096))
     }
 
@@ -206,11 +226,22 @@ fn fetch_image(url: &str, lim: (u32, u32)) -> Option<egui::ColorImage> {
 }
 
 fn decode(bytes: &[u8], lim: (u32, u32)) -> Option<egui::ColorImage> {
-    let img = image::load_from_memory(bytes).ok()?;
+    let img = decode_upright(bytes)?;
     // miniatura do chat: mostra no máximo 400x300, guardamos 1200x900 para telas densas
     let img = if img.width() > lim.0 || img.height() > lim.1 { img.thumbnail(lim.0, lim.1) } else { img };
     let rgba = img.to_rgba8();
     Some(egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
+}
+
+/// Decodifica respeitando a orientação EXIF (foto de celular): a miniatura do servidor já vem em pé, o
+/// original precisa ser girado aqui para as duas versões combinarem.
+fn decode_upright(bytes: &[u8]) -> Option<image::DynamicImage> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut dec = reader.into_decoder().ok()?;
+    let orientation = image::ImageDecoder::orientation(&mut dec).unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(dec).ok()?;
+    img.apply_orientation(orientation);
+    Some(img)
 }
 
 // ------------------------------------------------------------ prévia de texto

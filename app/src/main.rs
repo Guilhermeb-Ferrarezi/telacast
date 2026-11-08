@@ -1870,11 +1870,17 @@ fn attachment_view(ui: &mut egui::Ui, a: &p::Attachment, base: &str, token: &str
     let open = |ui: &egui::Ui| ui.ctx().open_url(egui::OpenUrl::new_tab(files::url(base, a, token)));
     ui.add_space(4.0);
     if a.mime.starts_with("image/") && a.width > 0 && a.height > 0 {
-        let scale = (400.0 / a.width as f32).min(300.0 / a.height as f32).min(1.0);
-        let size = egui::vec2(a.width as f32 * scale, a.height as f32 * scale).max(egui::vec2(40.0, 40.0));
         let ctx = ui.ctx().clone();
+        let fit = |w: f32, h: f32| {
+            let scale = (400.0 / w).min(300.0 / h).min(1.0);
+            egui::vec2(w * scale, h * scale).max(egui::vec2(40.0, 40.0))
+        };
+        let size = fit(a.width as f32, a.height as f32);
         match images.get(&ctx, base, token, a) {
             files::Img::Ready(tex) => {
+                // foto de celular girada pelo EXIF: o servidor guarda largura e altura do arquivo cru, a textura vem em pé
+                let t = tex.size_vec2();
+                let size = if (t.x > t.y) != (a.width > a.height) && (t.x - t.y).abs() > 2.0 { fit(a.height as f32, a.width as f32) } else { size };
                 let r = ui.add(egui::Image::new(tex).fit_to_exact_size(size).corner_radius(egui::CornerRadius::same(8)).sense(egui::Sense::click()));
                 if r.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);

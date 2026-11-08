@@ -15,7 +15,7 @@ Tudo conversa com o mesmo servidor (`ws://host:porta` em desenvolvimento, `wss:/
 | `GET /publish/{canal}?token=T` (WebSocket) | Quem transmite a tela do canal envia vídeo |
 | `GET /watch/{canal}?token=T` (WebSocket) | Quem assiste recebe o vídeo |
 | `POST /upload?token=T&channel=ID&name=ARQUIVO` | Envia um anexo (corpo = bytes do arquivo) |
-| `GET /files/{id}/{nome}?token=T` | Baixa um anexo |
+| `GET /files/{id}/{nome}?token=T[&thumb=1]` | Baixa um anexo (ou a miniatura dele, ver 1.3) |
 | `GET /update/manifest?platform=P` e `GET /update/file/{sha256}` | Atualização do app desktop |
 | `GET /health` | Devolve `ok` |
 
@@ -70,6 +70,25 @@ de 2 bytes são descartados.
    pode ser usado uma vez, por quem enviou, no canal indicado no upload; senão `Error InvalidInput`.
 3. Baixar: `GET /files/{id}/{nome}?token=T` (`{nome}` é decorativo). Só quem lê o canal baixa; `401`/`403`/`404`
    conforme o caso. Imagens vêm `inline`; o resto, `attachment`.
+4. **Miniatura**: `GET /files/{id}/{nome}?token=T&thumb=1` devolve uma versão leve da imagem, gerada pelo servidor
+   na primeira requisição e guardada em disco (`<TELACAST_FILES_DIR>/thumbs/<sha256 do original>.jpg|png`). Mesma
+   permissão do download (`401`/`403`/`404`). Use no chat; baixe o original (sem `thumb`) só quando o usuário abrir a
+   imagem ampliada ou pedir para salvar. Regras:
+   - Lado maior **<= 1024 px**, proporção mantida, **nunca amplia**. Filtro Lanczos3.
+   - **JPEG qualidade 80** (`Content-Type: image/jpeg`) quando a imagem não tem transparência; **PNG** (`image/png`)
+     quando algum pixel tem alfa < 255 (um PNG RGBA todo opaco também vira JPEG).
+   - Orientação **EXIF** do JPEG é respeitada: a miniatura sai em pé e o EXIF não é copiado. Atenção: `width`/`height`
+     do `Attachment` são as dimensões do arquivo cru, então numa foto girada pelo EXIF (orientação 5 a 8) a miniatura
+     tem largura e altura trocadas em relação a esses campos; dimensione a vista pela imagem decodificada.
+   - Resposta de miniatura traz `X-Telacast-Thumb: 1`, `Cache-Control: private, max-age=31536000, immutable` e o
+     `Content-Type` da miniatura. **Sem esse cabeçalho o corpo é o original** (e o `Content-Type` é o do original).
+   - **Cai para o original** (sem o cabeçalho, status 200) quando: o tipo não é PNG, JPEG ou WebP (GIF fica de fora
+     para não perder a animação; PNG e WebP animados também); o arquivo não decodifica; a imagem passa de
+     **64 megapixels** (largura x altura, conferido pelo cabeçalho antes de decodificar) ou de 300 MiB já decodificada;
+     a imagem já cabe em 1024 px (reduzir não ajuda); ou a miniatura não ficaria menor que o original.
+   - Servidor antigo ignora `thumb=1` e devolve o original sem o cabeçalho: o cliente trata os dois casos igual.
+   - Geração: no máximo 2 ao mesmo tempo; pedidos simultâneos da mesma miniatura esperam a primeira. Quando não há
+     miniatura possível o servidor grava um marcador vazio (`<hash>.none`) para não tentar de novo.
 
 ### 1.4 Atualização do app desktop
 

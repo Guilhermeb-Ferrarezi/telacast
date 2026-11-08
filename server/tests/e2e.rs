@@ -939,6 +939,119 @@ fn anexos() {
     assert_eq!(m, "fim");
 }
 
+/// Foto de mentira com cara de foto (gradiente e formas, sem ruído), em PNG, para as miniaturas.
+fn png_grande(w: u32, h: u32) -> Vec<u8> {
+    let img = image::ImageBuffer::from_fn(w, h, |x, y| {
+        let (fx, fy) = (x as f32 / w as f32, y as f32 / h as f32);
+        let sol = (-(((fx - 0.7).powi(2) + (fy - 0.3).powi(2)) * 40.0)).exp();
+        image::Rgb([(60.0 + 150.0 * fy + 150.0 * sol).min(255.0) as u8, (90.0 + 90.0 * fy + 120.0 * sol).min(255.0) as u8, (200.0 - 100.0 * fy) as u8])
+    });
+    let mut v = Vec::new();
+    image::DynamicImage::ImageRgb8(img).write_to(&mut std::io::Cursor::new(&mut v), image::ImageFormat::Png).unwrap();
+    v
+}
+
+#[test]
+fn miniaturas_de_imagem() {
+    let env = Env::start();
+    let code = env.invite(1);
+    let mut ana = env.client();
+    let (ana_tok, _) = ana.register("ana", &code);
+    ana.send(C2S::CreateServer { name: "Casa".into() });
+    let snap = ana.wait("snapshot com o servidor", |m| match m {
+        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
+        _ => None,
+    });
+    let geral = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
+    let code2 = env.invite(1);
+    let mut fora = env.client();
+    let (fora_tok, _) = fora.register("carla", &code2);
+
+    let up = |name: &str, body: &[u8]| -> (i64, String) {
+        let (st, _, b) = http(env.port, "POST", &format!("/upload?token={ana_tok}&channel={geral}&name={name}"), body);
+        assert_eq!(st, 200, "upload de {name}");
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        (j["id"].as_i64().unwrap(), j["mime"].as_str().unwrap().to_string())
+    };
+    let original = png_grande(3000, 2000);
+    assert!(original.len() < 10 << 20);
+    let (id, mime) = up("foto.png", &original);
+    assert_eq!(mime, "image/png");
+    let thumbs_dir = std::path::Path::new(&env.files).join("thumbs");
+    assert!(!thumbs_dir.exists(), "nada é gerado no upload");
+
+    // sem token: 401; quem não é do canal: 403; sem ?thumb=1 continua o original
+    assert_eq!(http(env.port, "GET", &format!("/files/{id}/foto.png?thumb=1"), &[]).0, 401);
+    assert_eq!(http(env.port, "GET", &format!("/files/{id}/foto.png?token=invalido&thumb=1"), &[]).0, 401);
+    assert_eq!(http(env.port, "GET", &format!("/files/{id}/foto.png?token={fora_tok}&thumb=1"), &[]).0, 403);
+    assert!(!thumbs_dir.exists(), "pedido recusado não gera miniatura");
+    let (st, head, bytes) = http(env.port, "GET", &format!("/files/{id}/foto.png?token={ana_tok}"), &[]);
+    assert_eq!((st, bytes.as_slice()), (200, original.as_slice()));
+    assert!(!head.contains("x-telacast-thumb"), "{head}");
+
+    // miniatura: menor, JPEG, lado maior 1024, com o cabeçalho; vários pedidos ao mesmo tempo geram uma vez só
+    let url = format!("/files/{id}/foto.png?token={ana_tok}&thumb=1");
+    let port = env.port;
+    let rs: Vec<_> = (0..4).map(|_| { let u = url.clone(); std::thread::spawn(move || http(port, "GET", &u, &[])) }).collect();
+    let rs: Vec<_> = rs.into_iter().map(|t| t.join().unwrap()).collect();
+    for (st, head, bytes) in &rs {
+        assert_eq!(*st, 200);
+        assert!(head.contains("content-type: image/jpeg"), "{head}");
+        assert!(head.contains("x-telacast-thumb: 1"), "{head}");
+        assert!(head.contains("cache-control: private, max-age=31536000, immutable"), "{head}");
+        assert!(head.contains("inline"), "{head}");
+        let s = imagesize::blob_size(bytes).unwrap();
+        assert_eq!((s.width, s.height), (1024, 683));
+        assert!(bytes.len() < original.len() / 2, "miniatura {} B, original {} B", bytes.len(), original.len());
+        assert_eq!(bytes, &rs[0].2, "todas as respostas são o mesmo arquivo");
+    }
+    let files: Vec<_> = std::fs::read_dir(&thumbs_dir).unwrap().map(|e| e.unwrap()).collect();
+    assert_eq!(files.len(), 1, "um arquivo só em thumbs/ (sem .tmp sobrando): {files:?}");
+    assert!(files[0].file_name().to_string_lossy().ends_with(".jpg"));
+    let (mtime, ino) = {
+        use std::os::unix::fs::MetadataExt;
+        let m = files[0].metadata().unwrap();
+        (m.modified().unwrap(), m.ino())
+    };
+
+    // segunda chamada vem do cache: o mesmo arquivo em disco, sem regravar
+    std::thread::sleep(Duration::from_millis(50));
+    let (st, head, again) = http(env.port, "GET", &url, &[]);
+    assert_eq!(st, 200);
+    assert!(head.contains("x-telacast-thumb: 1"));
+    assert_eq!(again, rs[0].2);
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(files[0].path()).unwrap();
+        assert_eq!((m.modified().unwrap(), m.ino()), (mtime, ino), "o cache não foi regravado");
+    }
+    assert_eq!(std::fs::read_dir(&thumbs_dir).unwrap().count(), 1);
+
+    // cai para o original: imagem pequena, lixo que diz ser PNG (tipo vem do conteúdo, então vira octet-stream) e GIF
+    let pequena = png_grande(300, 200);
+    let (id_p, _) = up("pequena.png", &pequena);
+    let (st, head, bytes) = http(env.port, "GET", &format!("/files/{id_p}/x?token={ana_tok}&thumb=1"), &[]);
+    assert_eq!((st, bytes.as_slice()), (200, pequena.as_slice()));
+    assert!(!head.contains("x-telacast-thumb"), "{head}");
+    let gif: &[u8] = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;";
+    let (id_g, mime_g) = up("a.gif", gif);
+    assert_eq!(mime_g, "image/gif");
+    let (st, head, bytes) = http(env.port, "GET", &format!("/files/{id_g}/x?token={ana_tok}&thumb=1"), &[]);
+    assert_eq!((st, bytes.as_slice()), (200, gif));
+    assert!(!head.contains("x-telacast-thumb"), "{head}");
+    // PNG cortado: o tipo é PNG mas não decodifica; devolve o original e lembra disso
+    let cortado = &original[..original.len() / 2];
+    let (id_c, mime_c) = up("quebrada.png", cortado);
+    assert_eq!(mime_c, "image/png");
+    for _ in 0..2 {
+        let (st, head, bytes) = http(env.port, "GET", &format!("/files/{id_c}/x?token={ana_tok}&thumb=1"), &[]);
+        assert_eq!((st, bytes.as_slice()), (200, cortado));
+        assert!(!head.contains("x-telacast-thumb"), "{head}");
+    }
+    assert!(std::fs::read_dir(&thumbs_dir).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".none")), "marcador do que não tem miniatura");
+    assert_eq!(http(env.port, "GET", &format!("/files/999/x?token={ana_tok}&thumb=1"), &[]).0, 404);
+}
+
 #[test]
 fn trocar_senha_e_encerrar_sessoes() {
     use telacast_proto::ErrorCode;
