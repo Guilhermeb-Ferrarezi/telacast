@@ -1582,7 +1582,7 @@ impl App {
         let mut login = Login {
             server: {
                 let s = get("server");
-                if s.is_empty() { "ws://127.0.0.1:8080".into() } else { s }
+                if s.is_empty() { option_env!("TELACAST_DEFAULT_SERVER").unwrap_or("ws://127.0.0.1:8080").into() } else { s }
             },
             user: get("user"),
             pass: String::new(),

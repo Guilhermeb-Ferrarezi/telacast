@@ -60,6 +60,8 @@ pub async fn download(Path(platform): Path<String>) -> Response {
     let Ok(bytes) = tokio::fs::read(dir().join(&m.sha256)).await else { return StatusCode::NOT_FOUND.into_response() };
     let (tipo, ext) = if platform.starts_with("android") {
         ("application/vnd.android.package-archive", "apk")
+    } else if platform.ends_with("-msi") || platform.ends_with("-installer") {
+        ("application/x-msi", "msi")
     } else if platform.starts_with("windows") {
         ("application/octet-stream", "exe")
     } else {
