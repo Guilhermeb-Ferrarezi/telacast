@@ -466,7 +466,7 @@ impl Session {
             link: Link::Up,
             gw,
             token,
-            snap: p::Snapshot { me: me.clone(), servers: vec![], friends: vec![], dms: vec![], live: vec![], blocked: vec![], voice: vec![] },
+            snap: p::Snapshot { me: me.clone(), servers: vec![], friends: vec![], dms: vec![], live: vec![], live_revision: 0, blocked: vec![], voice: vec![] },
             me,
             view: View::Home,
             tab: HomeTab::Online,
@@ -1126,7 +1126,11 @@ impl Session {
                     self.idle_sent = false; // a conexão nova começa "ativa" no servidor
                 }
                 Event::Msg(m) => match m {
-                    S2C::Snapshot(sn) => {
+                    S2C::Snapshot(mut sn) => {
+                        if sn.live_revision < self.snap.live_revision {
+                            sn.live = self.snap.live.clone();
+                            sn.live_revision = self.snap.live_revision;
+                        }
                         self.me = sn.me.clone();
                         self.voice = sn.voice.clone();
                         if self.my_voice().is_none() && self.engine.is_some() {
@@ -3302,10 +3306,16 @@ impl App {
         let mine = s.my_voice().map(|v| v.channel_id) == Some(c.id);
         let selected = mine && s.voice_view;
         let members = s.voice_members(c.id);
+        let live = s.snap.live.iter().any(|l| l.channel_id == c.id);
         let r = list_row(ui, selected, |ui| {
             let (ir, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
             speaker_icon(ui.painter(), ir.center(), 18.0, if mine { TEXT2 } else { MUTED });
             ui.label(RichText::new(&c.name).color(if mine { TEXT } else { TEXT2 }));
+            if live {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new("AO VIVO").size(10.0).strong().color(AMBER));
+                });
+            }
         });
         if r.clicked() {
             acts.push(Act::JoinVoice(c.id));
@@ -3327,6 +3337,9 @@ impl App {
             }
             pt.text(egui::pos2(rect.left() + 28.0 + 28.0, rect.center().y), Align2::LEFT_CENTER, &name, egui::FontId::proportional(13.5), if v.deafened || v.muted { MUTED } else { TEXT2 });
             let ic = egui::pos2(rect.right() - 14.0, rect.center().y);
+            if s.snap.live.iter().any(|l| l.channel_id == c.id && l.user_id == v.user_id) {
+                pt.text(egui::pos2(rect.right() - 38.0, rect.center().y), Align2::RIGHT_CENTER, "AO VIVO", egui::FontId::proportional(9.5), AMBER);
+            }
             if v.deafened {
                 headphone_icon(pt, ic, 15.0, MUTED, true);
             } else if v.muted {
@@ -4998,6 +5011,17 @@ impl App {
                 );
             }
             None => {}
+        }
+        if let Some(tex) = &self.texture {
+            let [w, h] = tex.size();
+            let label = format!("{}p · {w}×{h}", h);
+            let galley = ui.painter().layout_no_wrap(label, egui::FontId::proportional(11.0), TEXT);
+            let badge = egui::Rect::from_min_size(
+                egui::pos2(rect.right() - galley.size().x - 24.0, rect.top() + 10.0),
+                galley.size() + egui::vec2(16.0, 8.0),
+            );
+            ui.painter().rect_filled(badge, 5.0, Color32::from_black_alpha(175));
+            ui.painter().galley(badge.min + egui::vec2(8.0, 4.0), galley, TEXT);
         }
         let ch = *ch;
         // cartões de estado (aguardando, terminou, falhou, você caiu)

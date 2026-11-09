@@ -115,6 +115,9 @@ pub struct Snapshot {
     pub friends: Vec<Friend>,
     pub dms: Vec<Dm>,
     pub live: Vec<Live>,
+    /// Monotonic revision for live-share state; clients ignore older snapshots that arrive late.
+    #[serde(default)]
+    pub live_revision: u64,
     /// Quem você bloqueou.
     #[serde(default)]
     pub blocked: Vec<User>,

@@ -139,6 +139,7 @@ struct App {
     sf: ids::Snowflake,
     conns: Mutex<HashMap<i64, Vec<(u64, Tx)>>>,
     rooms: Mutex<HashMap<i64, Room>>,
+    live_revision: AtomicU64,
     /// Espectadores de cada transmissão: (id da conexão de vídeo, usuário).
     viewers: Mutex<HashMap<i64, Vec<(u64, i64)>>>,
     next: AtomicU64,
@@ -319,13 +320,12 @@ impl App {
 
     async fn snapshot(&self, me: i64) -> Result<p::Snapshot, sqlx::Error> {
         let online: HashSet<i64> = self.conns.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-        let live_rooms: Vec<(i64, i64)> = self
-            .rooms
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(|r| (r.channel, r.user))
-            .collect();
+        let (live_revision, live_rooms): (u64, Vec<(i64, i64)>) = {
+            let rooms = self.rooms.lock().unwrap_or_else(|e| e.into_inner());
+            let revision = self.live_revision.load(Ordering::Relaxed);
+            let live = rooms.values().map(|r| (r.channel, r.user)).collect();
+            (revision, live)
+        };
         // status escolhido por quem está conectado; "ausente automático" = todas as conexões da pessoa paradas
         let connected: Vec<i64> = online.iter().copied().collect();
         let manual: HashMap<i64, i16> = self.store.manual_statuses(&connected).await?.into_iter().collect();
@@ -423,7 +423,7 @@ impl App {
         let me_name = self.store.display_name(me).await?.unwrap_or_default();
         let blocked = self.store.blocked_by(me).await?.into_iter().map(|(id, name)| user(id, name)).collect();
         let voice = self.voice_in(&ids.iter().copied().collect());
-        Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live, blocked, voice })
+        Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live, live_revision, blocked, voice })
     }
 
     async fn push_snapshot(&self, uid: i64) {
@@ -688,6 +688,7 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         sf,
         conns: Default::default(),
         rooms: Default::default(),
+        live_revision: AtomicU64::new(0),
         viewers: Default::default(),
         next: AtomicU64::new(1),
         conn_tokens: Mutex::new(HashMap::new()),
@@ -1618,6 +1619,7 @@ async fn run_publisher(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<A
         } else {
             let (tx, _) = broadcast::channel(16);
             rooms.insert(channel, Room { tx: tx.clone(), key: None, channel, user: uid });
+            app.live_revision.fetch_add(1, Ordering::Relaxed);
             Some(tx)
         }
     };
@@ -1642,7 +1644,10 @@ async fn run_publisher(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<A
             let _ = tx.send(data); // sem espectadores: erro ignorado
         }
     }
-    app.rooms.lock().unwrap_or_else(|e| e.into_inner()).remove(&channel); // encerra os espectadores
+    let removed = app.rooms.lock().unwrap_or_else(|e| e.into_inner()).remove(&channel); // encerra os espectadores
+    if removed.is_some() {
+        app.live_revision.fetch_add(1, Ordering::Relaxed);
+    }
     app.push_many(&people).await;
     info!("[canal {channel}] transmissão encerrada");
 }

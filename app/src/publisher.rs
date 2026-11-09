@@ -287,7 +287,7 @@ fn run(
         ws.send(Message::Binary(payload.into()))?;
         sent += 1;
         if t0.elapsed() >= Duration::from_secs(1) {
-            *status.lock().unwrap() = format!("transmitindo · {sent} fps");
+            *status.lock().unwrap() = format!("transmitindo · {sent} fps · {w}×{h}");
             (sent, t0) = (0, Instant::now());
         }
         Ok(())
