@@ -1,6 +1,6 @@
 [package]
 name = "telacast"
-version = "0.1.0"
+version = "0.1.4"
 edition = "2021"
 
 [dependencies]
@@ -28,7 +28,8 @@ telacast-qs = { path = "../qs" }
 
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.15", default-features = false }
+windows-capture = "2.0.1"
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(unix, windows))'.dependencies]
 nvidia-video-codec-sdk = { path = "../vendor/nvidia-video-codec-sdk" }
 cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12080"] }

@@ -144,5 +144,5 @@ O servidor entrega os executáveis do app; o app confere antes de trocar o próp
 2. Servidor em release: `TELACAST_FILES_DIR=~/telacast/files DATABASE_URL=... ./target/release/telacast-server serve`. Atrás do túnel o IP do cliente vem de `CF-Connecting-IP` (o servidor já usa; `X-Forwarded-For` é forjável).
 3. Verifique: `curl https://telecast.seudominio.com/health` responde `ok`; o app usa `wss://telecast.seudominio.com`.
 4. Convite para quem vai testar: `telacast-server invite --uses 1 --days 2 --label amigo`.
-5. Windows: `cargo zigbuild --release --target x86_64-pc-windows-gnu -p telacast` gera `Telacast.exe` (só assiste transmissões; captura de tela é só Linux por enquanto). Empacotado em `dist/` (ignorado pelo git).
+5. Windows: compile `cargo build --release --target x86_64-pc-windows-msvc -p telacast` para gerar `Telacast.exe`, com captura de telas e janelas pelo Windows Graphics Capture. Para atualização automática, publique o binário com `--platform windows-x86_64`. Empacote em `dist/` (ignorado pelo git).
 6. Cuidado: a Cloudflare pode limitar vídeo contínuo no plano gratuito; teste com 720p30 e 3 a 4 Mbps primeiro.

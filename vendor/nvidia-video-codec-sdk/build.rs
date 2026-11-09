@@ -61,6 +61,12 @@ fn main() {
     }
     rerun_if_changed();
 
+    // No Windows, o driver carrega nvEncodeAPI64.dll em runtime. Não é preciso
+    // instalar o CUDA Toolkit nem linkar os .lib do Video Codec SDK.
+    if cfg!(windows) {
+        return;
+    }
+
     // Link to libraries.
     println!("cargo:rustc-link-lib={}", NVENC_LIB.0);
     println!("cargo:rustc-link-lib={}", NVDEC_LIB.0);

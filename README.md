@@ -25,7 +25,7 @@ Detalhes, limites e o guia de implantação (Caddy + systemd, ou túnel da Cloud
 
 ## Windows
 
-O cliente compila para Windows (`cargo zigbuild --release --target x86_64-pc-windows-gnu -p telacast`). No Windows dá para conversar, usar voz e assistir às transmissões; **compartilhar a própria tela ainda só existe no Linux** (captura X11 + NVENC). Binários prontos estão nas [releases](../../releases). O executável não é assinado, então o Windows avisa antes de abrir.
+O cliente compila para Windows (`cargo zigbuild --release --target x86_64-pc-windows-gnu -p telacast`). No Windows, telas e janelas são capturadas pelo Windows Graphics Capture; no Linux, a captura continua usando X11 + NVENC. Binários prontos estão nas [releases](../../releases). O executável não é assinado, então o Windows avisa antes de abrir.
 
 ## Estrutura
 

@@ -364,7 +364,7 @@ struct Session {
     voice_focus: Option<i64>,
     /// Atualização do app: estado compartilhado com a thread de consulta/download.
     update: std::sync::Arc<std::sync::Mutex<update::State>>,
-    update_dismissed: bool,
+    update_dismissed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Motor de áudio da voz (existe só enquanto estou num canal de voz) e dispositivos escolhidos.
     engine: Option<std::sync::Arc<voice::Engine>>,
     voice_in: Option<String>,
@@ -518,7 +518,7 @@ impl Session {
             viewers: HashMap::new(),
             voice_focus: None,
             update: std::sync::Arc::new(std::sync::Mutex::new(update::State::Idle)),
-            update_dismissed: false,
+            update_dismissed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             engine: None,
             voice_in: None,
             voice_out: None,
@@ -687,17 +687,20 @@ impl Session {
         self.pending.push(pend);
     }
 
-    /// Consulta o servidor por uma versão mais nova (em segundo plano). Uma vez por execução.
+    /// Consulta o servidor por uma versão mais nova em segundo plano.
     fn check_update(&self) {
-        let (state, base, ctx) = (self.update.clone(), self.http_base.clone(), self.ctx.clone());
+        let (state, base, ctx, dismissed) = (
+            self.update.clone(),
+            self.http_base.clone(),
+            self.ctx.clone(),
+            self.update_dismissed.clone(),
+        );
         std::thread::spawn(move || {
             let res = update::check(&base);
             if let Ok(mut st) = state.lock() {
-                *st = match res {
-                    Ok(Some(m)) => update::State::Available(m),
-                    // erro de consulta não incomoda: só aparece se o usuário pedir a verificação
-                    _ => update::State::Idle,
-                };
+                if update::apply_check_result(&mut st, res) {
+                    dismissed.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             ctx.request_repaint();
         });
@@ -1349,6 +1352,7 @@ struct Login {
 struct App {
     login: Login,
     session: Option<Session>,
+    next_update_check: Instant,
     token_saved: String,
     fps: u32,
     kbps: u32,
@@ -1408,6 +1412,7 @@ impl App {
         Self {
             login,
             session: None,
+            next_update_check: Instant::now() + update::CHECK_INTERVAL,
             token_saved: token,
             voice_ns: get("voice_ns") != "0",
             voice_ll: get("voice_ll") != "0",
@@ -1470,6 +1475,7 @@ impl App {
                     self.login.resuming = false;
                     let mut sess = Session::new(gw, self.login.server.clone(), ctx.clone(), token, me);
                     sess.check_update();
+                    self.next_update_check = Instant::now() + update::CHECK_INTERVAL;
                     sess.voice_in = self.voice_in.clone();
                     sess.voice_out = self.voice_out.clone();
                     sess.voice_ns = self.voice_ns;
@@ -1552,6 +1558,14 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         self.poll_login(&ctx);
+        let now = Instant::now();
+        if update::check_due(now, self.next_update_check) {
+            if let Some(session) = &self.session {
+                session.check_update();
+            }
+            self.next_update_check = now + update::CHECK_INTERVAL;
+        }
+        ctx.request_repaint_after(self.next_update_check.saturating_duration_since(now));
         let pasted: Vec<std::sync::Arc<egui::ColorImage>> = ctx.input(|i| {
             i.events.iter().filter_map(|e| if let egui::Event::PasteImage(img) = e { Some(img.clone()) } else { None }).collect()
         });
@@ -2426,7 +2440,10 @@ impl App {
 
         // faixa de atualização (versão nova disponível, baixando, pronta ou com erro)
         let upd = s.update.lock().map(|g| g.clone()).unwrap_or_default();
-        if !self.fullscreen && !s.update_dismissed && !matches!(upd, update::State::Idle) {
+        if !self.fullscreen
+            && !s.update_dismissed.load(std::sync::atomic::Ordering::Relaxed)
+            && !matches!(upd, update::State::Idle)
+        {
             egui::Panel::top("update")
                 .frame(egui::Frame::new().fill(L3).inner_margin(egui::Margin::symmetric(16, 7)))
                 .show(ui, |ui| {
@@ -2440,7 +2457,7 @@ impl App {
                                 }
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if small_button(ui, "Depois", FIELD) {
-                                        s.update_dismissed = true;
+                                        s.update_dismissed.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
                                     if small_button(ui, "Atualizar agora", BLURPLE) {
                                         s.start_update(m.clone());
@@ -2464,7 +2481,7 @@ impl App {
                                 ui.label(RichText::new(format!("Atualização recusada: {e}")).color(RED));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if small_button(ui, "Fechar", FIELD) {
-                                        s.update_dismissed = true;
+                                        s.update_dismissed.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 });
                             }
@@ -5356,9 +5373,6 @@ impl App {
                 modal(ctx, "Transmitir", 540.0, &mut dismissed, |ui| {
                     ui.set_width(500.0);
                     ui.label(RichText::new("Compartilhar uma tela ou janela").size(12.0).color(MUTED));
-                    if cfg!(windows) {
-                        ui.label(RichText::new("Compartilhar a tela ainda não está disponível no Windows (dá para assistir às transmissões dos outros).").size(12.5).color(AMBER));
-                    }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut gl.tab, 0, "Telas");
@@ -5502,7 +5516,7 @@ impl App {
                             go_stop = true;
                             close = true;
                         }
-                        let ready = cur.is_some() && gl.source.is_some() && !cfg!(windows);
+                        let ready = cur.is_some() && gl.source.is_some();
                         ui.add_enabled_ui(ready, |ui| {
                             if small_button(ui, if live { "Aplicar" } else { "Transmitir" }, BLURPLE) {
                                 go_publish = true;
