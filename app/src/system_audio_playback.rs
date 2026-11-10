@@ -5,9 +5,9 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use std::{sync::{atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}, Arc}, time::Instant};
 
 const RATE: u32 = 48_000;
-const QUEUE_FRAMES: usize = 12_000; // 250 ms de PCM estéreo
-const PREBUFFER_FRAMES: usize = 2_400; // 50 ms antes do primeiro som
-const VIDEO_AUDIO_DELAY_US: u64 = 60_000;
+const QUEUE_FRAMES: usize = 48_000; // 1 s de PCM estéreo para absorver picos de rede
+const PREBUFFER_FRAMES: usize = 4_800; // 100 ms antes do primeiro som ou após um esvaziamento
+const VIDEO_AUDIO_DELAY_US: u64 = 120_000;
 
 pub struct Player {
     decoder: Decoder,
@@ -99,12 +99,13 @@ struct Resampler {
 }
 
 impl Resampler {
-    fn source_frame(&mut self) -> [f32; 2] { self.consumer.pop().unwrap_or([0.0, 0.0]) }
+    fn source_frame(&mut self) -> Option<[f32; 2]> { self.consumer.pop().ok() }
 
     fn render<T: Sample + FromSample<f32>>(&mut self, out: &mut [T]) {
         if self.muted.load(Ordering::Relaxed) {
             while self.consumer.pop().is_ok() {}
             self.primed = false;
+            self.started = false;
             self.phase = 0.0;
             for sample in out { *sample = T::from_sample(0.0); }
             return;
@@ -121,15 +122,41 @@ impl Resampler {
             }
             self.started = true;
         }
-        for frame in out.chunks_mut(self.channels) {
+        let mut frames = out.chunks_mut(self.channels);
+        while let Some(frame) = frames.next() {
             if !self.primed {
-                self.current = self.source_frame();
-                self.next = self.source_frame();
+                let Some(current) = self.source_frame() else {
+                    self.started = false;
+                    for sample in frame.iter_mut().chain(frames.flat_map(|rest| rest.iter_mut())) {
+                        *sample = T::from_sample(0.0);
+                    }
+                    return;
+                };
+                let Some(next) = self.source_frame() else {
+                    self.started = false;
+                    self.primed = false;
+                    self.phase = 0.0;
+                    for sample in frame.iter_mut().chain(frames.flat_map(|rest| rest.iter_mut())) {
+                        *sample = T::from_sample(0.0);
+                    }
+                    return;
+                };
+                self.current = current;
+                self.next = next;
                 self.primed = true;
             }
             while self.phase >= 1.0 {
                 self.current = self.next;
-                self.next = self.source_frame();
+                let Some(next) = self.source_frame() else {
+                    self.started = false;
+                    self.primed = false;
+                    self.phase = 0.0;
+                    for sample in frame.iter_mut().chain(frames.flat_map(|rest| rest.iter_mut())) {
+                        *sample = T::from_sample(0.0);
+                    }
+                    return;
+                };
+                self.next = next;
                 self.phase -= 1.0;
             }
             let left = self.current[0] + (self.next[0] - self.current[0]) * self.phase;
