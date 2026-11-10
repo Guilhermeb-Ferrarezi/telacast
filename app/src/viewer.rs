@@ -72,6 +72,11 @@ fn run(
     // A leitura da rede não pode esperar o decodificador. Uma fila curta impede
     // que o TCP acumule muitos quadros antigos quando o espectador fica ocupado.
     let (packet_tx, packet_rx) = sync_channel::<anyhow::Result<Message>>(INCOMING_PACKET_QUEUE);
+    // Áudio e vídeo precisam compartilhar a mesma origem local. Com relógios
+    // separados, o atraso de chegada do primeiro pacote de cada faixa virava
+    // um deslocamento permanente entre a imagem e o som.
+    let media_timeline = Arc::new(Mutex::new(None::<(Instant, u64)>));
+    let reader_timeline = media_timeline.clone();
     let reader_stop = Arc::new(AtomicBool::new(false));
     let reader_stop_thread = reader_stop.clone();
     let stream_stop = Arc::new(AtomicBool::new(false));
@@ -83,7 +88,6 @@ fn run(
     let reader = std::thread::spawn(move || {
         let mut dropping_until_keyframe = false;
         let mut audio_player = None;
-        let mut audio_timeline: Option<(Instant, u64)> = None;
         while !reader_stop_thread.load(Ordering::Relaxed)
             && !stream_stop_thread.load(Ordering::Relaxed)
         {
@@ -94,21 +98,26 @@ fn run(
                     // Áudio não entra na fila do decoder H.264. Assim, uma fila de
                     // vídeo cheia (ou um quadro caro de decodificar) não descarta
                     // os pacotes Opus junto com os quadros até o próximo keyframe.
-                    if let Some(packet) = packet.filter(|p| p.kind == telacast_proto::MediaKind::SystemAudioOpus) {
-                        let (anchor, base_pts) = *audio_timeline.get_or_insert_with(|| (Instant::now(), packet.pts_us));
-                        if audio_player.is_none() {
-                            audio_player = crate::system_audio_playback::Player::new(
-                                reader_audio_muted.clone(),
-                                reader_audio_volume.clone(),
-                                anchor,
-                                base_pts,
-                            ).ok();
+                    if let Some(packet) = packet {
+                        let (anchor, base_pts) = {
+                            let mut timeline = reader_timeline.lock().unwrap_or_else(|e| e.into_inner());
+                            *timeline.get_or_insert_with(|| (Instant::now(), packet.pts_us))
+                        };
+                        if packet.kind == telacast_proto::MediaKind::SystemAudioOpus {
+                            if audio_player.is_none() {
+                                audio_player = crate::system_audio_playback::Player::new(
+                                    reader_audio_muted.clone(),
+                                    reader_audio_volume.clone(),
+                                    anchor,
+                                    base_pts,
+                                ).ok();
+                            }
+                            if let Some(player) = audio_player.as_mut() {
+                                player.mute(reader_audio_muted.load(Ordering::Relaxed));
+                                let _ = player.push(packet.pts_us, packet.payload);
+                            }
+                            continue;
                         }
-                        if let Some(player) = audio_player.as_mut() {
-                            player.mute(reader_audio_muted.load(Ordering::Relaxed));
-                            let _ = player.push(packet.pts_us, packet.payload);
-                        }
-                        continue;
                     }
                     if dropping_until_keyframe {
                         if kind != Some(telacast_proto::MediaKind::H264Keyframe) {
@@ -156,7 +165,6 @@ fn run(
         reader: Some(reader),
     };
     let mut dec = Decoder::new()?;
-    let mut timeline: Option<(Instant, u64)> = None;
     let mut pending_video = VecDeque::<(Instant, ColorImage)>::new();
     let mut waiting_for_keyframe = false;
     *status.lock().unwrap() = "assistindo".into();
@@ -176,8 +184,9 @@ fn run(
         }
         if let Message::Binary(data) = message {
             if let Ok(packet) = telacast_proto::parse_media_packet(&data) {
-                let (anchor, base_pts) =
-                    *timeline.get_or_insert_with(|| (Instant::now(), packet.pts_us));
+                let Some((anchor, base_pts)) = *media_timeline.lock().unwrap_or_else(|e| e.into_inner()) else {
+                    continue;
+                };
                 match packet.kind {
                     telacast_proto::MediaKind::H264Delta
                     | telacast_proto::MediaKind::H264Keyframe => {
@@ -195,7 +204,6 @@ fn run(
                                 continue;
                             }
                             dec = Decoder::new()?;
-                            timeline = Some((Instant::now(), packet.pts_us));
                             waiting_for_keyframe = false;
                         }
                         if let Ok(Some(yuv)) = dec.decode(packet.payload) {
@@ -203,7 +211,6 @@ fn run(
                             let mut rgba = vec![0u8; w * h * 4];
                             yuv.write_rgba8(&mut rgba);
                             let image = ColorImage::from_rgba_unmultiplied([w, h], &rgba);
-                            let (anchor, base_pts) = timeline.unwrap_or((anchor, base_pts));
                             let due = anchor
                                 + Duration::from_micros(
                                     packet.pts_us.saturating_sub(base_pts).min(1_000_000),
