@@ -286,7 +286,9 @@ fn run(
     };
     let mut audio_pending = std::collections::VecDeque::<(u64, Vec<u8>)>::new();
     let mut audio_error: Option<String> = None;
-    let mut last_media_pts = 0u64;
+    // PTS são monotônicos dentro de cada faixa, mas pacotes de áudio podem chegar
+    // depois de quadros de vídeo cujo PTS já avançou. Não compare faixas distintas.
+    let mut audio_sent = false;
     let mut send = |key: bool, h264: &[u8]| -> anyhow::Result<()> {
         if let Some(capture) = audio_capture.as_mut() {
             loop {
@@ -304,20 +306,25 @@ fn run(
         let video_pts = stream_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
         while audio_pending.front().is_some_and(|(pts, _)| *pts <= video_pts) {
             let (pts, opus) = audio_pending.pop_front().unwrap();
-            if pts <= last_media_pts { continue; }
             let packet = telacast_proto::encode_media_packet(telacast_proto::MediaKind::SystemAudioOpus, pts, &opus)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             ws.send(Message::Binary(packet.into()))?;
-            last_media_pts = pts;
+            audio_sent = true;
         }
-        let video_pts = video_pts.max(last_media_pts);
         let kind = if key { telacast_proto::MediaKind::H264Keyframe } else { telacast_proto::MediaKind::H264Delta };
         let payload = telacast_proto::encode_media_packet(kind, video_pts, h264).map_err(|e| anyhow::anyhow!(e.to_string()))?;
         ws.send(Message::Binary(payload.into()))?;
-        last_media_pts = video_pts;
         sent += 1;
         if t0.elapsed() >= Duration::from_secs(1) {
-            let audio_suffix = audio_error.as_deref().map(|e| format!(" · áudio indisponível: {e}")).unwrap_or_default();
+            let audio_suffix = if let Some(e) = audio_error.as_deref() {
+                format!(" · áudio indisponível: {e}")
+            } else if audio_sent {
+                " · áudio do sistema ativo".to_string()
+            } else if audio_capture.is_some() {
+                " · aguardando áudio do sistema".to_string()
+            } else {
+                String::new()
+            };
             *status.lock().unwrap() = format!("transmitindo · {sent} fps · {w}×{h}{audio_suffix}");
             (sent, t0) = (0, Instant::now());
         }

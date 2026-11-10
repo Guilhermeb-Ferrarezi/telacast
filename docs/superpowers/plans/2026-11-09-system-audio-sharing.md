@@ -16,7 +16,7 @@
 - O áudio do sistema é independente do microfone/relay de voz; não duplicar nem misturar essas fontes.
 - Este plano cobre Windows e Linux. O plano Android depende da base do app e do compartilhamento de tela previstos em `docs/MOBILE-PLAN.md`, fase C; iOS está fora do escopo.
 - O espectador pode silenciar o áudio sem fechar o vídeo.
-- Pacotes usam Opus e timestamps monotônicos; filas têm limite e descartam áudio velho em vez de acumular atraso.
+- Cada faixa usa timestamps monotônicos no relógio do stream; áudio e vídeo podem chegar intercalados fora da ordem global de PTS. Filas têm limite e descartam áudio novo quando cheias em vez de acumular atraso.
 - Conteúdo protegido, apps que desabilitam captura e permissões negadas não podem derrubar vídeo ou voz.
 
 ## Pontos de revisão
@@ -40,7 +40,7 @@
 - `kind`: `0` H.264 delta, `1` H.264 keyframe, `2` Opus de áudio do sistema.
 - `MediaKind::{H264Delta, H264Keyframe, SystemAudioOpus}`, `MediaPacketRef { kind: MediaKind, pts_us: u64, payload: &[u8] }`, `MediaPacketError::{TooShort, UnknownKind, EmptyPayload, TooLarge}`.
 - `proto::parse_media_packet(data: &[u8]) -> Result<MediaPacketRef<'_>, MediaPacketError>` e `proto::encode_media_packet(kind: MediaKind, pts_us: u64, payload: &[u8]) -> Result<Vec<u8>, MediaPacketError>`.
-- `pts_us` é monotônico relativo ao início do stream. H.264 mantém o payload Annex B; Opus usa 48 kHz, 20 ms por pacote.
+- `pts_us` é monotônico dentro de cada faixa e relativo ao início do stream. O publisher não compara PTS de faixas diferentes, pois atraso de captura/codificação pode fazer áudio chegar depois de vídeo com PTS posterior. H.264 mantém o payload Annex B; Opus usa 48 kHz, 20 ms por pacote.
 - O quadro chave continua guardado no `Room` para novos espectadores; pacote Opus nunca substitui esse quadro.
 
 - [x] Implementar o cabeçalho de 9 bytes e parser que rejeita pacote menor que cabeçalho + 1 byte de payload, tipo diferente de 0/1/2 e tamanhos acima do limite existente de 4 MiB.
