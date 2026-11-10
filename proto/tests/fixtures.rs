@@ -135,6 +135,7 @@ variantes!(nome_s2c, TODAS_S2C, S2C;
     S2C::Viewers { .. } => "Viewers",
     S2C::VoiceUpdate(_) => "VoiceUpdate",
     S2C::VoiceLeft { .. } => "VoiceLeft",
+    S2C::EgressUsage { .. } => "EgressUsage",
     S2C::Sessions { .. } => "Sessions",
     S2C::PasswordChanged => "PasswordChanged",
     S2C::Error { .. } => "Error",
@@ -289,6 +290,9 @@ fn canais() -> Vec<Channel> {
 
 fn snapshot_cheio() -> Snapshot {
     Snapshot {
+        live_revision: 7,
+        egress_month: "2026-11".into(),
+        egress_bytes: 1_048_576,
         me: guilherme(),
         servers: vec![ServerInfo {
             id: SERVIDOR,
@@ -375,6 +379,9 @@ fn amostras_c2s() -> Vec<(&'static str, C2S)> {
 fn amostras_s2c() -> Vec<(&'static str, S2C)> {
     let token = "q3Vb9Zt1mXw0L5nY8rJc2HdKpEoAaSuIvGf7TzBN4kM".to_string();
     let vazio = Snapshot {
+        live_revision: 0,
+        egress_month: String::new(),
+        egress_bytes: 0,
         me: guilherme(),
         servers: vec![],
         friends: vec![],
@@ -393,6 +400,7 @@ fn amostras_s2c() -> Vec<(&'static str, S2C)> {
         ("Viewers.ninguem", S2C::Viewers { channel_id: SALA_VOZ, users: vec![] }),
         ("VoiceUpdate", S2C::VoiceUpdate(voz_marina())),
         ("VoiceLeft", S2C::VoiceLeft { user_id: MARINA, channel_id: SALA_VOZ }),
+        ("EgressUsage", S2C::EgressUsage { month: "2026-11".into(), bytes: 1_048_576 }),
         ("Sessions", S2C::Sessions {
             list: vec![
                 SessionInfo { id: SESSAO1, device: "203.0.113.42".into(), created: TS - 86_400_000, last_used: TS, current: true },

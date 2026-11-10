@@ -120,6 +120,7 @@ pub async fn download(State(app): State<Arc<App>>, Path((id, _name)): Path<(i64,
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
         },
     };
+    app.count_egress(bytes.len());
     let mut h = HeaderMap::new();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_str(&mime).unwrap_or(HeaderValue::from_static("application/octet-stream")));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=31536000, immutable"));

@@ -3,7 +3,89 @@ use serde::{Deserialize, Serialize};
 
 /// Versão do protocolo. Sobe quando uma mudança quebra clientes antigos; o servidor recusa outra versão
 /// no login com `ErrorCode::VersionMismatch`.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
+
+/// Pacote binário enviado pelos WebSockets `/publish` e `/watch`.
+pub const MEDIA_HEADER_LEN: usize = 9;
+pub const MEDIA_MAX_PACKET: usize = 4 << 20;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MediaKind {
+    H264Delta = 0,
+    H264Keyframe = 1,
+    SystemAudioOpus = 2,
+}
+
+impl TryFrom<u8> for MediaKind {
+    type Error = MediaPacketError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::H264Delta),
+            1 => Ok(Self::H264Keyframe),
+            2 => Ok(Self::SystemAudioOpus),
+            other => Err(MediaPacketError::UnknownKind(other)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MediaPacketRef<'a> {
+    pub kind: MediaKind,
+    pub pts_us: u64,
+    pub payload: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaPacketError {
+    TooShort,
+    UnknownKind(u8),
+    EmptyPayload,
+    TooLarge,
+}
+
+impl std::fmt::Display for MediaPacketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort => f.write_str("pacote de mídia incompleto"),
+            Self::UnknownKind(k) => write!(f, "tipo de pacote de mídia desconhecido: {k}"),
+            Self::EmptyPayload => f.write_str("pacote de mídia sem conteúdo"),
+            Self::TooLarge => f.write_str("pacote de mídia excede 4 MiB"),
+        }
+    }
+}
+
+impl std::error::Error for MediaPacketError {}
+
+pub fn parse_media_packet(data: &[u8]) -> Result<MediaPacketRef<'_>, MediaPacketError> {
+    if data.len() < MEDIA_HEADER_LEN {
+        return Err(MediaPacketError::TooShort);
+    }
+    if data.len() > MEDIA_MAX_PACKET {
+        return Err(MediaPacketError::TooLarge);
+    }
+    let kind = MediaKind::try_from(data[0])?;
+    let payload = &data[MEDIA_HEADER_LEN..];
+    if payload.is_empty() {
+        return Err(MediaPacketError::EmptyPayload);
+    }
+    Ok(MediaPacketRef { kind, pts_us: u64::from_be_bytes(data[1..9].try_into().unwrap()), payload })
+}
+
+pub fn encode_media_packet(kind: MediaKind, pts_us: u64, payload: &[u8]) -> Result<Vec<u8>, MediaPacketError> {
+    if payload.is_empty() {
+        return Err(MediaPacketError::EmptyPayload);
+    }
+    if payload.len() > MEDIA_MAX_PACKET - MEDIA_HEADER_LEN {
+        return Err(MediaPacketError::TooLarge);
+    }
+    let mut packet = Vec::with_capacity(MEDIA_HEADER_LEN + payload.len());
+    packet.push(kind as u8);
+    packet.extend_from_slice(&pts_us.to_be_bytes());
+    packet.extend_from_slice(payload);
+    Ok(packet)
+}
 
 /// Motivo estável de um erro, para o cliente decidir o que fazer sem ler o texto.
 /// Um código desconhecido (servidor mais novo) vira `Unknown`.
@@ -115,12 +197,20 @@ pub struct Snapshot {
     pub friends: Vec<Friend>,
     pub dms: Vec<Dm>,
     pub live: Vec<Live>,
+    /// Monotonic revision for live-share state; clients ignore older snapshots that arrive late.
+    #[serde(default)]
+    pub live_revision: u64,
     /// Quem você bloqueou.
     #[serde(default)]
     pub blocked: Vec<User>,
     /// Quem está em cada canal de voz dos seus servidores (estado completo; depois vêm `VoiceUpdate`/`VoiceLeft`).
     #[serde(default)]
     pub voice: Vec<VoiceState>,
+    /// Bytes enviados pelo servidor no mês UTC atual (conta payload da aplicação).
+    #[serde(default)]
+    pub egress_month: String,
+    #[serde(default)]
+    pub egress_bytes: u64,
 }
 
 /// Quadro de áudio no WebSocket do gateway (mensagem **binária**; o texto continua sendo JSON).
@@ -307,6 +397,8 @@ pub enum C2S {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum S2C {
     Auth { token: String, me: User },
+    /// Total de bytes enviados pelo servidor no mês UTC atual.
+    EgressUsage { month: String, bytes: u64 },
     /// Quem está assistindo à transmissão do canal (vai ao transmissor e aos espectadores; lista vazia = ninguém).
     Viewers { channel_id: i64, users: Vec<i64> },
     /// Alguém entrou num canal de voz ou mudou de estado (inclui você).

@@ -37,6 +37,18 @@ impl Store {
         Ok(Self { pool })
     }
 
+    pub async fn load_egress(&self, month: &str) -> R<u64> {
+        let bytes: Option<i64> = sqlx::query_scalar("SELECT bytes FROM monthly_egress WHERE month = $1")
+            .bind(month).fetch_optional(&self.pool).await?;
+        Ok(bytes.unwrap_or(0).max(0) as u64)
+    }
+
+    pub async fn save_egress(&self, month: &str, bytes: u64) -> R<()> {
+        sqlx::query("INSERT INTO monthly_egress(month, bytes) VALUES ($1, $2) ON CONFLICT(month) DO UPDATE SET bytes = EXCLUDED.bytes, updated_at = now()")
+            .bind(month).bind(bytes.min(i64::MAX as u64) as i64).execute(&self.pool).await?;
+        Ok(())
+    }
+
     // ---------------------------------------------------------------- contas
 
     /// Consome um uso do convite de instância e cria o usuário, tudo numa transação.
@@ -311,12 +323,29 @@ impl Store {
         Ok(r.rows_affected() == 1)
     }
 
-    /// (servidor, tipo) de um canal de servidor; `None` se não existe.
-    pub async fn channel_server_kind(&self, channel: i64) -> R<Option<(i64, i16)>> {
-        sqlx::query_as("SELECT server_id, kind FROM channels WHERE id = $1 AND server_id IS NOT NULL")
+    /// Metadados de qualquer canal, incluindo DMs (server_id nulo).
+    pub async fn channel_kind_and_server(&self, channel: i64) -> R<Option<(Option<i64>, i16)>> {
+        sqlx::query_as("SELECT server_id, kind FROM channels WHERE id = $1")
             .bind(channel)
             .fetch_optional(&self.pool)
             .await
+    }
+
+    /// Só permite chamada em DM individual, e apenas aos dois participantes dela.
+    pub async fn is_direct_dm_member(&self, channel: i64, user: i64) -> R<bool> {
+        let (allowed,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS (
+                 SELECT 1 FROM channels c
+                 WHERE c.id = $1 AND c.kind = 10 AND c.server_id IS NULL
+                   AND (SELECT count(*) FROM channel_members cm WHERE cm.channel_id = c.id) = 2
+                   AND EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.user_id = $2)
+             )",
+        )
+        .bind(channel)
+        .bind(user)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(allowed)
     }
 
     pub async fn server_member_ids(&self, server: i64) -> R<Vec<i64>> {

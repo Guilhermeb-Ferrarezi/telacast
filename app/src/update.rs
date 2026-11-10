@@ -59,7 +59,9 @@ fn valid_sha(h: &str) -> bool {
 
 /// Chave pública que assina as atualizações: variável de ambiente (testes) ou a embutida na compilação.
 pub fn trusted_key() -> Option<[u8; 32]> {
-    let h = std::env::var("TELACAST_UPDATE_PUBKEY").ok().or_else(|| option_env!("TELACAST_UPDATE_PUBKEY").map(str::to_string))?;
+    let h = std::env::var("TELACAST_UPDATE_PUBKEY").ok()
+        .or_else(|| option_env!("TELACAST_UPDATE_PUBKEY").map(str::to_string))
+        .or_else(|| Some("2b5a681f90a77408fdd96dc9c6c71d846d2c909a353202bf943deb561a0458f4".to_string()))?;
     <[u8; 32]>::try_from(unhex(h.trim())?).ok()
 }
 
@@ -205,10 +207,48 @@ pub fn restart() {
 pub enum State {
     #[default]
     Idle,
+    Checking,
     Available(UpdateManifest),
     Downloading { got: u64, total: u64 },
     Ready,
     Failed(String),
+}
+
+pub const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub fn check_due(now: std::time::Instant, next_check: std::time::Instant) -> bool {
+    now >= next_check
+}
+
+/// Atualiza a faixa sem substituir um download ou instalação que já começou.
+/// Retorna `true` quando apareceu uma versão nova em relação à faixa atual.
+pub fn apply_check_result(state: &mut State, result: Result<Option<UpdateManifest>, String>) -> bool {
+    if matches!(state, State::Downloading { .. } | State::Ready) {
+        return false;
+    }
+    match result {
+        Ok(Some(manifest)) => {
+            if matches!(state, State::Available(current) if current.version == manifest.version) {
+                return false;
+            }
+            *state = State::Available(manifest);
+            true
+        }
+        Ok(None) => {
+            if matches!(state, State::Available(_) | State::Failed(_) | State::Checking) {
+                *state = State::Idle;
+            }
+            false
+        }
+        Err(error) => {
+            if matches!(state, State::Checking) {
+                *state = State::Failed(error);
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +269,31 @@ mod tests {
 
     fn sign(m: &mut UpdateManifest, key: &SigningKey) {
         m.signature = hex(&key.sign(&update_signing_message(&m.version, &m.platform, &m.sha256, m.size)).to_bytes());
+    }
+
+    #[test]
+    fn consulta_periodica_mostra_nova_versao_e_preserva_estado_em_erro() {
+        let mut state = State::Idle;
+        let m = manifest(b"nova versao");
+        assert!(apply_check_result(&mut state, Ok(Some(m.clone()))));
+        assert!(matches!(&state, State::Available(found) if found.version == m.version));
+        assert!(!apply_check_result(&mut state, Ok(Some(m))));
+        assert!(!apply_check_result(&mut state, Err("sem rede".into())));
+        assert!(matches!(state, State::Available(_)));
+    }
+
+    #[test]
+    fn consulta_periodica_nao_interrompe_instalacao_em_andamento() {
+        let mut state = State::Downloading { got: 25, total: 100 };
+        assert!(!apply_check_result(&mut state, Ok(Some(manifest(b"nova versao")))));
+        assert!(matches!(state, State::Downloading { got: 25, total: 100 }));
+    }
+
+    #[test]
+    fn consulta_periodica_respeita_intervalo() {
+        let now = std::time::Instant::now();
+        assert!(!check_due(now, now + CHECK_INTERVAL));
+        assert!(check_due(now + CHECK_INTERVAL, now + CHECK_INTERVAL));
     }
 
     #[test]

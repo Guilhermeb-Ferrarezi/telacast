@@ -1526,18 +1526,18 @@ fn transmissao_espectadores() {
     let (ana_token, ana_id) = ana.register("ana", &code);
     let mut beto = env.client();
     let (beto_token, beto_id) = beto.register("beto", &code);
-    ana.send(C2S::CreateServer { name: "Casa".into() });
-    let snap = ana.wait("snapshot com o servidor", |m| match m {
-        S2C::Snapshot(s) if !s.servers.is_empty() => Some(s.clone()),
-        _ => None,
-    });
-    let channel = snap.servers[0].channels.iter().find(|c| c.kind == 0).unwrap().id;
-    beto.send(C2S::JoinServer { code: snap.servers[0].invite.clone() });
-    beto.wait("ServerJoined", |m| matches!(m, S2C::ServerJoined { .. }).then_some(()));
+    let casa = montar_casa(&mut ana, &mut [&mut beto]);
+    // transmitir e assistir exigem estar na chamada do canal de voz agora
+    let channel = casa.sala;
+    ana.send(C2S::VoiceJoin { channel_id: channel });
+    voice_update(&mut ana, ana_id);
+    beto.send(C2S::VoiceJoin { channel_id: channel });
+    voice_update(&mut beto, beto_id);
 
     // a ana transmite (um quadro-chave falso basta para o servidor)
     let (mut pubws, _) = tungstenite::connect(format!("ws://127.0.0.1:{}/publish/{channel}?token={ana_token}", env.port)).unwrap();
-    pubws.send(tungstenite::Message::Binary(vec![1u8, 0, 0, 0, 1].into())).unwrap();
+    let keyframe = telacast_proto::encode_media_packet(telacast_proto::MediaKind::H264Keyframe, 0, &[0, 0, 0, 1, 0x65]).unwrap();
+    pubws.send(tungstenite::Message::Binary(keyframe.clone().into())).unwrap();
     beto.wait("a transmissão aparece", |m| match m {
         S2C::Snapshot(s) if !s.live.is_empty() => Some(()),
         _ => None,
@@ -1558,7 +1558,7 @@ fn transmissao_espectadores() {
             _ => continue,
         }
     };
-    assert_eq!(got[0], 1);
+    assert_eq!(got.as_ref(), &keyframe[..], "o relé entrega o pacote de mídia intacto");
 
     // o beto sai: a lista da ana esvazia
     view.close(None).ok();

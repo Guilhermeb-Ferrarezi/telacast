@@ -138,7 +138,7 @@ Consequências para o cliente:
      (letras, números, `_`, `.`, `-`); senha de 8 a 128 caracteres.
    - `Login{username, password, proto}`: nome comparado sem diferenciar maiúsculas.
    - `Resume{token, proto}`: retoma uma sessão guardada.
-   `proto` tem de ser `1` (`PROTO_VERSION`). Sem o campo (lido como 0) ou com outro número, o servidor responde
+   `proto` tem de ser `2` (`PROTO_VERSION`). Sem o campo (lido como 0) ou com outro número, o servidor responde
    `Error{code: VersionMismatch}` e **não** autentica.
 3. Sucesso: o servidor manda `Auth{token, me}` e logo depois um `Snapshot`. Guarde o `token` (de forma segura)
    para os próximos `Resume` e para o HTTP. Em `Resume` o token devolvido é o mesmo.

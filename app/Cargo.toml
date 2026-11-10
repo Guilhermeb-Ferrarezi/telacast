@@ -1,6 +1,6 @@
 [package]
 name = "telacast"
-version = "0.1.0"
+version = "0.1.23"
 edition = "2021"
 
 [dependencies]
@@ -32,6 +32,8 @@ telacast-qs = { path = "../qs" }
 rfd = { version = "0.15", default-features = false }
 # toast do Windows: o `windows` já está na árvore (wgpu, accesskit); só liga os módulos de notificação
 windows = { version = "0.62", features = ["UI_Notifications", "Data_Xml_Dom", "Foundation", "Win32_System_Registry", "Win32_Foundation"] }
+windows-capture = "2.0.1"
+wasapi = "0.27"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # notificação por D-Bus: o zbus já vem com o eframe (accesskit_unix); estes três só repetem o que já está no Cargo.lock
@@ -41,5 +43,7 @@ async-channel = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(any(unix, windows))'.dependencies]
 nvidia-video-codec-sdk = { path = "../vendor/nvidia-video-codec-sdk" }
 cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12080"] }

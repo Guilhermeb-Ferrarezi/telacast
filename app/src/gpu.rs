@@ -1,5 +1,6 @@
 //! Encoder H.264 por GPU (NVENC). A GPU converte BGRA -> YUV e codifica,
 //! então a CPU só entrega os pixels capturados.
+use std::sync::Arc;
 
 /// Falha ao iniciar a GPU (permite cair para o encoder de software).
 #[derive(Debug)]
@@ -11,25 +12,25 @@ impl std::fmt::Display for InitError {
 }
 impl std::error::Error for InitError {}
 
-/// Fora do Linux a captura/transmissão de tela ainda não existe (sem NVENC): devolve `InitError` e o chamador cai no software.
-#[cfg(not(unix))]
+/// Plataformas sem NVENC usam o encoder de software.
+#[cfg(not(any(unix, windows)))]
 pub fn encode_loop(
     _w: u32,
     _h: u32,
     _fps: u32,
     _kbps: u32,
-    _recv: impl FnMut() -> Option<Vec<u8>>,
+    _recv: impl FnMut() -> Option<Arc<Vec<u8>>>,
     _send: impl FnMut(bool, &[u8]) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     Err(InitError("só no Linux por enquanto".into()).into())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use real::encode_loop;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod real {
-    use super::InitError;
+    use super::{Arc, InitError};
     use nvidia_video_codec_sdk::{
         sys::nvEncodeAPI::{
             NV_ENC_BUFFER_FORMAT, NV_ENC_CODEC_H264_GUID, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_TYPE,
@@ -50,11 +51,13 @@ mod real {
         h: u32,
         fps: u32,
         kbps: u32,
-        mut recv: impl FnMut() -> Option<Vec<u8>>,
+        mut recv: impl FnMut() -> Option<Arc<Vec<u8>>>,
         mut send: impl FnMut(bool, &[u8]) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let ctx = cudarc::driver::CudaContext::new(0).map_err(init)?;
-        let encoder = Encoder::initialize_with_cuda(ctx).map_err(init)?;
+        let encoder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Encoder::initialize_with_cuda(ctx)))
+            .map_err(|_| InitError("NVENC não está disponível neste driver NVIDIA".into()))?
+            .map_err(init)?;
 
         let mut preset = encoder
             .get_preset_config(
@@ -64,7 +67,9 @@ mod real {
             )
             .map_err(init)?;
         let cfg = &mut preset.presetCfg;
-        let gop = fps * 2;
+        // Um GOP de 1 s limita quanto tempo um espectador atrasado precisa
+        // esperar antes de descartar o buffer e voltar ao quadro ao vivo.
+        let gop = fps;
         cfg.gopLength = gop;
         cfg.frameIntervalP = 1; // sem quadros B: latência mínima
         let bps = kbps * 1000;
@@ -94,7 +99,7 @@ mod real {
 
         let row = w as usize * 4;
         while let Some(frame) = recv() {
-            unsafe { input.lock()?.write_pitched(&frame, row) };
+            unsafe { input.lock()?.write_pitched(frame.as_slice(), row) };
             loop {
                 match session.encode_picture(&mut input, &mut output, Default::default()) {
                     Ok(()) => break,

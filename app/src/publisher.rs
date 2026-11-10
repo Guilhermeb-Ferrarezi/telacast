@@ -1,6 +1,6 @@
 use crate::capture::{Grabber, Raw, Scaler, Source};
 use openh264::{
-    encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod},
+    encoder::{BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, UsageType},
     formats::{BgraSliceU8, YUVBuffer},
     OpenH264API,
 };
@@ -109,7 +109,7 @@ pub fn describe_with_encoder(source_w: u32, source_h: u32, q: &Quality, encoder:
 pub fn suggested_kbps(h: u32, fps: u32) -> u32 {
     // (megapixels por segundo em 16:9, kbps), em ordem crescente.
     const T: [(u32, u32, u32); 6] =
-        [(480, 30, 1500), (720, 30, 3000), (720, 60, 5000), (1080, 30, 5000), (1080, 60, 9000), (1440, 60, 15000)];
+        [(480, 30, 2000), (720, 30, 4000), (720, 60, 6000), (1080, 30, 8000), (1080, 60, 12000), (1440, 60, 20000)];
     let rate = |h: u32, fps: u32| -> f64 { (h as f64 * 16.0 / 9.0) * h as f64 * fps as f64 };
     let r = rate(h.max(1), fps.max(1));
     let pts: Vec<(f64, f64)> = T.iter().map(|&(h, f, k)| (rate(h, f), k as f64)).collect();
@@ -128,17 +128,17 @@ pub fn suggested_kbps(h: u32, fps: u32) -> u32 {
 
 /// Compatibilidade: transmite o monitor inteiro na resolução da fonte.
 pub fn start(url: String, monitor: usize, fps: u32, kbps: u32) -> Handle {
-    start_source(url, Source::Monitor(monitor), Quality { height: None, fps, kbps })
+    start_source(url, Source::Monitor(monitor), Quality { height: None, fps, kbps }, false, None)
 }
 
-pub fn start_source(url: String, source: Source, q: Quality) -> Handle {
+pub fn start_source(url: String, source: Source, q: Quality, share_system_audio: bool, audio_output: Option<String>) -> Handle {
     let stop = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new("conectando…".to_string()));
     let preview: Preview = Arc::new(Mutex::new(None));
     let preview_width = Arc::new(std::sync::atomic::AtomicU32::new(1280));
     let (s, st, pv, pw) = (stop.clone(), status.clone(), preview.clone(), preview_width.clone());
     std::thread::spawn(move || {
-        let msg = match run(&url, &source, &q, &s, &st, &pv, &pw) {
+        let msg = match run(&url, &source, &q, share_system_audio, audio_output.as_deref(), &s, &st, &pv, &pw) {
             Ok(()) => "parado".to_string(),
             Err(e) => format!("erro: {e:#}"),
         };
@@ -154,7 +154,7 @@ const WINDOW_GRACE: Duration = Duration::from_secs(5);
 /// Converte o quadro capturado no tamanho final `ow`x`oh` (pares).
 /// `base` é o tamanho da fonte no início: se a janela mudou de tamanho depois,
 /// o quadro novo é reduzido para caber, centralizado sobre fundo preto.
-fn make_frame(raw: Raw, base: (u32, u32), (ow, oh): (u32, u32), sc: &mut Scaler) -> Vec<u8> {
+fn make_frame(raw: Raw, base: (u32, u32), (ow, oh): (u32, u32), sc: &mut Scaler) -> Arc<Vec<u8>> {
     let (rw, rh) = (raw.w as usize, raw.h as usize);
     let (ow, oh) = (ow as usize, oh as usize);
     if (raw.w, raw.h) == base {
@@ -164,14 +164,14 @@ fn make_frame(raw: Raw, base: (u32, u32), (ow, oh): (u32, u32), sc: &mut Scaler)
         let mut out = vec![0u8; ow * oh * 4];
         if rw == ow && rh >= oh {
             // Só sobra linha ímpar: basta truncar.
-            let mut d = raw.data;
+            let mut d = raw.data.as_ref().clone();
             d.truncate(ow * oh * 4);
-            return d;
+            return Arc::new(d);
         }
         // Redução (ou recorte de coluna ímpar). Recorte: região = tamanho final.
         let (cw, ch) = if rw.abs_diff(ow) <= 1 && rh.abs_diff(oh) <= 1 { (ow.min(rw), oh.min(rh)) } else { (rw, rh) };
-        sc.scale(&raw.data, rw, cw, ch, &mut out, ow, ow, oh);
-        return out;
+        sc.scale(raw.data.as_slice(), rw, cw, ch, &mut out, ow, ow, oh);
+        return Arc::new(out);
     }
     // Janela redimensionada no meio da transmissão: encaixa com proporção mantida.
     let s = (ow as f64 / rw as f64).min(oh as f64 / rh as f64).min(1.0);
@@ -179,14 +179,16 @@ fn make_frame(raw: Raw, base: (u32, u32), (ow, oh): (u32, u32), sc: &mut Scaler)
     let fh = (((rh as f64 * s) as usize) & !1).clamp(2, oh);
     let mut out = vec![0u8; ow * oh * 4];
     let (x0, y0) = ((ow - fw) / 2 & !1, (oh - fh) / 2 & !1);
-    sc.scale(&raw.data, rw, rw, rh, &mut out[(y0 * ow + x0) * 4..], ow, fw, fh);
-    out
+    sc.scale(raw.data.as_slice(), rw, rw, rh, &mut out[(y0 * ow + x0) * 4..], ow, fw, fh);
+    Arc::new(out)
 }
 
 fn run(
     url: &str,
     source: &Source,
     q: &Quality,
+    share_system_audio: bool,
+    audio_output: Option<&str>,
     stop: &AtomicBool,
     status: &Mutex<String>,
     preview: &Preview,
@@ -199,15 +201,17 @@ fn run(
     let (w, h) = output_size(base.0, base.1, q.height);
     let (w, h) = (w as usize, h as usize);
     let mut ws = crate::net::connect_ws(url)?;
+    let stream_start = Instant::now();
+    let mut audio_capture = share_system_audio.then(|| crate::system_audio::Capture::start(audio_output.map(str::to_owned), stream_start));
 
     // Captura e codificação em threads separadas: o fps é limitado pelo
     // mais lento dos dois, não pela soma.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Arc<Vec<u8>>>(1);
     let cap_stop = Arc::new(AtomicBool::new(false));
     let cs = cap_stop.clone();
     let (fail_tx, fail_rx) = std::sync::mpsc::channel::<String>();
     // A prévia é reduzida numa thread própria (até ~20 por segundo), para não roubar tempo da captura a 60 fps.
-    let (ptx, prx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize, usize)>(1);
+    let (ptx, prx) = std::sync::mpsc::sync_channel::<(Arc<Vec<u8>>, usize, usize)>(1);
     {
         let (preview, pw, stop_p) = (preview.clone(), preview_width.clone(), cap_stop.clone());
         std::thread::spawn(move || {
@@ -216,7 +220,7 @@ fn run(
                 match prx.recv_timeout(Duration::from_millis(250)) {
                     Ok((frame, w, h)) => {
                         let target = pw.load(Ordering::Relaxed) as usize;
-                        if let Some(p) = make_preview(&frame, w, h, target, &mut sc) {
+                        if let Some(p) = make_preview(frame.as_slice(), w, h, target, &mut sc) {
                             if let Ok(mut g) = preview.lock() {
                                 *g = Some(p);
                             }
@@ -267,7 +271,7 @@ fn run(
     });
 
     let (mut sent, mut t0) = (0u32, Instant::now());
-    let mut recv = || -> Option<Vec<u8>> {
+    let mut recv = || -> Option<Arc<Vec<u8>>> {
         while !stop.load(Ordering::Relaxed) {
             while let Ok(m) = fail_rx.try_recv() {
                 *status.lock().unwrap() = m;
@@ -280,14 +284,48 @@ fn run(
         }
         None
     };
+    let mut audio_pending = std::collections::VecDeque::<(u64, Vec<u8>)>::new();
+    let mut audio_error: Option<String> = None;
+    // PTS são monotônicos dentro de cada faixa, mas pacotes de áudio podem chegar
+    // depois de quadros de vídeo cujo PTS já avançou. Não compare faixas distintas.
+    let mut audio_sent = false;
     let mut send = |key: bool, h264: &[u8]| -> anyhow::Result<()> {
-        let mut payload = Vec::with_capacity(h264.len() + 1);
-        payload.push(key as u8);
-        payload.extend_from_slice(h264);
+        if let Some(capture) = audio_capture.as_mut() {
+            loop {
+                match capture.rx.try_recv() {
+                    Ok(crate::system_audio::Event::Packet { pts_us, opus }) => audio_pending.push_back((pts_us, opus)),
+                    Ok(crate::system_audio::Event::Failed(e)) => audio_error = Some(e),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        audio_error.get_or_insert_with(|| "captura encerrada".into());
+                        break;
+                    }
+                }
+            }
+        }
+        let video_pts = stream_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        while audio_pending.front().is_some_and(|(pts, _)| *pts <= video_pts) {
+            let (pts, opus) = audio_pending.pop_front().unwrap();
+            let packet = telacast_proto::encode_media_packet(telacast_proto::MediaKind::SystemAudioOpus, pts, &opus)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            ws.send(Message::Binary(packet.into()))?;
+            audio_sent = true;
+        }
+        let kind = if key { telacast_proto::MediaKind::H264Keyframe } else { telacast_proto::MediaKind::H264Delta };
+        let payload = telacast_proto::encode_media_packet(kind, video_pts, h264).map_err(|e| anyhow::anyhow!(e.to_string()))?;
         ws.send(Message::Binary(payload.into()))?;
         sent += 1;
         if t0.elapsed() >= Duration::from_secs(1) {
-            *status.lock().unwrap() = format!("transmitindo · {sent} fps");
+            let audio_suffix = if let Some(e) = audio_error.as_deref() {
+                format!(" · áudio indisponível: {e}")
+            } else if audio_sent {
+                " · áudio do sistema ativo".to_string()
+            } else if audio_capture.is_some() {
+                " · aguardando áudio do sistema".to_string()
+            } else {
+                String::new()
+            };
+            *status.lock().unwrap() = format!("transmitindo · {sent} fps · {w}×{h}{audio_suffix}");
             (sent, t0) = (0, Instant::now());
         }
         Ok(())
@@ -300,12 +338,13 @@ fn run(
             let cfg = EncoderConfig::new()
                 .bitrate(BitRate::from_bps(kbps * 1000))
                 .max_frame_rate(FrameRate::from_hz(fps as f32))
-                .intra_frame_period(IntraFramePeriod::from_num_frames(fps * 2))
+                .intra_frame_period(IntraFramePeriod::from_num_frames(fps))
+                .usage_type(UsageType::ScreenContentRealTime)
                 .num_threads(4);
             let mut enc = Encoder::with_api_config(OpenH264API::from_source(), cfg)?;
             (|| -> anyhow::Result<()> {
                 while let Some(data) = recv() {
-                    let yuv = YUVBuffer::from_bgra8_source(BgraSliceU8::new(&data, (w, h)));
+                    let yuv = YUVBuffer::from_bgra8_source(BgraSliceU8::new(data.as_slice(), (w, h)));
                     let bits = enc.encode(&yuv)?;
                     let key = matches!(
                         bits.frame_type(),
@@ -337,7 +376,7 @@ pub fn bench(fps: u32, kbps: u32) -> anyhow::Result<()> {
     let (w, h) = output_size(bw, bh, None);
     let (w, h) = (w as u16, h as u16);
     let mut sc = Scaler::default();
-    let mut grab = || -> anyhow::Result<Vec<u8>> {
+    let mut grab = || -> anyhow::Result<Arc<Vec<u8>>> {
         Ok(make_frame(g.grab()?, (bw, bh), (w as u32, h as u32), &mut sc))
     };
     let t = Instant::now();
@@ -399,21 +438,21 @@ mod tests {
 
     #[test]
     fn tabela_de_bitrate() {
-        assert_eq!(suggested_kbps(480, 30), 1500);
-        assert_eq!(suggested_kbps(720, 30), 3000);
-        assert_eq!(suggested_kbps(720, 60), 5000);
-        assert_eq!(suggested_kbps(1080, 30), 5000);
-        assert_eq!(suggested_kbps(1080, 60), 9000);
-        assert_eq!(suggested_kbps(1440, 60), 15000);
+        assert_eq!(suggested_kbps(480, 30), 2000);
+        assert_eq!(suggested_kbps(720, 30), 4000);
+        assert_eq!(suggested_kbps(720, 60), 6000);
+        assert_eq!(suggested_kbps(1080, 30), 8000);
+        assert_eq!(suggested_kbps(1080, 60), 12000);
+        assert_eq!(suggested_kbps(1440, 60), 20000);
         // monotônica na taxa de pixels
-        assert!(suggested_kbps(1080, 45) > 5000 && suggested_kbps(1080, 45) < 9000);
+        assert!(suggested_kbps(1080, 45) > 8000 && suggested_kbps(1080, 45) < 12000);
         assert!(suggested_kbps(480, 15) < 1500 && suggested_kbps(480, 15) >= 500);
         assert!(suggested_kbps(2160, 60) > 15000);
         assert!(suggested_kbps(1440, 144) > suggested_kbps(1440, 60));
     }
 
     fn raw(w: u32, h: u32, v: u8) -> Raw {
-        Raw { w, h, data: vec![v; (w * h * 4) as usize] }
+        Raw { w, h, data: Arc::new(vec![v; (w * h * 4) as usize]) }
     }
 
     #[test]

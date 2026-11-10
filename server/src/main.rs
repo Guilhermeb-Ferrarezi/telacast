@@ -35,9 +35,9 @@ use telacast_proto as p;
 use tokio::sync::{
     broadcast,
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    Semaphore,
+    watch, Semaphore,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // ------------------------------------------------------------------ limite de taxa
 
@@ -129,11 +129,13 @@ impl Drop for ViewerGuard {
 }
 
 struct Room {
+    id: u64,
     tx: broadcast::Sender<Bytes>,
     /// Último quadro-chave: novos espectadores começam por ele.
     key: Option<Bytes>,
     channel: i64,
     user: i64,
+    stop: watch::Sender<bool>,
 }
 
 struct App {
@@ -141,8 +143,9 @@ struct App {
     sf: ids::Snowflake,
     conns: Mutex<HashMap<i64, Vec<(u64, Tx)>>>,
     rooms: Mutex<HashMap<i64, Room>>,
-    /// Espectadores de cada transmissão: (id da conexão de vídeo, usuário).
-    viewers: Mutex<HashMap<i64, Vec<(u64, i64)>>>,
+    live_revision: AtomicU64,
+    /// Espectadores de cada transmissão: (id da conexão de vídeo, usuário, cancelamento).
+    viewers: Mutex<HashMap<i64, Vec<(u64, i64, watch::Sender<bool>)>>>,
     next: AtomicU64,
     /// Limita quantos hashes de senha rodam ao mesmo tempo (cada um usa ~19 MiB e CPU).
     hash_sem: Semaphore,
@@ -165,14 +168,18 @@ struct App {
     focused: Mutex<HashSet<u64>>,
     /// Notificações push; `None` sem `TELACAST_FCM_SERVICE_ACCOUNT`.
     push: Option<push::PushService>,
+    egress_bytes: AtomicU64,
+    egress_month: Mutex<String>,
 }
 
 /// Estado de voz de um usuário no servidor, mais o balde de fichas que limita os quadros dele.
+#[derive(Clone)]
 struct VoiceEntry {
     /// Conexão que entrou na voz (se a sessão dela for revogada, a pessoa sai da voz).
     cid: u64,
     channel: i64,
-    server: i64,
+    /// `None` identifica uma chamada em DM direta; nesse caso a sala é só para os dois participantes.
+    server: Option<i64>,
     muted: bool,
     deafened: bool,
     tokens: f64,
@@ -205,20 +212,20 @@ impl App {
     }
 
     /// Registra um espectador. `false` se a transmissão já está no limite.
-    fn viewers_add(&self, channel: i64, vid: u64, uid: i64) -> bool {
+    fn viewers_add(&self, channel: i64, vid: u64, uid: i64, stop: watch::Sender<bool>) -> bool {
         let mut m = self.viewers.lock().unwrap_or_else(|e| e.into_inner());
         let v = m.entry(channel).or_default();
         if v.len() >= MAX_VIEWERS {
             return false;
         }
-        v.push((vid, uid));
+        v.push((vid, uid, stop));
         true
     }
 
     fn viewers_remove(&self, channel: i64, vid: u64) {
         let mut m = self.viewers.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = m.get_mut(&channel) {
-            v.retain(|(i, _)| *i != vid);
+            v.retain(|(i, _, _)| *i != vid);
             if v.is_empty() {
                 m.remove(&channel);
             }
@@ -228,7 +235,7 @@ impl App {
     /// Manda a lista de espectadores (sem repetir pessoa) ao transmissor e a cada espectador.
     fn viewers_notify(&self, channel: i64) {
         let mut users: Vec<i64> = Vec::new();
-        for (_, u) in self.viewers.lock().unwrap_or_else(|e| e.into_inner()).get(&channel).into_iter().flatten() {
+        for (_, u, _) in self.viewers.lock().unwrap_or_else(|e| e.into_inner()).get(&channel).into_iter().flatten() {
             if !users.contains(u) {
                 users.push(*u);
             }
@@ -255,10 +262,13 @@ impl App {
     }
 
     /// Quem está em voz nos servidores dados, ordenado por canal e usuário.
-    fn voice_in(&self, servers: &HashSet<i64>) -> Vec<p::VoiceState> {
+    fn voice_in(&self, servers: &HashSet<i64>, dms: &HashSet<i64>) -> Vec<p::VoiceState> {
         let v = self.voice.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out: Vec<p::VoiceState> =
-            v.iter().filter(|(_, e)| servers.contains(&e.server)).map(|(u, e)| e.state(*u)).collect();
+        let mut out: Vec<p::VoiceState> = v
+            .iter()
+            .filter(|(_, e)| e.server.is_some_and(|server| servers.contains(&server)) || (e.server.is_none() && dms.contains(&e.channel)))
+            .map(|(u, e)| e.state(*u))
+            .collect();
         out.sort_by_key(|s| (s.channel_id, s.user_id));
         out
     }
@@ -275,13 +285,53 @@ impl App {
         }
     }
 
+    async fn broadcast_voice(&self, channel: i64, server: Option<i64>, m: &S2C) {
+        if let Some(server) = server {
+            self.broadcast_server(server, m).await;
+        } else {
+            match self.store.participants(channel).await {
+                Ok(ids) => {
+                    for uid in ids { self.send_to(uid, m); }
+                }
+                Err(e) => error!("participantes da chamada DM {channel}: {e}"),
+            }
+        }
+    }
+
     /// Tira da voz (síncrono, para a saída ficar valendo já) e devolve onde estava.
     fn voice_take(&self, uid: i64) -> Option<VoiceEntry> {
         self.voice.lock().unwrap_or_else(|e| e.into_inner()).remove(&uid)
     }
 
     async fn voice_left(&self, uid: i64, old: &VoiceEntry) {
-        self.broadcast_server(old.server, &S2C::VoiceLeft { user_id: uid, channel_id: old.channel }).await;
+        let viewer_stops: Vec<_> = self
+            .viewers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&old.channel)
+            .into_iter()
+            .flatten()
+            .filter(|(_, viewer_uid, _)| *viewer_uid == uid)
+            .map(|(_, _, stop)| stop.clone())
+            .collect();
+        for stop in viewer_stops {
+            let _ = stop.send(true);
+        }
+        let room = {
+            let mut rooms = self.rooms.lock().unwrap_or_else(|e| e.into_inner());
+            if rooms.get(&old.channel).is_some_and(|room| room.user == uid) {
+                rooms.remove(&old.channel)
+            } else {
+                None
+            }
+        };
+        if let Some(room) = room {
+            let _ = room.stop.send(true);
+            self.live_revision.fetch_add(1, Ordering::Relaxed);
+            let people = self.store.participants(old.channel).await.unwrap_or_default();
+            self.push_many(&people).await;
+        }
+        self.broadcast_voice(old.channel, old.server, &S2C::VoiceLeft { user_id: uid, channel_id: old.channel }).await;
     }
 
     /// Repassa um quadro de áudio de `uid` aos outros participantes do canal dele.
@@ -325,13 +375,12 @@ impl App {
 
     async fn snapshot(&self, me: i64) -> Result<p::Snapshot, sqlx::Error> {
         let online: HashSet<i64> = self.conns.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-        let live_rooms: Vec<(i64, i64)> = self
-            .rooms
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(|r| (r.channel, r.user))
-            .collect();
+        let (live_revision, live_rooms): (u64, Vec<(i64, i64)>) = {
+            let rooms = self.rooms.lock().unwrap_or_else(|e| e.into_inner());
+            let revision = self.live_revision.load(Ordering::Relaxed);
+            let live = rooms.values().map(|r| (r.channel, r.user)).collect();
+            (revision, live)
+        };
         // status escolhido por quem está conectado; "ausente automático" = todas as conexões da pessoa paradas
         let connected: Vec<i64> = online.iter().copied().collect();
         let manual: HashMap<i64, i16> = self.store.manual_statuses(&connected).await?.into_iter().collect();
@@ -400,7 +449,7 @@ impl App {
                 },
             })
             .collect();
-        let dms = self
+        let dms: Vec<p::Dm> = self
             .store
             .dms_of(me)
             .await?
@@ -428,9 +477,14 @@ impl App {
 
         let me_name = self.store.display_name(me).await?.unwrap_or_default();
         let blocked = self.store.blocked_by(me).await?.into_iter().map(|(id, name)| user(id, name)).collect();
-        let voice = self.voice_in(&ids.iter().copied().collect());
-        Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live, blocked, voice })
+        let dm_channels: HashSet<i64> = dms.iter().map(|d| d.channel_id).collect();
+        let voice = self.voice_in(&ids.iter().copied().collect(), &dm_channels);
+        Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live, live_revision, blocked, voice,
+            egress_month: self.egress_month.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            egress_bytes: self.egress_bytes.load(Ordering::Relaxed) })
     }
+
+    fn count_egress(&self, bytes: usize) { self.egress_bytes.fetch_add(bytes as u64, Ordering::Relaxed); }
 
     async fn push_snapshot(&self, uid: i64) {
         match self.snapshot(uid).await {
@@ -533,12 +587,16 @@ impl App {
 
     async fn auth_stream(&self, token: &str, channel: i64) -> Option<i64> {
         let uid = self.store.session_user(&auth::hash_token(token)).await.ok().flatten()?;
-        if self.store.can_access(channel, uid).await.ok()? {
-            return Some(uid);
+        let (server, kind) = self.store.channel_kind_and_server(channel).await.ok().flatten()?;
+        match (server, kind) {
+            (Some(server), 1) if self.store.is_member(server, uid).await.ok()? => {}
+            (None, 10)
+                if self.store.is_direct_dm_member(channel, uid).await.ok()?
+                    && !self.store.dm_blocked(channel, uid).await.ok()? => {}
+            _ => return None,
         }
-        // canal de voz: transmite e assiste quem está nele agora (como no Discord)
-        let in_voice = self.voice.lock().unwrap_or_else(|e| e.into_inner()).get(&uid).is_some_and(|v| v.channel == channel);
-        in_voice.then_some(uid)
+        // A permissão de membro do servidor não basta: stream exige estar na call agora.
+        self.voice.lock().unwrap_or_else(|e| e.into_inner()).get(&uid).is_some_and(|v| v.channel == channel).then_some(uid)
     }
 }
 
@@ -691,11 +749,14 @@ async fn serve(store: Store, sf: ids::Snowflake) {
     let permits = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 4);
     let dummy_hash = auth::hash_password("senha-falsa-para-igualar-o-tempo").expect("argon2");
     let push = push::PushService::from_env(store.clone());
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    let egress_bytes = store.load_egress(&month).await.unwrap_or(0);
     let app = Arc::new(App {
         store,
         sf,
         conns: Default::default(),
         rooms: Default::default(),
+        live_revision: AtomicU64::new(0),
         viewers: Default::default(),
         next: AtomicU64::new(1),
         conn_tokens: Mutex::new(HashMap::new()),
@@ -710,6 +771,29 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         voice: Mutex::new(HashMap::new()),
         focused: Mutex::new(HashSet::new()),
         push,
+        egress_bytes: AtomicU64::new(egress_bytes),
+        egress_month: Mutex::new(month),
+    });
+    let usage_app = app.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            let month = chrono::Utc::now().format("%Y-%m").to_string();
+            let bytes = {
+                let mut current = usage_app.egress_month.lock().unwrap_or_else(|e| e.into_inner());
+                if *current != month {
+                    *current = month.clone();
+                    usage_app.egress_bytes.store(0, Ordering::Relaxed);
+                }
+                usage_app.egress_bytes.load(Ordering::Relaxed)
+            };
+            if let Err(e) = usage_app.store.save_egress(&month, bytes).await { tracing::warn!("persistência do tráfego de saída: {e}"); }
+            let month = usage_app.egress_month.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let update = S2C::EgressUsage { month, bytes };
+            let users: Vec<i64> = usage_app.conns.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+            for uid in users { usage_app.send_to(uid, &update); }
+        }
     });
     let router = Router::new()
         .route("/ws", get(gateway))
@@ -805,11 +889,15 @@ async fn run_conn(mut socket: WebSocket, app: Arc<App>, ip: String) {
                     None => break,
                     Some(Out::Msg(m)) => {
                         let Ok(json) = serde_json::to_string(&m) else { continue };
+                        let len = json.len();
                         if socket.send(Message::Text(json.into())).await.is_err() { break }
+                        app.count_egress(len);
                     }
                     Some(Out::Bin(b)) => {
                         tx.bin_taken();
+                        let len = b.len();
                         if socket.send(Message::Binary(b)).await.is_err() { break }
+                        app.count_egress(len);
                     }
                 }
             }
@@ -1058,47 +1146,73 @@ async fn handle_authed(
                 err(ErrorCode::RateLimited, ERR_BUSY);
                 return true;
             }
-            let (server, kind) = match app.store.channel_server_kind(channel_id).await {
+            let (server, kind) = match app.store.channel_kind_and_server(channel_id).await {
                 Ok(Some(x)) => x,
                 Ok(None) => {
-                    err(ErrorCode::NotFound, "Canal de voz não encontrado");
+                    err(ErrorCode::NotFound, "Canal não encontrado");
                     return true;
                 }
                 Err(e) => {
-                    db_err("channel_server_kind", e);
+                    db_err("channel_kind_and_server", e);
                     return true;
                 }
             };
-            match app.store.is_member(server, me).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    err(ErrorCode::Forbidden, "Você não é membro deste servidor");
+            match (server, kind) {
+                (Some(server_id), 1) => match app.store.is_member(server_id, me).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        err(ErrorCode::Forbidden, "Você não é membro deste servidor");
+                        return true;
+                    }
+                    Err(e) => {
+                        db_err("is_member", e);
+                        return true;
+                    }
+                },
+                (None, 10) => {
+                    match app.store.is_direct_dm_member(channel_id, me).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            err(ErrorCode::Forbidden, "Esta conversa não permite chamada direta");
+                            return true;
+                        }
+                        Err(e) => {
+                            db_err("is_direct_dm_member", e);
+                            return true;
+                        }
+                    }
+                    match app.store.dm_blocked(channel_id, me).await {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            err(ErrorCode::Forbidden, "Não é possível ligar nesta conversa");
+                            return true;
+                        }
+                        Err(e) => {
+                            db_err("dm_blocked", e);
+                            return true;
+                        }
+                    }
+                }
+                _ => {
+                    err(ErrorCode::InvalidInput, "Este canal não aceita chamadas");
                     return true;
                 }
-                Err(e) => {
-                    db_err("is_member", e);
-                    return true;
-                }
-            }
-            if kind != 1 {
-                err(ErrorCode::InvalidInput, "Este canal não é de voz");
-                return true;
             }
             // um canal por vez: entrar noutro move (mantém mudo/surdo). Entrar no mesmo só reenvia o estado.
             let (old, state) = {
                 let mut v = app.voice.lock().unwrap_or_else(|e| e.into_inner());
-                let old = v.get(&me).map(|e| (e.channel, e.server));
-                if old.is_none_or(|(c, _)| c != channel_id) {
+                let old = v.get(&me).cloned();
+                if old.as_ref().is_none_or(|entry| entry.channel != channel_id) {
                     let (muted, deafened) = v.get(&me).map(|e| (e.muted, e.deafened)).unwrap_or((false, false));
                     v.insert(me, VoiceEntry { cid, channel: channel_id, server, muted, deafened, tokens: VOICE_BURST, last: Instant::now() });
                 }
                 (old, v.get(&me).map(|e| e.state(me)))
             };
             let Some(state) = state else { return true };
-            if let Some((old_channel, old_server)) = old.filter(|(c, _)| *c != channel_id) {
-                app.broadcast_server(old_server, &S2C::VoiceLeft { user_id: me, channel_id: old_channel }).await;
+            if let Some(old) = old.filter(|entry| entry.channel != channel_id) {
+                app.voice_left(me, &old).await;
             }
-            app.broadcast_server(server, &S2C::VoiceUpdate(state)).await;
+            app.broadcast_voice(channel_id, server, &S2C::VoiceUpdate(state)).await;
         }
         C2S::VoiceLeave => {
             if let Some(old) = app.voice_take(me) {
@@ -1118,13 +1232,13 @@ async fn handle_authed(
                     Some(e) if (e.muted, e.deafened) != (muted, deafened) => {
                         e.muted = muted;
                         e.deafened = deafened;
-                        Some((e.server, e.state(me)))
+                        Some((e.channel, e.server, e.state(me)))
                     }
                     _ => None,
                 }
             };
-            if let Some((server, state)) = changed {
-                app.broadcast_server(server, &S2C::VoiceUpdate(state)).await;
+            if let Some((channel, server, state)) = changed {
+                app.broadcast_voice(channel, server, &S2C::VoiceUpdate(state)).await;
             }
         }
         C2S::ListSessions => send_sessions(app, tx, me, token_hash).await,
@@ -1657,18 +1771,28 @@ async fn publish(
     let Some(uid) = app.auth_stream(&q.token, channel).await else {
         return StatusCode::FORBIDDEN.into_response();
     };
-    // 4 MiB por quadro é folga de sobra para H.264 de tela; limita o uso de memória por sala.
-    ws.max_message_size(4 << 20).on_upgrade(move |s| run_publisher(s, channel, uid, app))
+    // Limite compartilhado pelo parser do protocolo, incluindo o cabeçalho de mídia.
+    ws.max_message_size(p::MEDIA_MAX_PACKET).on_upgrade(move |s| run_publisher(s, channel, uid, app))
 }
 
 async fn run_publisher(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<App>) {
+    let room_id = app.next.fetch_add(1, Ordering::Relaxed);
+    let (stop_tx, mut stop_rx) = watch::channel(false);
     let tx = {
         let mut rooms = app.rooms.lock().unwrap_or_else(|e| e.into_inner());
-        if rooms.contains_key(&channel) {
+        // Reaplicar as configurações abre o novo WebSocket antes de o handler
+        // antigo terminar de limpar a sala. Permita a troca somente pelo mesmo
+        // usuário e sinalize o publicador anterior para encerrar; o `room_id`
+        // impede que a limpeza antiga remova esta sala nova.
+        if rooms.get(&channel).is_some_and(|room| room.user != uid) {
             None
         } else {
+            if let Some(previous) = rooms.remove(&channel) {
+                let _ = previous.stop.send(true);
+            }
             let (tx, _) = broadcast::channel(16);
-            rooms.insert(channel, Room { tx: tx.clone(), key: None, channel, user: uid });
+            rooms.insert(channel, Room { id: room_id, tx: tx.clone(), key: None, channel, user: uid, stop: stop_tx });
+            app.live_revision.fetch_add(1, Ordering::Relaxed);
             Some(tx)
         }
     };
@@ -1680,20 +1804,35 @@ async fn run_publisher(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<A
     app.push_many(&people).await;
     info!("[canal {channel}] transmissão iniciada por {uid}");
 
-    while let Some(Ok(msg)) = socket.recv().await {
-        if let Message::Binary(data) = msg {
-            if data.len() < 2 {
-                continue;
-            }
-            if data[0] == 1 {
-                if let Some(room) = app.rooms.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&channel) {
-                    room.key = Some(data.clone());
+    loop {
+        tokio::select! {
+            _ = stop_rx.changed() => break,
+            incoming = socket.recv() => {
+                let Some(Ok(msg)) = incoming else { break };
+                if let Message::Binary(data) = msg {
+                    let Ok(packet) = p::parse_media_packet(&data) else {
+                        warn!("[canal {channel}] pacote de mídia inválido do publicador {uid}");
+                        break;
+                    };
+                    if packet.kind == p::MediaKind::H264Keyframe {
+                        if let Some(room) = app.rooms.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&channel) {
+                            if room.id == room_id {
+                                room.key = Some(data.clone());
+                            }
+                        }
+                    }
+                    let _ = tx.send(data); // sem espectadores: erro ignorado
                 }
             }
-            let _ = tx.send(data); // sem espectadores: erro ignorado
         }
     }
-    app.rooms.lock().unwrap_or_else(|e| e.into_inner()).remove(&channel); // encerra os espectadores
+    let removed = {
+        let mut rooms = app.rooms.lock().unwrap_or_else(|e| e.into_inner());
+        if rooms.get(&channel).is_some_and(|room| room.id == room_id) { rooms.remove(&channel) } else { None }
+    };
+    if removed.is_some() {
+        app.live_revision.fetch_add(1, Ordering::Relaxed);
+    }
     app.push_many(&people).await;
     info!("[canal {channel}] transmissão encerrada");
 }
@@ -1713,34 +1852,55 @@ async fn watch(
 async fn run_viewer(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<App>) {
     let found = {
         let rooms = app.rooms.lock().unwrap_or_else(|e| e.into_inner());
-        rooms.get(&channel).map(|r| (r.tx.subscribe(), r.key.clone()))
+        rooms.get(&channel).map(|r| (r.tx.subscribe(), r.key.clone(), r.stop.subscribe()))
     };
-    let Some((mut rx, key)) = found else {
+    let Some((mut rx, key, mut stop_rx)) = found else {
         let _ = socket.send(Message::Text("ninguém está transmitindo neste canal".into())).await;
         return;
     };
     let vid = app.next.fetch_add(1, Ordering::Relaxed);
-    if !app.viewers_add(channel, vid, uid) {
-        let _ = socket.send(Message::Text("Esta transmissão está com o máximo de espectadores.".into())).await;
+    let (viewer_stop, mut viewer_stop_rx) = watch::channel(false);
+    // Fechar a corrida entre auth_stream e VoiceLeave: registre o espectador sob
+    // o mesmo lock que protege a presença na call para o leave conseguir cancelá-lo.
+    let registered = {
+        let voice = app.voice.lock().unwrap_or_else(|e| e.into_inner());
+        if voice.get(&uid).is_some_and(|entry| entry.channel == channel) {
+            app.viewers_add(channel, vid, uid, viewer_stop)
+        } else {
+            false
+        }
+    };
+    if !registered {
+        let _ = socket.send(Message::Text("Você precisa estar na call para assistir à transmissão.".into())).await;
         return;
     }
     let _guard = ViewerGuard { app: app.clone(), channel, vid };
     app.viewers_notify(channel);
     let mut need_key = key.is_none();
     if let Some(k) = key {
+        let len = k.len();
         if socket.send(Message::Binary(k)).await.is_err() {
             return;
         }
+        app.count_egress(len);
     }
     loop {
         tokio::select! {
+            _ = stop_rx.changed() => return,
+            _ = viewer_stop_rx.changed() => return,
             frame = rx.recv() => match frame {
                 Ok(data) => {
                     if need_key {
-                        if data[0] != 1 { continue; }
-                        need_key = false;
+                        let Ok(packet) = p::parse_media_packet(&data) else { continue; };
+                        if packet.kind == p::MediaKind::H264Keyframe {
+                            need_key = false;
+                        } else if packet.kind != p::MediaKind::SystemAudioOpus {
+                            continue;
+                        }
                     }
+                    let len = data.len();
                     if socket.send(Message::Binary(data)).await.is_err() { return; }
+                    app.count_egress(len);
                 }
                 // Espectador lento: descarta até o próximo quadro-chave.
                 Err(broadcast::error::RecvError::Lagged(_)) => need_key = true,

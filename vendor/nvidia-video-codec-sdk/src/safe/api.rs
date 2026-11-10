@@ -2,9 +2,9 @@
 
 use core::ffi::{c_int, c_void};
 
+#[cfg(not(windows))]
+use crate::sys::nvEncodeAPI::{NvEncodeAPICreateInstance, NvEncodeAPIGetMaxSupportedVersion};
 use crate::sys::nvEncodeAPI::{
-    NvEncodeAPICreateInstance,
-    NvEncodeAPIGetMaxSupportedVersion,
     GUID,
     NVENCAPI_MAJOR_VERSION,
     NVENCAPI_MINOR_VERSION,
@@ -37,6 +37,42 @@ use crate::sys::nvEncodeAPI::{
     NV_ENC_STAT,
     NV_ENC_TUNING_INFO,
 };
+
+#[cfg(windows)]
+lazy_static! {
+    static ref NVENC_LIBRARY: libloading::Library = unsafe {
+        libloading::Library::new("nvEncodeAPI64.dll")
+            .unwrap_or_else(|e| panic!("não consegui carregar nvEncodeAPI64.dll: {e}"))
+    };
+}
+
+#[cfg(windows)]
+unsafe fn nvenc_get_max_supported_version(version: *mut u32) -> NVENCSTATUS {
+    let f: libloading::Symbol<'_, unsafe extern "C" fn(*mut u32) -> NVENCSTATUS> = NVENC_LIBRARY
+        .get(b"NvEncodeAPIGetMaxSupportedVersion\0")
+        .expect("símbolo NVENC NvEncodeAPIGetMaxSupportedVersion ausente");
+    f(version)
+}
+
+#[cfg(not(windows))]
+unsafe fn nvenc_get_max_supported_version(version: *mut u32) -> NVENCSTATUS {
+    NvEncodeAPIGetMaxSupportedVersion(version)
+}
+
+#[cfg(windows)]
+unsafe fn nvenc_create_instance(function_list: *mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS {
+    let f: libloading::Symbol<'_,
+        unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS,
+    > = NVENC_LIBRARY
+        .get(b"NvEncodeAPICreateInstance\0")
+        .expect("símbolo NVENC NvEncodeAPICreateInstance ausente");
+    f(function_list)
+}
+
+#[cfg(not(windows))]
+unsafe fn nvenc_create_instance(function_list: *mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS {
+    NvEncodeAPICreateInstance(function_list)
+}
 
 lazy_static! {
     /// A lazy static for the Encoder API.
@@ -235,7 +271,7 @@ impl EncodeAPI {
         // Check that the driver max supported version matches the version
         // from the header files. If they do not match, the bindings should be updated.
         let mut version = 0;
-        unsafe { NvEncodeAPIGetMaxSupportedVersion(&mut version) }
+        unsafe { nvenc_get_max_supported_version(&mut version) }
             .result_without_string()
             .expect("The pointer to the version should be valid.");
         assert_versions_match(version);
@@ -246,7 +282,7 @@ impl EncodeAPI {
             ..Default::default()
         };
         // Create Encode API Instance (populate function buffer).
-        unsafe { NvEncodeAPICreateInstance(&mut function_list) }
+        unsafe { nvenc_create_instance(&mut function_list) }
             .result_without_string()
             .expect("The pointer to the function list should be valid.");
 

@@ -64,6 +64,9 @@ path = "tests/blanks.rs"
 version = "0.16.4"
 features = ["dynamic-loading", "cuda-12080"]
 
+[dependencies.libloading]
+version = "0.8"
+
 [dependencies.lazy_static]
 version = "1.5.0"
 

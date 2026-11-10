@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod capture;
+mod call_sounds;
 mod gateway;
 mod files;
 mod gpu;
@@ -15,6 +16,8 @@ mod update;
 mod voice;
 mod voice_dsp;
 mod single;
+mod system_audio;
+mod system_audio_playback;
 mod theme;
 mod viewer;
 
@@ -138,7 +141,9 @@ struct GoLive {
     res: Option<u32>,
     /// 0 personalizado, 1 fluidez, 2 nitidez.
     preset: u8,
-    advanced: bool,
+    share_system_audio: bool,
+    audio_outputs: Vec<system_audio::AudioOutput>,
+    audio_output: Option<String>,
     /// Bitrate manual (kbps); `None` = automático pela resolução e taxa.
     kbps: Option<u32>,
     items: Vec<GoItem>,
@@ -149,7 +154,22 @@ struct GoLive {
 
 impl GoLive {
     fn new() -> Self {
-        Self { tab: 0, source: None, res: Some(1080), preset: 1, advanced: false, kbps: None, items: Vec::new(), rx: None, last: None, busy: false }
+        let audio_outputs = system_audio::outputs();
+        let audio_output = audio_outputs.first().map(|o| o.id.clone());
+        Self {
+            tab: 0,
+            source: None,
+            res: Some(1080),
+            preset: 1,
+            share_system_audio: false,
+            audio_outputs,
+            audio_output,
+            kbps: None,
+            items: Vec::new(),
+            rx: None,
+            last: None,
+            busy: false,
+        }
     }
 
     /// Atualiza as miniaturas em segundo plano (a cada ~2 s enquanto o diálogo está aberto).
@@ -293,6 +313,7 @@ enum Act {
     OpenAccount,
     Watch(i64),
     StopWatch,
+    ToggleWatchExpand,
     Publish(i64),
     StopPublish,
     Fullscreen,
@@ -374,6 +395,8 @@ struct Session {
     nav_i: usize,
     nav_moving: bool,
     voice_since: Option<Instant>,
+    /// Tentativa de ligação direta aguardando atendimento (canal, prazo, fui eu quem ligou).
+    dm_call_timeout: Option<(i64, Instant, bool)>,
     /// Volume de cada pessoa que ouço (0.0 a 2.0; ausente = 1.0).
     voice_volumes: HashMap<i64, f32>,
     /// Quem assiste a cada transmissão (o servidor manda; vale para o transmissor e para os espectadores).
@@ -382,7 +405,7 @@ struct Session {
     voice_focus: Option<i64>,
     /// Atualização do app: estado compartilhado com a thread de consulta/download.
     update: std::sync::Arc<std::sync::Mutex<update::State>>,
-    update_dismissed: bool,
+    update_dismissed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Motor de áudio da voz (existe só enquanto estou num canal de voz) e dispositivos escolhidos.
     engine: Option<std::sync::Arc<voice::Engine>>,
     voice_in: Option<String>,
@@ -495,7 +518,7 @@ impl Session {
             link: Link::Up,
             gw,
             token,
-            snap: p::Snapshot { me: me.clone(), servers: vec![], friends: vec![], dms: vec![], live: vec![], blocked: vec![], voice: vec![] },
+            snap: p::Snapshot { me: me.clone(), servers: vec![], friends: vec![], dms: vec![], live: vec![], live_revision: 0, blocked: vec![], voice: vec![], egress_month: String::new(), egress_bytes: 0 },
             me,
             view: View::Home,
             tab: HomeTab::Online,
@@ -543,11 +566,12 @@ impl Session {
             nav_i: 0,
             nav_moving: false,
             voice_since: None,
+            dm_call_timeout: None,
             voice_volumes: HashMap::new(),
             viewers: HashMap::new(),
             voice_focus: None,
             update: std::sync::Arc::new(std::sync::Mutex::new(update::State::Idle)),
-            update_dismissed: false,
+            update_dismissed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             engine: None,
             voice_in: None,
             voice_out: None,
@@ -852,17 +876,20 @@ impl Session {
         self.pending.push(pend);
     }
 
-    /// Consulta o servidor por uma versão mais nova (em segundo plano). Uma vez por execução.
+    /// Consulta o servidor por uma versão mais nova em segundo plano.
     fn check_update(&self) {
-        let (state, base, ctx) = (self.update.clone(), self.http_base.clone(), self.ctx.clone());
+        let (state, base, ctx, dismissed) = (
+            self.update.clone(),
+            self.http_base.clone(),
+            self.ctx.clone(),
+            self.update_dismissed.clone(),
+        );
         std::thread::spawn(move || {
             let res = update::check(&base);
             if let Ok(mut st) = state.lock() {
-                *st = match res {
-                    Ok(Some(m)) => update::State::Available(m),
-                    // erro de consulta não incomoda: só aparece se o usuário pedir a verificação
-                    _ => update::State::Idle,
-                };
+                if update::apply_check_result(&mut st, res) {
+                    dismissed.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             ctx.request_repaint();
         });
@@ -995,7 +1022,11 @@ impl Session {
 
     /// (nome do canal, nome do servidor) do canal de voz `ch`.
     fn voice_place(&self, ch: i64) -> Option<(String, String)> {
-        self.snap.servers.iter().find_map(|sv| sv.channels.iter().find(|c| c.id == ch).map(|c| (c.name.clone(), sv.name.clone())))
+        self.snap
+            .servers
+            .iter()
+            .find_map(|sv| sv.channels.iter().find(|c| c.id == ch).map(|c| (c.name.clone(), sv.name.clone())))
+            .or_else(|| self.snap.dms.iter().find(|dm| dm.channel_id == ch).map(|dm| ("Chamada".into(), dm.user.name.clone())))
     }
 
     /// Está falando agora? (o motor de áudio responde)
@@ -1267,6 +1298,8 @@ impl Session {
                     self.viewers.clear();
                     self.voice_focus = None;
                     self.stop_voice_engine();
+                    self.dm_call_timeout = None;
+                    call_sounds::stop();
                     self.voice.clear();
                     self.voice_view = false;
                     self.voice_since = None;
@@ -1310,7 +1343,15 @@ impl Session {
                     self.idle_sent = false; // a conexão nova começa "ativa" no servidor
                 }
                 Event::Msg(m) => match m {
-                    S2C::Snapshot(sn) => {
+                    S2C::EgressUsage { month, bytes } => {
+                        self.snap.egress_month = month;
+                        self.snap.egress_bytes = bytes;
+                    }
+                    S2C::Snapshot(mut sn) => {
+                        if sn.live_revision < self.snap.live_revision {
+                            sn.live = self.snap.live.clone();
+                            sn.live_revision = self.snap.live_revision;
+                        }
                         self.me = sn.me.clone();
                         self.notify_new_friend_requests(&sn);
                         self.voice = sn.voice.clone();
@@ -1498,6 +1539,53 @@ impl Session {
                         }
                     }
                     S2C::VoiceUpdate(st) => {
+                        let dm_call = self.snap.dms.iter().any(|dm| dm.channel_id == st.channel_id);
+                        let had_anyone = self.voice.iter().any(|v| v.channel_id == st.channel_id);
+                        let had_self = self.voice.iter().any(|v| v.channel_id == st.channel_id && v.user_id == self.me.id);
+                        let had_peer = self.voice.iter().any(|v| v.channel_id == st.channel_id && v.user_id != self.me.id);
+                        let new_dm_call = dm_call && st.user_id != self.me.id && !had_self && !had_anyone;
+                        if new_dm_call {
+                            self.dm_call_timeout = Some((st.channel_id, Instant::now() + Duration::from_secs(60), false));
+                        } else if dm_call && st.user_id == self.me.id && !had_self {
+                            self.dm_call_timeout = if had_peer {
+                                None
+                            } else {
+                                Some((st.channel_id, Instant::now() + Duration::from_secs(60), true))
+                            };
+                        } else if dm_call && st.user_id != self.me.id && had_self && !had_peer {
+                            // A outra pessoa atendeu: não é mais uma tentativa pendente.
+                            self.dm_call_timeout = None;
+                        }
+                        if dm_call {
+                            let effect = if new_dm_call {
+                                Some(call_sounds::Effect::Incoming)
+                            } else if st.user_id == self.me.id && !had_self {
+                                Some(if had_peer { call_sounds::Effect::Connected } else { call_sounds::Effect::Outgoing })
+                            } else if st.user_id != self.me.id && had_self && !had_peer {
+                                Some(call_sounds::Effect::Connected)
+                            } else {
+                                None
+                            };
+                            if let Some(effect) = effect {
+                                match effect {
+                                    call_sounds::Effect::Incoming | call_sounds::Effect::Outgoing => {
+                                        call_sounds::ring(self.voice_out.clone(), effect);
+                                    }
+                                    call_sounds::Effect::Connected => {
+                                        call_sounds::stop();
+                                        call_sounds::play(self.voice_out.clone(), effect);
+                                    }
+                                    call_sounds::Effect::Ended => {
+                                        call_sounds::stop();
+                                        call_sounds::play(self.voice_out.clone(), effect);
+                                    }
+                                }
+                            }
+                        }
+                        if new_dm_call {
+                            let caller = self.user_name_of(st.user_id);
+                            self.toast = Some((format!("{caller} está te ligando"), Instant::now()));
+                        }
                         self.voice.retain(|v| v.user_id != st.user_id);
                         let mine = st.user_id == self.me.id;
                         if mine && self.voice_since.is_none() {
@@ -1509,6 +1597,17 @@ impl Session {
                         }
                     }
                     S2C::VoiceLeft { user_id, channel_id } => {
+                        let dm_call = self.snap.dms.iter().any(|dm| dm.channel_id == channel_id);
+                        let had_self = self.voice.iter().any(|v| v.channel_id == channel_id && v.user_id == self.me.id);
+                        if dm_call {
+                            call_sounds::stop();
+                            if self.dm_call_timeout.is_some_and(|(pending_channel, _, _)| pending_channel == channel_id) {
+                                self.dm_call_timeout = None;
+                            }
+                            if user_id != self.me.id && had_self {
+                                call_sounds::play(self.voice_out.clone(), call_sounds::Effect::Ended);
+                            }
+                        }
                         self.voice.retain(|v| !(v.user_id == user_id && v.channel_id == channel_id));
                         if user_id == self.me.id {
                             self.voice_view = false;
@@ -1520,6 +1619,22 @@ impl Session {
                     }
                     S2C::Auth { .. } => {}
                 },
+            }
+        }
+        if let Some((channel, deadline, caller)) = self.dm_call_timeout {
+            let now = Instant::now();
+            if now >= deadline {
+                self.dm_call_timeout = None;
+                call_sounds::stop();
+                if caller && self.voice.iter().any(|v| v.channel_id == channel && v.user_id == self.me.id) {
+                    self.gw.send(C2S::VoiceLeave);
+                    call_sounds::play(self.voice_out.clone(), call_sounds::Effect::Ended);
+                    self.toast = Some(("A ligação expirou: ninguém atendeu em 1 minuto".into(), now));
+                } else {
+                    self.toast = Some(("Chamada perdida".into(), now));
+                }
+            } else {
+                self.ctx.request_repaint_after(deadline.saturating_duration_since(now));
             }
         }
         None
@@ -1536,11 +1651,13 @@ struct Login {
     gw: Option<Gateway>,
     pending: Option<C2S>,
     resuming: bool,
+    update: std::sync::Arc<std::sync::Mutex<update::State>>,
 }
 
 struct App {
     login: Login,
     session: Option<Session>,
+    next_update_check: Instant,
     token_saved: String,
     fps: u32,
     kbps: u32,
@@ -1568,6 +1685,8 @@ struct App {
     publishing: Option<(i64, publisher::Handle)>,
     watching: Option<(i64, viewer::Handle)>,
     texture: Option<egui::TextureHandle>,
+    watching_expanded: bool,
+    watch_retry_after: Instant,
     fullscreen: bool,
     /// Última atividade do usuário (relógio de parede: suspender o PC conta como tempo parado).
     qs: Option<quick::Qs>,
@@ -1592,6 +1711,7 @@ impl App {
             gw: None,
             pending: None,
             resuming: false,
+            update: std::sync::Arc::new(std::sync::Mutex::new(update::State::Idle)),
         };
         let token = get("token");
         if !token.is_empty() && net::insecure_remote(&login.server) {
@@ -1604,6 +1724,7 @@ impl App {
         Self {
             login,
             session: None,
+            next_update_check: Instant::now(),
             token_saved: token,
             voice_ns: get("voice_ns") != "0",
             voice_ll: get("voice_ll") != "0",
@@ -1627,6 +1748,8 @@ impl App {
             publishing: None,
             watching: None,
             texture: None,
+            watching_expanded: false,
+            watch_retry_after: Instant::now(),
             fullscreen: false,
             qs: None,
             last_input: std::time::SystemTime::now(),
@@ -1652,7 +1775,57 @@ impl App {
         });
     }
 
-    fn poll_login(&mut self, ctx: &egui::Context) {
+    /// Consulta o manifesto usando o servidor informado na própria tela de login.
+    fn check_login_update(&self, ctx: &egui::Context) {
+        let state = self.login.update.clone();
+        let base = files::http_base(&self.login.server);
+        let ctx = ctx.clone();
+        if let Ok(mut current) = state.lock() {
+            if matches!(*current, update::State::Checking | update::State::Downloading { .. } | update::State::Ready) {
+                return;
+            }
+            *current = update::State::Checking;
+        }
+        std::thread::spawn(move || {
+            let result = update::check(&base);
+            if let Ok(mut current) = state.lock() {
+                update::apply_check_result(&mut current, result);
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Baixa e instala a atualização sem exigir que o usuário entre na conta.
+    fn start_login_update(&self, ctx: &egui::Context, manifest: telacast_proto::UpdateManifest) {
+        let state = self.login.update.clone();
+        let base = files::http_base(&self.login.server);
+        let ctx = ctx.clone();
+        if let Ok(mut current) = state.lock() {
+            *current = update::State::Downloading { got: 0, total: manifest.size };
+        }
+        std::thread::spawn(move || {
+            let progress = |got: u64, total: u64| {
+                if let Ok(mut current) = state.lock() {
+                    *current = update::State::Downloading { got, total };
+                }
+                ctx.request_repaint();
+            };
+            let result = update::download(&base, &manifest, &progress).and_then(|path| update::install(&path));
+            if let Ok(mut current) = state.lock() {
+                *current = match result {
+                    Ok(()) => update::State::Ready,
+                    Err(error) => update::State::Failed(error),
+                };
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_login<'a>(
+        &mut self,
+        ctx: &egui::Context,
+        storage: &mut Option<&'a mut (dyn eframe::Storage + 'static)>,
+    ) {
         loop {
             let Some(ev) = self.login.gw.as_ref().and_then(|g| g.rx.try_recv().ok()) else { break };
             match ev {
@@ -1664,11 +1837,18 @@ impl App {
                 Event::Msg(S2C::Auth { token, me }) => {
                     let gw = self.login.gw.take().expect("gateway");
                     self.token_saved = token.clone();
+                    if let Some(storage) = storage.as_deref_mut() {
+                        storage.set_string("server", self.login.server.clone());
+                        storage.set_string("user", self.login.user.clone());
+                        storage.set_string("token", token.clone());
+                        storage.flush();
+                    }
                     self.login.pass.clear();
                     self.login.error.clear();
                     self.login.resuming = false;
                     let mut sess = Session::new(gw, self.login.server.clone(), ctx.clone(), token, me);
                     sess.check_update();
+                    self.next_update_check = Instant::now() + update::CHECK_INTERVAL;
                     sess.voice_in = self.voice_in.clone();
                     sess.voice_out = self.voice_out.clone();
                     sess.voice_ns = self.voice_ns;
@@ -1726,6 +1906,21 @@ impl App {
             h.stop.store(true, Ordering::Relaxed);
         }
         self.texture = None;
+        self.watching_expanded = false;
+    }
+
+    fn refresh_watch_texture(&mut self, ctx: &egui::Context, channel: i64) {
+        let frame = self
+            .watching
+            .as_ref()
+            .filter(|(ch, _)| *ch == channel)
+            .and_then(|(_, h)| h.frame.lock().ok()?.take());
+        if let Some(img) = frame {
+            match &mut self.texture {
+                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                None => self.texture = Some(ctx.load_texture("remote", img, egui::TextureOptions::LINEAR)),
+            }
+        }
     }
 }
 
@@ -1750,8 +1945,9 @@ impl eframe::App for App {
         storage.set_string("kbps", self.kbps.to_string());
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let mut storage = frame.storage_mut();
         if !self.fullscreen {
             self.titlebar(ui, &ctx);
             resize_edges(&ctx);
@@ -1760,7 +1956,17 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
-        self.poll_login(&ctx);
+        self.poll_login(&ctx, &mut storage);
+        let now = Instant::now();
+        if update::check_due(now, self.next_update_check) {
+            if let Some(session) = &self.session {
+                session.check_update();
+            } else {
+                self.check_login_update(&ctx);
+            }
+            self.next_update_check = now + update::CHECK_INTERVAL;
+        }
+        ctx.request_repaint_after(self.next_update_check.saturating_duration_since(now));
         let pasted: Vec<std::sync::Arc<egui::ColorImage>> = ctx.input(|i| {
             i.events.iter().filter_map(|e| if let egui::Event::PasteImage(img) = e { Some(img.clone()) } else { None }).collect()
         });
@@ -1774,6 +1980,21 @@ impl eframe::App for App {
                     self.logout(&why);
                     self.login_ui(ui, &ctx);
                 } else {
+                    let publish_call_lost = self.publishing.as_ref().is_some_and(|(channel, _)| {
+                        !s.voice.iter().any(|v| v.user_id == s.me.id && v.channel_id == *channel)
+                    });
+                    let watch_call_lost = self.watching.as_ref().is_some_and(|(channel, _)| {
+                        !s.voice.iter().any(|v| v.user_id == s.me.id && v.channel_id == *channel)
+                    });
+                    let watched_stream_ended = self.watching.as_ref().is_some_and(|(channel, _)| {
+                        !s.snap.live.iter().any(|live| live.channel_id == *channel)
+                    });
+                    if publish_call_lost { self.stop_publish(); }
+                    if watch_call_lost || watched_stream_ended {
+                        self.stop_watch();
+                        self.fullscreen = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    }
                     let keep = self.session_ui(ui, &ctx, &mut s);
                     if keep {
                         self.session = Some(s);
@@ -1929,6 +2150,64 @@ impl App {
 
 impl App {
     fn login_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let update_state = self.login.update.lock().map(|state| state.clone()).unwrap_or_default();
+        let mut check_update = false;
+        let mut install_update = None;
+        if !self.fullscreen {
+            egui::Panel::top("login-update")
+                .frame(egui::Frame::new().fill(L3).inner_margin(egui::Margin::symmetric(16, 7)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        dot(ui, AMBER);
+                        match &update_state {
+                            update::State::Idle => {
+                                ui.label(RichText::new(format!("Telacast {}", update::CURRENT)).color(MUTED));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Verificar atualizações", FIELD) {
+                                        check_update = true;
+                                    }
+                                });
+                            }
+                            update::State::Checking => {
+                                ui.label(RichText::new("Verificando atualizações…").color(TEXT));
+                            }
+                            update::State::Available(manifest) => {
+                                ui.label(RichText::new(format!("Nova versão {} disponível (você está na {}).", manifest.version, update::CURRENT)).color(TEXT));
+                                if !manifest.notes.is_empty() {
+                                    ui.label(RichText::new(&manifest.notes).size(12.5).color(MUTED));
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Depois", FIELD) {
+                                        if let Ok(mut state) = self.login.update.lock() { *state = update::State::Idle; }
+                                    }
+                                    if small_button(ui, "Atualizar agora", BLURPLE) {
+                                        install_update = Some(manifest.clone());
+                                    }
+                                });
+                            }
+                            update::State::Downloading { got, total } => {
+                                let pct = if *total > 0 { *got as f32 / *total as f32 } else { 0.0 };
+                                ui.label(RichText::new(format!("Baixando e conferindo a atualização… {:.0}%", pct * 100.0)).color(TEXT));
+                                ctx.request_repaint_after(Duration::from_millis(200));
+                            }
+                            update::State::Ready => {
+                                ui.label(RichText::new("Atualização instalada e verificada. Reinicie para usar a nova versão.").color(TEXT));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Reiniciar agora", BLURPLE) { update::restart(); }
+                                });
+                            }
+                            update::State::Failed(error) => {
+                                ui.label(RichText::new(format!("Não foi possível atualizar: {error}")).color(RED));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Tentar novamente", FIELD) { check_update = true; }
+                                });
+                            }
+                        }
+                    });
+                });
+        }
+        if check_update { self.check_login_update(ctx); }
+        if let Some(manifest) = install_update { self.start_login_update(ctx, manifest); }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| {
             let busy = self.login.gw.is_some();
             let top = ((ui.available_height() - 470.0) / 2.0).max(10.0);
@@ -2745,13 +3024,20 @@ impl App {
 
         // faixa de atualização (versão nova disponível, baixando, pronta ou com erro)
         let upd = s.update.lock().map(|g| g.clone()).unwrap_or_default();
-        if !self.fullscreen && !s.update_dismissed && !matches!(upd, update::State::Idle) {
+        if !self.fullscreen
+            && !s.update_dismissed.load(std::sync::atomic::Ordering::Relaxed)
+            && !matches!(upd, update::State::Idle)
+        {
             egui::Panel::top("update")
                 .frame(egui::Frame::new().fill(L3).inner_margin(egui::Margin::symmetric(16, 7)))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         dot(ui, AMBER);
                         match &upd {
+                            update::State::Checking => {
+                                ui.label(RichText::new("Verificando atualizações…").color(TEXT));
+                                ctx.request_repaint_after(Duration::from_millis(200));
+                            }
                             update::State::Available(m) => {
                                 ui.label(RichText::new(format!("Nova versão {} disponível (você está na {}).", m.version, update::CURRENT)).color(TEXT));
                                 if !m.notes.is_empty() {
@@ -2759,7 +3045,7 @@ impl App {
                                 }
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if small_button(ui, "Depois", FIELD) {
-                                        s.update_dismissed = true;
+                                        s.update_dismissed.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
                                     if small_button(ui, "Atualizar agora", BLURPLE) {
                                         s.start_update(m.clone());
@@ -2783,7 +3069,7 @@ impl App {
                                 ui.label(RichText::new(format!("Atualização recusada: {e}")).color(RED));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if small_button(ui, "Fechar", FIELD) {
-                                        s.update_dismissed = true;
+                                        s.update_dismissed.store(true, std::sync::atomic::Ordering::Relaxed);
                                     }
                                 });
                             }
@@ -2934,8 +3220,20 @@ impl App {
                     s.voice_view = true;
                 }
                 Act::LeaveVoice => {
+                    let leaving_dm_call = s.my_voice().is_some_and(|voice| {
+                        s.snap.dms.iter().any(|dm| dm.channel_id == voice.channel_id)
+                    });
+                    if leaving_dm_call {
+                        s.dm_call_timeout = None;
+                        call_sounds::stop();
+                        call_sounds::play(s.voice_out.clone(), call_sounds::Effect::Ended);
+                    }
                     s.gw.send(C2S::VoiceLeave);
                     s.voice_view = false;
+                    self.stop_publish();
+                    self.stop_watch();
+                    self.fullscreen = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                 }
                 Act::ToggleMute => {
                     if s.voice_deaf {
@@ -3164,11 +3462,13 @@ impl App {
                     self.stop_watch();
                     let url = net::url(&self.login.server, "watch", ch, &s.token);
                     self.watching = Some((ch, viewer::start(url, ctx.clone())));
+                    self.watch_retry_after = Instant::now() + Duration::from_secs(2);
                 }
                 Act::StopWatch => {
                     self.stop_watch();
                     self.fullscreen = false;
                 }
+                Act::ToggleWatchExpand => self.watching_expanded = !self.watching_expanded,
                 Act::Publish(ch) => {
                     self.stop_publish();
                     let url = net::url(&self.login.server, "publish", ch, &s.token);
@@ -3177,7 +3477,16 @@ impl App {
                         None => (capture::Source::Monitor(self.monitor), publisher::Quality { height: self.golive.res, fps: self.fps, kbps: self.kbps }),
                     };
                     self.publishing_source = Some(source.clone());
-                    self.publishing = Some((ch, publisher::start_source(url, source, q)));
+                    self.publishing = Some((
+                        ch,
+                        publisher::start_source(
+                            url,
+                            source,
+                            q,
+                            self.golive.share_system_audio,
+                            self.golive.audio_output.clone(),
+                        ),
+                    ));
                 }
                 Act::StopPublish => self.stop_publish(),
                 Act::Fullscreen => {
@@ -3616,10 +3925,16 @@ impl App {
         let mine = s.my_voice().map(|v| v.channel_id) == Some(c.id);
         let selected = mine && s.voice_view;
         let members = s.voice_members(c.id);
+        let live = s.snap.live.iter().any(|l| l.channel_id == c.id);
         let r = list_row(ui, selected, |ui| {
             let (ir, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
             speaker_icon(ui.painter(), ir.center(), 18.0, if mine { TEXT2 } else { MUTED });
             ui.label(RichText::new(&c.name).color(if mine { TEXT } else { TEXT2 }));
+            if live {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new("AO VIVO").size(10.0).strong().color(AMBER));
+                });
+            }
         });
         if r.clicked() {
             acts.push(Act::JoinVoice(c.id));
@@ -3641,6 +3956,9 @@ impl App {
             }
             pt.text(egui::pos2(rect.left() + 28.0 + 28.0, rect.center().y), Align2::LEFT_CENTER, &name, egui::FontId::proportional(13.5), if v.deafened || v.muted { MUTED } else { TEXT2 });
             let ic = egui::pos2(rect.right() - 14.0, rect.center().y);
+            if s.snap.live.iter().any(|l| l.channel_id == c.id && l.user_id == v.user_id) {
+                pt.text(egui::pos2(rect.right() - 38.0, rect.center().y), Align2::RIGHT_CENTER, "AO VIVO", egui::FontId::proportional(9.5), AMBER);
+            }
             if v.deafened {
                 headphone_icon(pt, ic, 15.0, MUTED, true);
             } else if v.muted {
@@ -3680,14 +3998,20 @@ impl App {
             ui.label(serif(&ch_name, 24.0));
             ui.add_space(8.0);
             ui.label(RichText::new(sv_name).size(13.0).color(MUTED));
-            if s.voice_focus.is_some() {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(20.0);
+                    let mb = s.snap.egress_bytes as f64 / 1_000_000.0;
+                    let pct = (s.snap.egress_bytes as f64 / 10_000_000_000_000.0 * 100.0).min(100.0);
+                    let month = if s.snap.egress_month.is_empty() { "este mês" } else { &s.snap.egress_month };
+                    ui.label(RichText::new(format!("Saída {month}: {mb:.2} MB / 10.000.000 MB ({pct:.4}%)"))
+                        .size(12.0).color(MUTED))
+                        .on_hover_text("Conta os dados do Telacast enviados pelo servidor no mês UTC. É uma estimativa do tráfego faturável: não inclui cabeçalhos TLS/TCP nem o tráfego de outros serviços da máquina.");
+                    if s.voice_focus.is_some() {
                     if small_button(ui, "Grade", FIELD) {
                         s.voice_focus = None;
                     }
-                });
-            }
+                    }
+            });
         });
         if s.voice_focus.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             s.voice_focus = None;
@@ -3704,6 +4028,26 @@ impl App {
         let live_here = s.snap.live.iter().find(|l| l.channel_id == mv.channel_id).cloned();
         let sharing = self.publishing.as_ref().is_some_and(|(c, _)| *c == mv.channel_id);
         let preview_here = sharing && !watching_here;
+        if live_here.as_ref().is_some_and(|l| l.user_id != s.me.id) {
+            let failed = self.watching.as_ref().is_some_and(|(ch, h)| {
+                *ch == mv.channel_id
+                    && h.status.lock().is_ok_and(|status| status.starts_with("erro:") || status.as_str() == "desconectado")
+            });
+            let retry = failed && Instant::now() >= self.watch_retry_after;
+            if retry {
+                self.stop_watch();
+            }
+            if !watching_here || retry {
+                acts.push(Act::Watch(mv.channel_id));
+            }
+        } else if watching_here {
+            acts.push(Act::StopWatch);
+        }
+        let watching_expanded = watching_here && self.watching_expanded;
+        if watching_here {
+            self.refresh_watch_texture(ctx, mv.channel_id);
+        }
+        let remote_preview_texture = self.texture.clone();
         if preview_here {
             // tamanho em que a prévia aparece: limitado pela largura ou pela altura do palco (menos a faixa de participantes)
             let aspect = self.preview_tex.as_ref().map(|t| t.size_vec2().x / t.size_vec2().y).unwrap_or(16.0 / 9.0);
@@ -3712,8 +4056,8 @@ impl App {
         }
         // foco: um participante grande no palco e os outros na faixa (duplo clique num tile; "Grade" ou Esc voltam)
         let focus = s.voice_focus.filter(|u| members.iter().any(|m| m.user_id == *u));
-        let focus_here = focus.is_some() && !watching_here && !preview_here;
-        let (stream_rect, stage) = if watching_here || preview_here || focus_here {
+        let focus_here = focus.is_some() && !watching_expanded && !preview_here;
+        let (stream_rect, stage) = if watching_expanded || preview_here || focus_here {
             let strip = 120.0;
             (
                 Some(egui::Rect::from_min_max(stage.min, egui::pos2(stage.max.x, stage.max.y - strip - 8.0))),
@@ -3748,10 +4092,26 @@ impl App {
             let speaking = s.voice_speaking(v.user_id);
             let pt = ui.painter();
             pt.rect_filled(rect, 8.0, bg);
+            let remote_live = live_here.as_ref().is_some_and(|l| l.user_id == v.user_id && v.user_id != s.me.id);
+            if remote_live {
+                if let Some(tex) = remote_preview_texture.as_ref() {
+                    let ts = tex.size_vec2();
+                    let k = (rect.width() / ts.x).min(rect.height() / ts.y);
+                    let image_rect = egui::Rect::from_center_size(rect.center(), ts * k);
+                    pt.image(tex.id(), image_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                } else {
+                    let connecting = self.watching.as_ref().is_some_and(|(_, h)| {
+                        h.status.lock().is_ok_and(|status| !status.starts_with("erro:") && status.as_str() != "desconectado")
+                    });
+                    let label = if connecting { "Conectando à transmissão…" } else { "Reconectando à transmissão…" };
+                    pt.text(rect.center(), Align2::CENTER_CENTER, label, egui::FontId::proportional(13.0), MUTED);
+                }
+            } else {
             let d = (th * 0.44).clamp(40.0, 128.0);
             let c = rect.center();
             pt.circle_filled(c, d / 2.0, lerp(bg, fg, 0.22));
             pt.text(c, Align2::CENTER_CENTER, name.chars().next().map(|x| x.to_uppercase().to_string()).unwrap_or_default(), egui::FontId::proportional(d * 0.42), fg);
+            }
             // pílula do nome com o estado (mudo/surdo) antes do nome
             let galley = pt.layout_no_wrap(name.clone(), egui::FontId::proportional(12.5), TEXT);
             let icon_w = if v.deafened || v.muted { 20.0 } else { 0.0 };
@@ -3769,23 +4129,21 @@ impl App {
             if speaking {
                 pt.rect_stroke(rect, 8.0, egui::Stroke::new(3.0, OK), egui::StrokeKind::Inside);
             }
-            // quem está transmitindo: etiqueta "AO VIVO" e, para os outros, o botão Assistir
+            // A miniatura da transmissão já aparece no cartão de quem transmite.
             if live_here.as_ref().is_some_and(|l| l.user_id == v.user_id) {
                 let g = pt.layout_no_wrap(if v.user_id == s.me.id { "VOCÊ ESTÁ AO VIVO".to_string() } else { "AO VIVO".to_string() }, egui::FontId::proportional(10.5), AMBER);
                 let pill = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), g.size() + egui::vec2(14.0, 8.0));
                 pt.rect_filled(pill, 5.0, Color32::from_black_alpha(170));
                 pt.galley(pill.min + egui::vec2(7.0, 4.0), g, AMBER);
-                if v.user_id != s.me.id && !watching_here && rect.height() >= 100.0 {
-                    let btn = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.bottom() - 40.0), egui::vec2(110.0, 30.0));
-                    if ui.put(btn, egui::Button::new(RichText::new("Assistir").color(L0)).fill(AMBER)).clicked() {
-                        acts.push(Act::Watch(mv.channel_id));
-                    }
-                }
             }
             if resp.clicked() {
-                acts.push(Act::OpenProfile { user: v.user_id, name: name.clone(), anchor: rect, left: false });
+                if remote_live && watching_here {
+                    acts.push(Act::ToggleWatchExpand);
+                } else {
+                    acts.push(Act::OpenProfile { user: v.user_id, name: name.clone(), anchor: rect, left: false });
+                }
             }
-            if resp.double_clicked() {
+            if resp.double_clicked() && !remote_live {
                 s.voice_focus = if s.voice_focus == Some(v.user_id) { None } else { Some(v.user_id) };
                 s.profile = None; // o 1º clique do duplo clique abriu o perfil
             }
@@ -3819,7 +4177,7 @@ impl App {
                 draw_tile(ui, s, acts, sr, v);
             }
         } else if let Some(sr) = stream_rect {
-            if watching_here {
+            if watching_expanded {
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sr));
                 self.stream_area(&mut child, ctx, &*s, acts, true);
             } else {
@@ -4293,6 +4651,14 @@ impl App {
                 if small_button(ui, "Fixadas", FIELD) {
                     acts.push(if s.pins_open { Act::ClosePins } else { Act::OpenPins });
                 }
+                if !hash {
+                    let mine = s.my_voice().is_some_and(|v| v.channel_id == ch);
+                    let active = s.voice_members(ch).iter().any(|v| v.user_id != s.me.id);
+                    let label = if mine { "Abrir chamada" } else if active { "Entrar na chamada" } else { "Ligar" };
+                    if small_button(ui, label, GREEN) {
+                        acts.push(Act::JoinVoice(ch));
+                    }
+                }
             });
         });
         rule_bleed(ui, 28.0);
@@ -4303,6 +4669,10 @@ impl App {
             let mine = l.user_id == s.me.id;
             let who = s.name_of(l.user_id);
             let watching_here = matches!(&self.watching, Some((c, _)) if *c == ch);
+            let in_call = s.my_voice().is_some_and(|v| v.channel_id == ch);
+            if !mine && in_call && !watching_here {
+                acts.push(Act::Watch(ch));
+            }
             egui::Frame::new()
                 .fill(CARD)
                 .stroke(egui::Stroke::new(1.0, LINE2))
@@ -4321,8 +4691,8 @@ impl App {
                                     if small_button(ui, "Fechar", FIELD) {
                                         acts.push(Act::StopWatch);
                                     }
-                                } else if small_button(ui, "Assistir", BLURPLE) {
-                                    acts.push(Act::Watch(ch));
+                                } else {
+                                    ui.label(RichText::new("Entre na chamada para ver a prévia").size(11.5).color(MUTED));
                                 }
                             });
                         }
@@ -5215,6 +5585,47 @@ impl App {
         } else if button(ui, "stop", "Parar de assistir", true, &|p, c, col| close_icon(p, c, 22.0, col)) {
             acts.push(Act::StopWatch);
         }
+        if !mine {
+            if let Some((watching_ch, handle)) = self.watching.as_ref().filter(|(watching_ch, _)| *watching_ch == ch) {
+                let muted = handle.audio_muted.load(Ordering::Relaxed);
+                if button(
+                    ui,
+                    "system-audio-mute",
+                    if muted { "Ativar áudio da transmissão" } else { "Silenciar áudio da transmissão" },
+                    false,
+                    &|p, c, col| {
+                        speaker_icon(p, c, 20.0, col);
+                        if muted {
+                            p.line_segment([c - egui::vec2(8.0, 8.0), c + egui::vec2(8.0, 8.0)], egui::Stroke::new(2.0, col));
+                        }
+                    },
+                ) {
+                    if let Some((_, handle)) = self.watching.as_ref().filter(|(current, _)| current == watching_ch) {
+                        handle.audio_muted.store(!muted, Ordering::Relaxed);
+                    }
+                }
+                if rect.width() >= 470.0 {
+                    let mut volume = handle.audio_volume.load(Ordering::Relaxed).min(100);
+                    let slider_rect = egui::Rect::from_min_size(
+                        egui::pos2(bottom.right() - 300.0, bottom.center().y - 8.0),
+                        egui::vec2(130.0, 16.0),
+                    );
+                    ui.painter().text(
+                        egui::pos2(slider_rect.left() - 10.0, slider_rect.center().y),
+                        Align2::RIGHT_CENTER,
+                        "Volume",
+                        egui::FontId::proportional(11.5),
+                        fade(TEXT2),
+                    );
+                    let response = ui.put(
+                        slider_rect,
+                        egui::Slider::new(&mut volume, 0..=100).show_value(false),
+                    );
+                    response.on_hover_text(format!("Volume do áudio da transmissão: {volume}%"));
+                    handle.audio_volume.store(volume, Ordering::Relaxed);
+                }
+            }
+        }
         let full = self.fullscreen;
         if button(ui, "full", if full { "Sair da tela cheia" } else { "Tela cheia" }, false, &|p, c, col| fullscreen_icon(p, c, 22.0, col, full)) {
             acts.push(Act::Fullscreen);
@@ -5283,14 +5694,13 @@ impl App {
     }
 
     fn stream_area(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &Session, acts: &mut Vec<Act>, full: bool) {
+        let Some(ch) = self.watching.as_ref().map(|(ch, _)| *ch) else { return };
+        self.refresh_watch_texture(ctx, ch);
         let Some((ch, h)) = &self.watching else { return };
-        if let Some(img) = h.frame.lock().unwrap().take() {
-            match &mut self.texture {
-                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                None => self.texture = Some(ctx.load_texture("remote", img, egui::TextureOptions::LINEAR)),
-            }
-        }
         let st = h.status.lock().unwrap().clone();
+        if st == "desconectado" || st.starts_with("erro:") {
+            self.texture = None;
+        }
         let size = if full {
             ui.available_size()
         } else {
@@ -5312,6 +5722,17 @@ impl App {
                 );
             }
             None => {}
+        }
+        if let Some(tex) = &self.texture {
+            let [w, h] = tex.size();
+            let label = format!("{}p · {w}×{h}", h);
+            let galley = ui.painter().layout_no_wrap(label, egui::FontId::proportional(11.0), TEXT);
+            let badge = egui::Rect::from_min_size(
+                egui::pos2(rect.right() - galley.size().x - 24.0, rect.top() + 10.0),
+                galley.size() + egui::vec2(16.0, 8.0),
+            );
+            ui.painter().rect_filled(badge, 5.0, Color32::from_black_alpha(175));
+            ui.painter().galley(badge.min + egui::vec2(8.0, 4.0), galley, TEXT);
         }
         let ch = *ch;
         // cartões de estado (aguardando, terminou, falhou, você caiu)
@@ -5728,144 +6149,103 @@ impl App {
                 let mut go_stop = false;
                 let gl = &mut self.golive;
                 let fps = &mut self.fps;
-                modal(ctx, "Transmitir", 540.0, &mut dismissed, |ui| {
-                    ui.set_width(500.0);
-                    ui.label(RichText::new("Compartilhar uma tela ou janela").size(12.0).color(MUTED));
-                    if cfg!(windows) {
-                        ui.label(RichText::new("Compartilhar a tela ainda não está disponível no Windows (dá para assistir às transmissões dos outros).").size(12.5).color(AMBER));
-                    }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut gl.tab, 0, "Telas");
-                        ui.selectable_value(&mut gl.tab, 1, "Janelas");
-                    });
-                    ui.add_space(6.0);
-                    egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(12.0, 8.0);
-                        let want_window = gl.tab == 1;
-                        let shown: Vec<usize> = (0..gl.items.len()).filter(|i| matches!(gl.items[*i].info.source, capture::Source::Window(_)) == want_window).collect();
-                        if shown.is_empty() {
-                            ui.label(RichText::new(if gl.busy || gl.items.is_empty() { "Procurando…" } else { "Nenhuma janela aberta para compartilhar." }).color(MUTED));
-                        }
-                        ui.horizontal_wrapped(|ui| {
-                            for i in shown {
-                                let (info, tex) = (&gl.items[i].info, &gl.items[i].tex);
-                                ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 4.0;
-                                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(156.0, 88.0), egui::Sense::click());
-                                    match tex {
-                                        Some(t) => {
-                                            egui::Image::new(t).corner_radius(egui::CornerRadius::same(6)).paint_at(ui, rect);
-                                        }
-                                        None => {
-                                            ui.painter().rect_filled(rect, 6.0, L2);
-                                        }
-                                    }
-                                    let sel = gl.source.as_ref() == Some(&info.source);
-                                    ui.painter().rect_stroke(
-                                        rect,
-                                        6.0,
-                                        egui::Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { AMBER } else if resp.hovered() { LINE2 } else { LINE }),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                    if resp.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    if resp.clicked() {
-                                        gl.source = Some(info.source.clone());
-                                    }
-                                    let cap = match &info.source {
-                                        capture::Source::Monitor(n) if info.title.is_empty() => format!("Tela {}", n + 1),
-                                        _ => info.title.clone(),
-                                    };
-                                    ui.add_sized([156.0, 14.0], egui::Label::new(RichText::new(cap).size(12.0).color(if sel { TEXT } else { MUTED })).truncate());
-                                });
+                modal(ctx, "Transmitir", 600.0, &mut dismissed, |ui| {
+                    ui.set_width(560.0);
+                    ui.label(RichText::new("Escolha a tela ou janela e ajuste a qualidade antes de transmitir.").size(12.0).color(MUTED));
+                    ui.add_space(10.0);
+                    egui::Frame::new().fill(L2).corner_radius(egui::CornerRadius::same(10)).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(caps("FONTE DA TRANSMISSÃO"));
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut gl.tab, 0, "Telas");
+                            ui.selectable_value(&mut gl.tab, 1, "Janelas");
+                        });
+                        egui::ScrollArea::vertical().max_height(180.0).auto_shrink([false, true]).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
+                            let want_window = gl.tab == 1;
+                            let shown: Vec<usize> = (0..gl.items.len()).filter(|i| matches!(gl.items[*i].info.source, capture::Source::Window(_)) == want_window).collect();
+                            if shown.is_empty() {
+                                ui.label(RichText::new(if gl.busy || gl.items.is_empty() { "Procurando fontes…" } else { "Nenhuma janela aberta para compartilhar." }).color(MUTED));
                             }
+                            ui.horizontal_wrapped(|ui| {
+                                for i in shown {
+                                    let (info, tex) = (&gl.items[i].info, &gl.items[i].tex);
+                                    ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing.y = 4.0;
+                                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(156.0, 88.0), egui::Sense::click());
+                                        if let Some(t) = tex { egui::Image::new(t).corner_radius(egui::CornerRadius::same(6)).paint_at(ui, rect); }
+                                        else { ui.painter().rect_filled(rect, 6.0, L3); }
+                                        let sel = gl.source.as_ref() == Some(&info.source);
+                                        ui.painter().rect_stroke(rect, 6.0, egui::Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { AMBER } else if resp.hovered() { LINE2 } else { LINE }), egui::StrokeKind::Inside);
+                                        if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                                        if resp.clicked() { gl.source = Some(info.source.clone()); }
+                                        let cap = match &info.source {
+                                            capture::Source::Monitor(n) if info.title.is_empty() => format!("Tela {}", n + 1),
+                                            _ => info.title.clone(),
+                                        };
+                                        ui.add_sized([156.0, 14.0], egui::Label::new(RichText::new(cap).size(12.0).color(if sel { TEXT } else { MUTED })).truncate());
+                                    });
+                                }
+                            });
                         });
                     });
-                    ui.add_space(8.0);
-                    if !place.is_empty() {
-                        ui.label(caps("CANAL DE TRANSMISSÃO"));
-                        ui.label(RichText::new(&place).size(13.0).color(TEXT2));
-                        ui.add_space(6.0);
-                    }
-                    ui.label(caps("QUALIDADE DA TRANSMISSÃO"));
-                    let src_h = gl.selected().map(|i| i.height).unwrap_or(0);
-                    // a escolha anterior era maior que esta tela: usa a resolução da própria fonte
-                    if matches!(gl.res, Some(v) if src_h > 0 && v > src_h) {
-                        gl.res = None;
-                    }
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        if ui.selectable_label(gl.preset == 1, "Fluidez").clicked() {
-                            gl.preset = 1;
-                            gl.res = Some(if src_h > 0 { src_h.min(1080) } else { 1080 });
-                            *fps = 60;
-                            gl.kbps = None;
+                    ui.add_space(10.0);
+                    egui::Frame::new().fill(L2).corner_radius(egui::CornerRadius::same(10)).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        if !place.is_empty() {
+                            ui.horizontal(|ui| { ui.label(caps("DESTINO")); ui.label(RichText::new(&place).size(12.5).color(TEXT2)); });
+                            ui.add_space(6.0);
                         }
-                        if ui.selectable_label(gl.preset == 2, "Nitidez").clicked() {
-                            gl.preset = 2;
-                            gl.res = None;
-                            *fps = 15;
-                            gl.kbps = None;
-                        }
-                        if gl.preset == 0 {
-                            ui.label(RichText::new("Personalizado").size(12.5).color(AMBER));
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Resolução").size(12.5).color(TEXT2));
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        for (h, label) in [(Some(480u32), "480p"), (Some(720), "720p"), (Some(1080), "1080p"), (Some(1440), "1440p"), (None, "Fonte")] {
-                            // não faz sentido ampliar além da tela
-                            let too_big = matches!(h, Some(v) if src_h > 0 && v > src_h);
-                            let r = ui.add_enabled(!too_big, egui::Button::selectable(gl.res == h, label));
-                            if r.clicked() {
-                                gl.res = h;
-                                gl.preset = 0;
-                                gl.kbps = None;
+                        ui.label(caps("QUALIDADE"));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 7.0;
+                            if ui.selectable_label(gl.preset == 1, "Fluidez").clicked() {
+                                gl.preset = 1;
+                                let h = gl.selected().map(|i| i.height).unwrap_or(1080);
+                                gl.res = Some(h.min(1080)); *fps = 60; gl.kbps = None;
                             }
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Taxa de quadros").size(12.5).color(TEXT2));
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        let rates: &[u32] = if gl.advanced { &[15, 30, 60, 90, 120, 144] } else { &[15, 30, 60] };
-                        for f in rates {
-                            if ui.add(egui::Button::selectable(*fps == *f, format!("{f} FPS"))).clicked() {
-                                *fps = *f;
-                                gl.preset = 0;
-                                gl.kbps = None;
+                            if ui.selectable_label(gl.preset == 2, "Nitidez").clicked() { gl.preset = 2; gl.res = None; *fps = 15; gl.kbps = None; }
+                            if gl.preset == 0 { ui.label(RichText::new("Personalizado").size(12.0).color(AMBER)); }
+                        });
+                        let src_h = gl.selected().map(|i| i.height).unwrap_or(0);
+                        if matches!(gl.res, Some(v) if src_h > 0 && v > src_h) { gl.res = None; }
+                        ui.label(RichText::new("Resolução").size(12.0).color(TEXT2));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            for (h, label) in [(Some(480u32), "480p"), (Some(720), "720p"), (Some(1080), "1080p"), (Some(1440), "1440p"), (None, "Fonte")] {
+                                let too_big = matches!(h, Some(v) if src_h > 0 && v > src_h);
+                                if ui.add_enabled(!too_big, egui::Button::selectable(gl.res == h, label)).clicked() { gl.res = h; gl.preset = 0; gl.kbps = None; }
                             }
-                        }
-                    });
-                    ui.add_space(6.0);
-                    match gl.selected() {
-                        Some(info) => {
+                        });
+                        ui.label(RichText::new("Taxa de quadros").size(12.0).color(TEXT2));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            for f in [15, 30, 60, 90, 120, 144] {
+                                if ui.add(egui::Button::selectable(*fps == f, format!("{f} FPS"))).clicked() { *fps = f; gl.preset = 0; gl.kbps = None; }
+                            }
+                        });
+                        if let Some(info) = gl.selected() {
                             let q = gl.quality(info, *fps);
-                            ui.label(RichText::new(publisher::describe(info.width, info.height, &q)).monospace().size(11.5).color(MUTED));
+                            ui.label(RichText::new(publisher::describe(info.width, info.height, &q)).monospace().size(11.0).color(MUTED));
+                        } else { ui.label(RichText::new("Selecione uma fonte para ver a qualidade.").size(11.0).color(MUTED)); }
+                        ui.separator();
+                        ui.checkbox(&mut gl.share_system_audio, "Compartilhar áudio do sistema");
+                        if gl.share_system_audio {
+                            ui.label(RichText::new(system_audio::capture_note()).size(10.5).color(MUTED));
+                            if gl.audio_outputs.is_empty() { ui.label(RichText::new(system_audio::unavailable_hint()).size(10.5).color(MUTED)); }
+                            else {
+                                let selected = gl.audio_outputs.iter().find(|o| Some(&o.id) == gl.audio_output.as_ref()).map(|o| o.name.as_str()).unwrap_or("Saída de áudio");
+                                egui::ComboBox::from_id_salt("golive-audio-output").selected_text(selected).width(300.0).show_ui(ui, |ui| {
+                                    for output in &gl.audio_outputs { ui.selectable_value(&mut gl.audio_output, Some(output.id.clone()), &output.name); }
+                                });
+                            }
                         }
-                        None => {
-                            ui.label(RichText::new("Escolha uma tela ou janela.").size(11.5).color(MUTED));
-                        }
-                    }
-                    ui.add_space(6.0);
-                    ui.add_enabled(false, egui::Checkbox::new(&mut false, "Compartilhar áudio")).on_disabled_hover_text("Em breve");
-                    ui.add_space(4.0);
-                    egui::CollapsingHeader::new("Avançado").default_open(gl.advanced).show(ui, |ui| {
-                        gl.advanced = true;
                         let auto = gl.selected().map(|i| publisher::suggested_kbps(publisher::output_size(i.width, i.height, gl.res).1, *fps)).unwrap_or(8000);
                         let mut mbps = gl.kbps.unwrap_or(auto) as f32 / 1000.0;
                         ui.horizontal(|ui| {
-                            if ui.add(egui::Slider::new(&mut mbps, 1.0..=40.0).suffix(" Mbps")).changed() {
-                                gl.kbps = Some((mbps * 1000.0) as u32);
-                                gl.preset = 0;
-                            }
-                            if gl.kbps.is_some() && small_button(ui, "Automático", FIELD) {
-                                gl.kbps = None;
-                            }
+                            ui.label(RichText::new("Bitrate").size(12.0).color(TEXT2));
+                            if ui.add(egui::Slider::new(&mut mbps, 1.0..=40.0).suffix(" Mbps")).changed() { gl.kbps = Some((mbps * 1000.0) as u32); gl.preset = 0; }
+                            if gl.kbps.is_some() && small_button(ui, "Auto", FIELD) { gl.kbps = None; }
                         });
                     });
                     ui.add_space(10.0);
@@ -5877,7 +6257,7 @@ impl App {
                             go_stop = true;
                             close = true;
                         }
-                        let ready = cur.is_some() && gl.source.is_some() && !cfg!(windows);
+                        let ready = cur.is_some() && gl.source.is_some();
                         ui.add_enabled_ui(ready, |ui| {
                             if small_button(ui, if live { "Aplicar" } else { "Transmitir" }, BLURPLE) {
                                 go_publish = true;

@@ -17,3 +17,4 @@ files/
 updates/
 dist/
 /updates/
+__pycache__/
