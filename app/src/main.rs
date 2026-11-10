@@ -1372,6 +1372,7 @@ struct Login {
     gw: Option<Gateway>,
     pending: Option<C2S>,
     resuming: bool,
+    update: std::sync::Arc<std::sync::Mutex<update::State>>,
 }
 
 struct App {
@@ -1425,6 +1426,7 @@ impl App {
             gw: None,
             pending: None,
             resuming: false,
+            update: std::sync::Arc::new(std::sync::Mutex::new(update::State::Idle)),
         };
         let token = get("token");
         if !token.is_empty() && net::insecure_remote(&login.server) {
@@ -1437,7 +1439,7 @@ impl App {
         Self {
             login,
             session: None,
-            next_update_check: Instant::now() + update::CHECK_INTERVAL,
+            next_update_check: Instant::now(),
             token_saved: token,
             voice_ns: get("voice_ns") != "0",
             voice_ll: get("voice_ll") != "0",
@@ -1480,6 +1482,52 @@ impl App {
             C2S::Register { username, password, invite, proto: p::PROTO_VERSION }
         } else {
             C2S::Login { username, password, proto: p::PROTO_VERSION }
+        });
+    }
+
+    /// Consulta o manifesto usando o servidor informado na própria tela de login.
+    fn check_login_update(&self, ctx: &egui::Context) {
+        let state = self.login.update.clone();
+        let base = files::http_base(&self.login.server);
+        let ctx = ctx.clone();
+        if let Ok(mut current) = state.lock() {
+            if matches!(*current, update::State::Checking | update::State::Downloading { .. } | update::State::Ready) {
+                return;
+            }
+            *current = update::State::Checking;
+        }
+        std::thread::spawn(move || {
+            let result = update::check(&base);
+            if let Ok(mut current) = state.lock() {
+                update::apply_check_result(&mut current, result);
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Baixa e instala a atualização sem exigir que o usuário entre na conta.
+    fn start_login_update(&self, ctx: &egui::Context, manifest: telacast_proto::UpdateManifest) {
+        let state = self.login.update.clone();
+        let base = files::http_base(&self.login.server);
+        let ctx = ctx.clone();
+        if let Ok(mut current) = state.lock() {
+            *current = update::State::Downloading { got: 0, total: manifest.size };
+        }
+        std::thread::spawn(move || {
+            let progress = |got: u64, total: u64| {
+                if let Ok(mut current) = state.lock() {
+                    *current = update::State::Downloading { got, total };
+                }
+                ctx.request_repaint();
+            };
+            let result = update::download(&base, &manifest, &progress).and_then(|path| update::install(&path));
+            if let Ok(mut current) = state.lock() {
+                *current = match result {
+                    Ok(()) => update::State::Ready,
+                    Err(error) => update::State::Failed(error),
+                };
+            }
+            ctx.request_repaint();
         });
     }
 
@@ -1587,6 +1635,8 @@ impl eframe::App for App {
         if update::check_due(now, self.next_update_check) {
             if let Some(session) = &self.session {
                 session.check_update();
+            } else {
+                self.check_login_update(&ctx);
             }
             self.next_update_check = now + update::CHECK_INTERVAL;
         }
@@ -1748,6 +1798,64 @@ impl App {
 
 impl App {
     fn login_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let update_state = self.login.update.lock().map(|state| state.clone()).unwrap_or_default();
+        let mut check_update = false;
+        let mut install_update = None;
+        if !self.fullscreen {
+            egui::Panel::top("login-update")
+                .frame(egui::Frame::new().fill(L3).inner_margin(egui::Margin::symmetric(16, 7)))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        dot(ui, AMBER);
+                        match &update_state {
+                            update::State::Idle => {
+                                ui.label(RichText::new(format!("Telacast {}", update::CURRENT)).color(MUTED));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Verificar atualizações", FIELD) {
+                                        check_update = true;
+                                    }
+                                });
+                            }
+                            update::State::Checking => {
+                                ui.label(RichText::new("Verificando atualizações…").color(TEXT));
+                            }
+                            update::State::Available(manifest) => {
+                                ui.label(RichText::new(format!("Nova versão {} disponível (você está na {}).", manifest.version, update::CURRENT)).color(TEXT));
+                                if !manifest.notes.is_empty() {
+                                    ui.label(RichText::new(&manifest.notes).size(12.5).color(MUTED));
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Depois", FIELD) {
+                                        if let Ok(mut state) = self.login.update.lock() { *state = update::State::Idle; }
+                                    }
+                                    if small_button(ui, "Atualizar agora", BLURPLE) {
+                                        install_update = Some(manifest.clone());
+                                    }
+                                });
+                            }
+                            update::State::Downloading { got, total } => {
+                                let pct = if *total > 0 { *got as f32 / *total as f32 } else { 0.0 };
+                                ui.label(RichText::new(format!("Baixando e conferindo a atualização… {:.0}%", pct * 100.0)).color(TEXT));
+                                ctx.request_repaint_after(Duration::from_millis(200));
+                            }
+                            update::State::Ready => {
+                                ui.label(RichText::new("Atualização instalada e verificada. Reinicie para usar a nova versão.").color(TEXT));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Reiniciar agora", BLURPLE) { update::restart(); }
+                                });
+                            }
+                            update::State::Failed(error) => {
+                                ui.label(RichText::new(format!("Não foi possível atualizar: {error}")).color(RED));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if small_button(ui, "Tentar novamente", FIELD) { check_update = true; }
+                                });
+                            }
+                        }
+                    });
+                });
+        }
+        if check_update { self.check_login_update(ctx); }
+        if let Some(manifest) = install_update { self.start_login_update(ctx, manifest); }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| {
             let busy = self.login.gw.is_some();
             let top = ((ui.available_height() - 470.0) / 2.0).max(10.0);
@@ -2475,6 +2583,10 @@ impl App {
                     ui.horizontal(|ui| {
                         dot(ui, AMBER);
                         match &upd {
+                            update::State::Checking => {
+                                ui.label(RichText::new("Verificando atualizações…").color(TEXT));
+                                ctx.request_repaint_after(Duration::from_millis(200));
+                            }
                             update::State::Available(m) => {
                                 ui.label(RichText::new(format!("Nova versão {} disponível (você está na {}).", m.version, update::CURRENT)).color(TEXT));
                                 if !m.notes.is_empty() {

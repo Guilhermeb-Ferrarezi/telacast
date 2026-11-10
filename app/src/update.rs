@@ -207,6 +207,7 @@ pub fn restart() {
 pub enum State {
     #[default]
     Idle,
+    Checking,
     Available(UpdateManifest),
     Downloading { got: u64, total: u64 },
     Ready,
@@ -234,12 +235,19 @@ pub fn apply_check_result(state: &mut State, result: Result<Option<UpdateManifes
             true
         }
         Ok(None) => {
-            if matches!(state, State::Available(_) | State::Failed(_)) {
+            if matches!(state, State::Available(_) | State::Failed(_) | State::Checking) {
                 *state = State::Idle;
             }
             false
         }
-        Err(_) => false,
+        Err(error) => {
+            if matches!(state, State::Checking) {
+                *state = State::Failed(error);
+                true
+            } else {
+                false
+            }
+        }
     }
 }
 
