@@ -1508,6 +1508,12 @@ fn atualizacao_publicar_e_baixar() {
     assert_eq!(baixado, b"binario falso do app");
     assert!(head.contains(&format!("filename=\"telacast-{}-{plat}.", m.version)), "{head}");
     assert_eq!(http(env.port, "GET", "/download/android-arm64", b"").0, 404, "sem publicação");
+    // barra no fim, página com os links e apelidos curtos
+    assert_eq!(http(env.port, "GET", &format!("/download/{plat}/"), b"").0, 200);
+    let (st, _, pagina) = http(env.port, "GET", "/download", b"");
+    assert_eq!(st, 200);
+    assert!(String::from_utf8_lossy(&pagina).contains(&format!("/download/{plat}")), "a página lista a plataforma publicada");
+    assert_eq!(http(env.port, "GET", "/baixar", b"").0, 200);
     assert_eq!(http(env.port, "GET", "/download/..%2Fx", b"").0, 400);
     // plataforma sem publicação, plataforma e hash malformados
     assert_eq!(http(env.port, "GET", "/update/manifest?platform=linux-aarch64", b"").0, 404);

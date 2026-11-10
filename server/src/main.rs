@@ -803,7 +803,13 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         .route("/files/{id}/{name}", get(files::download))
         .route("/update/manifest", get(updates::manifest))
         .route("/update/file/{hash}", get(updates::file))
+        .route("/download", get(updates::pagina))
+        .route("/baixar", get(updates::pagina))
         .route("/download/{platform}", get(updates::download))
+        .route("/download/{platform}/", get(updates::download))
+        .route("/android", get(updates::download_android))
+        .route("/windows", get(updates::download_windows))
+        .route("/linux", get(updates::download_linux))
         .route("/health", get(|| async { "ok" }))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");

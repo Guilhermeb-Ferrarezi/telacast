@@ -51,6 +51,7 @@ pub async fn file(State(app): State<Arc<App>>, Path(hash): Path<String>) -> Resp
 /// `GET /download/{plataforma}`: baixa a versão mais recente já com nome e tipo certos (link para mandar a um amigo:
 /// `https://servidor/download/android-arm64`). Não confere a assinatura (o app confere ao se atualizar).
 pub async fn download(Path(platform): Path<String>) -> Response {
+    let platform = apelido(platform.trim_end_matches('/'));
     if !valid_platform(&platform) {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -79,6 +80,69 @@ pub async fn download(Path(platform): Path<String>) -> Response {
         bytes,
     )
         .into_response()
+}
+
+/// Nomes curtos para o link: `/android`, `/windows`, `/linux` (e `/download/android` etc.).
+fn apelido(p: &str) -> String {
+    match p {
+        "android" => "android-arm64",
+        "windows" => "windows-msi",
+        "linux" => "linux-x86_64",
+        outro => outro,
+    }
+    .to_string()
+}
+
+pub async fn download_android() -> Response {
+    download(Path("android".into())).await
+}
+pub async fn download_windows() -> Response {
+    download(Path("windows".into())).await
+}
+pub async fn download_linux() -> Response {
+    download(Path("linux".into())).await
+}
+
+/// `GET /download` (e `/baixar`): página simples com os links das versões publicadas.
+pub async fn pagina() -> Response {
+    let mut itens = String::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(dir()).await {
+        let mut plats: Vec<(String, String)> = Vec::new();
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let nome = e.file_name().to_string_lossy().to_string();
+            if let Some(plat) = nome.strip_prefix("manifest-").and_then(|n| n.strip_suffix(".json")) {
+                if let Ok(b) = tokio::fs::read(e.path()).await {
+                    if let Ok(m) = serde_json::from_slice::<UpdateManifest>(&b) {
+                        if valid_platform(plat) && valid_version(&m.version) {
+                            plats.push((plat.to_string(), m.version));
+                        }
+                    }
+                }
+            }
+        }
+        plats.sort();
+        for (plat, versao) in plats {
+            let rotulo = match plat.as_str() {
+                "android-arm64" => "Android (APK)",
+                "windows-msi" => "Windows (instalador)",
+                "windows-x86_64" => "Windows (executável avulso)",
+                "linux-x86_64" => "Linux",
+                outro => outro,
+            };
+            itens.push_str(&format!("<li><a href=\"/download/{plat}\">{rotulo}</a> <small>versão {versao}</small></li>"));
+        }
+    }
+    if itens.is_empty() {
+        itens.push_str("<li>Nenhuma versão publicada ainda.</li>");
+    }
+    let html = format!(
+        "<!doctype html><html lang=\"pt-BR\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Telacast</title>\
+<style>body{{background:#141416;color:#e8e6e1;font:16px/1.5 system-ui,sans-serif;margin:0;padding:32px 20px;max-width:520px;margin:auto}}\
+h1{{font:500 34px Georgia,serif;margin:0 0 4px}}p{{color:#9a978f}}ul{{list-style:none;padding:0}}li{{margin:10px 0;padding:14px;background:#1c1c1f;border:1px solid #2a2a2e;border-radius:10px}}\
+a{{color:#e9b35e;font-weight:600;text-decoration:none}}small{{color:#9a978f;margin-left:8px}}</style>\
+<h1>Telacast</h1><p>Baixe o app para o seu aparelho.</p><ul>{itens}</ul>"
+    );
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], html).into_response()
 }
 
 /// Versão só com dígitos, pontos e hífen/letras simples (vira parte do nome do arquivo no cabeçalho).
