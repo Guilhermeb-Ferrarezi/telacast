@@ -1529,7 +1529,11 @@ impl App {
         });
     }
 
-    fn poll_login(&mut self, ctx: &egui::Context) {
+    fn poll_login<'a>(
+        &mut self,
+        ctx: &egui::Context,
+        storage: &mut Option<&'a mut (dyn eframe::Storage + 'static)>,
+    ) {
         loop {
             let Some(ev) = self.login.gw.as_ref().and_then(|g| g.rx.try_recv().ok()) else { break };
             match ev {
@@ -1541,6 +1545,12 @@ impl App {
                 Event::Msg(S2C::Auth { token, me }) => {
                     let gw = self.login.gw.take().expect("gateway");
                     self.token_saved = token.clone();
+                    if let Some(storage) = storage.as_deref_mut() {
+                        storage.set_string("server", self.login.server.clone());
+                        storage.set_string("user", self.login.user.clone());
+                        storage.set_string("token", token.clone());
+                        storage.flush();
+                    }
                     self.login.pass.clear();
                     self.login.error.clear();
                     self.login.resuming = false;
@@ -1618,8 +1628,9 @@ impl eframe::App for App {
         storage.set_string("kbps", self.kbps.to_string());
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let mut storage = frame.storage_mut();
         if !self.fullscreen {
             self.titlebar(ui, &ctx);
             resize_edges(&ctx);
@@ -1628,7 +1639,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
-        self.poll_login(&ctx);
+        self.poll_login(&ctx, &mut storage);
         let now = Instant::now();
         if update::check_due(now, self.next_update_check) {
             if let Some(session) = &self.session {
