@@ -294,6 +294,7 @@ enum Act {
     OpenAccount,
     Watch(i64),
     StopWatch,
+    ToggleWatchExpand,
     Publish(i64),
     StopPublish,
     Fullscreen,
@@ -485,7 +486,7 @@ impl Session {
             link: Link::Up,
             gw,
             token,
-            snap: p::Snapshot { me: me.clone(), servers: vec![], friends: vec![], dms: vec![], live: vec![], live_revision: 0, blocked: vec![], voice: vec![] },
+            snap: p::Snapshot { me: me.clone(), servers: vec![], friends: vec![], dms: vec![], live: vec![], live_revision: 0, blocked: vec![], voice: vec![], egress_month: String::new(), egress_bytes: 0 },
             me,
             view: View::Home,
             tab: HomeTab::Online,
@@ -1145,6 +1146,10 @@ impl Session {
                     self.idle_sent = false; // a conexão nova começa "ativa" no servidor
                 }
                 Event::Msg(m) => match m {
+                    S2C::EgressUsage { month, bytes } => {
+                        self.snap.egress_month = month;
+                        self.snap.egress_bytes = bytes;
+                    }
                     S2C::Snapshot(mut sn) => {
                         if sn.live_revision < self.snap.live_revision {
                             sn.live = self.snap.live.clone();
@@ -1400,6 +1405,8 @@ struct App {
     publishing: Option<(i64, publisher::Handle)>,
     watching: Option<(i64, viewer::Handle)>,
     texture: Option<egui::TextureHandle>,
+    watching_expanded: bool,
+    watch_retry_after: Instant,
     fullscreen: bool,
     /// Última atividade do usuário (relógio de parede: suspender o PC conta como tempo parado).
     qs: Option<quick::Qs>,
@@ -1458,6 +1465,8 @@ impl App {
             publishing: None,
             watching: None,
             texture: None,
+            watching_expanded: false,
+            watch_retry_after: Instant::now(),
             fullscreen: false,
             qs: None,
             last_input: std::time::SystemTime::now(),
@@ -1612,6 +1621,21 @@ impl App {
             h.stop.store(true, Ordering::Relaxed);
         }
         self.texture = None;
+        self.watching_expanded = false;
+    }
+
+    fn refresh_watch_texture(&mut self, ctx: &egui::Context, channel: i64) {
+        let frame = self
+            .watching
+            .as_ref()
+            .filter(|(ch, _)| *ch == channel)
+            .and_then(|(_, h)| h.frame.lock().ok()?.take());
+        if let Some(img) = frame {
+            match &mut self.texture {
+                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                None => self.texture = Some(ctx.load_texture("remote", img, egui::TextureOptions::LINEAR)),
+            }
+        }
     }
 }
 
@@ -3015,11 +3039,13 @@ impl App {
                     self.stop_watch();
                     let url = net::url(&self.login.server, "watch", ch, &s.token);
                     self.watching = Some((ch, viewer::start(url, ctx.clone())));
+                    self.watch_retry_after = Instant::now() + Duration::from_secs(2);
                 }
                 Act::StopWatch => {
                     self.stop_watch();
                     self.fullscreen = false;
                 }
+                Act::ToggleWatchExpand => self.watching_expanded = !self.watching_expanded,
                 Act::Publish(ch) => {
                     self.stop_publish();
                     let url = net::url(&self.login.server, "publish", ch, &s.token);
@@ -3549,14 +3575,20 @@ impl App {
             ui.label(serif(&ch_name, 24.0));
             ui.add_space(8.0);
             ui.label(RichText::new(sv_name).size(13.0).color(MUTED));
-            if s.voice_focus.is_some() {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(20.0);
+                    let mb = s.snap.egress_bytes as f64 / 1_000_000.0;
+                    let pct = (s.snap.egress_bytes as f64 / 10_000_000_000_000.0 * 100.0).min(100.0);
+                    let month = if s.snap.egress_month.is_empty() { "este mês" } else { &s.snap.egress_month };
+                    ui.label(RichText::new(format!("Saída {month}: {mb:.2} MB / 10.000.000 MB ({pct:.4}%)"))
+                        .size(12.0).color(MUTED))
+                        .on_hover_text("Conta os dados do Telacast enviados pelo servidor no mês UTC. É uma estimativa do tráfego faturável: não inclui cabeçalhos TLS/TCP nem o tráfego de outros serviços da máquina.");
+                    if s.voice_focus.is_some() {
                     if small_button(ui, "Grade", FIELD) {
                         s.voice_focus = None;
                     }
-                });
-            }
+                    }
+            });
         });
         if s.voice_focus.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             s.voice_focus = None;
@@ -3573,6 +3605,26 @@ impl App {
         let live_here = s.snap.live.iter().find(|l| l.channel_id == mv.channel_id).cloned();
         let sharing = self.publishing.as_ref().is_some_and(|(c, _)| *c == mv.channel_id);
         let preview_here = sharing && !watching_here;
+        if live_here.as_ref().is_some_and(|l| l.user_id != s.me.id) {
+            let failed = self.watching.as_ref().is_some_and(|(ch, h)| {
+                *ch == mv.channel_id
+                    && h.status.lock().is_ok_and(|status| status.starts_with("erro:") || status.as_str() == "desconectado")
+            });
+            let retry = failed && Instant::now() >= self.watch_retry_after;
+            if retry {
+                self.stop_watch();
+            }
+            if !watching_here || retry {
+                acts.push(Act::Watch(mv.channel_id));
+            }
+        } else if watching_here {
+            acts.push(Act::StopWatch);
+        }
+        let watching_expanded = watching_here && self.watching_expanded;
+        if watching_here {
+            self.refresh_watch_texture(ctx, mv.channel_id);
+        }
+        let remote_preview_texture = self.texture.clone();
         if preview_here {
             // tamanho em que a prévia aparece: limitado pela largura ou pela altura do palco (menos a faixa de participantes)
             let aspect = self.preview_tex.as_ref().map(|t| t.size_vec2().x / t.size_vec2().y).unwrap_or(16.0 / 9.0);
@@ -3581,8 +3633,8 @@ impl App {
         }
         // foco: um participante grande no palco e os outros na faixa (duplo clique num tile; "Grade" ou Esc voltam)
         let focus = s.voice_focus.filter(|u| members.iter().any(|m| m.user_id == *u));
-        let focus_here = focus.is_some() && !watching_here && !preview_here;
-        let (stream_rect, stage) = if watching_here || preview_here || focus_here {
+        let focus_here = focus.is_some() && !watching_expanded && !preview_here;
+        let (stream_rect, stage) = if watching_expanded || preview_here || focus_here {
             let strip = 120.0;
             (
                 Some(egui::Rect::from_min_max(stage.min, egui::pos2(stage.max.x, stage.max.y - strip - 8.0))),
@@ -3617,10 +3669,26 @@ impl App {
             let speaking = s.voice_speaking(v.user_id);
             let pt = ui.painter();
             pt.rect_filled(rect, 8.0, bg);
+            let remote_live = live_here.as_ref().is_some_and(|l| l.user_id == v.user_id && v.user_id != s.me.id);
+            if remote_live {
+                if let Some(tex) = remote_preview_texture.as_ref() {
+                    let ts = tex.size_vec2();
+                    let k = (rect.width() / ts.x).min(rect.height() / ts.y);
+                    let image_rect = egui::Rect::from_center_size(rect.center(), ts * k);
+                    pt.image(tex.id(), image_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                } else {
+                    let connecting = self.watching.as_ref().is_some_and(|(_, h)| {
+                        h.status.lock().is_ok_and(|status| !status.starts_with("erro:") && status.as_str() != "desconectado")
+                    });
+                    let label = if connecting { "Conectando à transmissão…" } else { "Reconectando à transmissão…" };
+                    pt.text(rect.center(), Align2::CENTER_CENTER, label, egui::FontId::proportional(13.0), MUTED);
+                }
+            } else {
             let d = (th * 0.44).clamp(40.0, 128.0);
             let c = rect.center();
             pt.circle_filled(c, d / 2.0, lerp(bg, fg, 0.22));
             pt.text(c, Align2::CENTER_CENTER, name.chars().next().map(|x| x.to_uppercase().to_string()).unwrap_or_default(), egui::FontId::proportional(d * 0.42), fg);
+            }
             // pílula do nome com o estado (mudo/surdo) antes do nome
             let galley = pt.layout_no_wrap(name.clone(), egui::FontId::proportional(12.5), TEXT);
             let icon_w = if v.deafened || v.muted { 20.0 } else { 0.0 };
@@ -3638,23 +3706,21 @@ impl App {
             if speaking {
                 pt.rect_stroke(rect, 8.0, egui::Stroke::new(3.0, OK), egui::StrokeKind::Inside);
             }
-            // quem está transmitindo: etiqueta "AO VIVO" e, para os outros, o botão Assistir
+            // A miniatura da transmissão já aparece no cartão de quem transmite.
             if live_here.as_ref().is_some_and(|l| l.user_id == v.user_id) {
                 let g = pt.layout_no_wrap(if v.user_id == s.me.id { "VOCÊ ESTÁ AO VIVO".to_string() } else { "AO VIVO".to_string() }, egui::FontId::proportional(10.5), AMBER);
                 let pill = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), g.size() + egui::vec2(14.0, 8.0));
                 pt.rect_filled(pill, 5.0, Color32::from_black_alpha(170));
                 pt.galley(pill.min + egui::vec2(7.0, 4.0), g, AMBER);
-                if v.user_id != s.me.id && !watching_here && rect.height() >= 100.0 {
-                    let btn = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.bottom() - 40.0), egui::vec2(110.0, 30.0));
-                    if ui.put(btn, egui::Button::new(RichText::new("Assistir").color(L0)).fill(AMBER)).clicked() {
-                        acts.push(Act::Watch(mv.channel_id));
-                    }
-                }
             }
             if resp.clicked() {
-                acts.push(Act::OpenProfile { user: v.user_id, name: name.clone(), anchor: rect, left: false });
+                if remote_live && watching_here {
+                    acts.push(Act::ToggleWatchExpand);
+                } else {
+                    acts.push(Act::OpenProfile { user: v.user_id, name: name.clone(), anchor: rect, left: false });
+                }
             }
-            if resp.double_clicked() {
+            if resp.double_clicked() && !remote_live {
                 s.voice_focus = if s.voice_focus == Some(v.user_id) { None } else { Some(v.user_id) };
                 s.profile = None; // o 1º clique do duplo clique abriu o perfil
             }
@@ -3688,7 +3754,7 @@ impl App {
                 draw_tile(ui, s, acts, sr, v);
             }
         } else if let Some(sr) = stream_rect {
-            if watching_here {
+            if watching_expanded {
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sr));
                 self.stream_area(&mut child, ctx, &*s, acts, true);
             } else {
@@ -4172,6 +4238,10 @@ impl App {
             let mine = l.user_id == s.me.id;
             let who = s.name_of(l.user_id);
             let watching_here = matches!(&self.watching, Some((c, _)) if *c == ch);
+            let in_call = s.my_voice().is_some_and(|v| v.channel_id == ch);
+            if !mine && in_call && !watching_here {
+                acts.push(Act::Watch(ch));
+            }
             egui::Frame::new()
                 .fill(CARD)
                 .stroke(egui::Stroke::new(1.0, LINE2))
@@ -4190,8 +4260,8 @@ impl App {
                                     if small_button(ui, "Fechar", FIELD) {
                                         acts.push(Act::StopWatch);
                                     }
-                                } else if small_button(ui, "Assistir", BLURPLE) {
-                                    acts.push(Act::Watch(ch));
+                                } else {
+                                    ui.label(RichText::new("Entre na chamada para ver a prévia").size(11.5).color(MUTED));
                                 }
                             });
                         }
@@ -5193,13 +5263,9 @@ impl App {
     }
 
     fn stream_area(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, s: &Session, acts: &mut Vec<Act>, full: bool) {
+        let Some(ch) = self.watching.as_ref().map(|(ch, _)| *ch) else { return };
+        self.refresh_watch_texture(ctx, ch);
         let Some((ch, h)) = &self.watching else { return };
-        if let Some(img) = h.frame.lock().unwrap().take() {
-            match &mut self.texture {
-                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-                None => self.texture = Some(ctx.load_texture("remote", img, egui::TextureOptions::LINEAR)),
-            }
-        }
         let st = h.status.lock().unwrap().clone();
         if st == "desconectado" || st.starts_with("erro:") {
             self.texture = None;

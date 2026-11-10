@@ -206,6 +206,11 @@ pub struct Snapshot {
     /// Quem está em cada canal de voz dos seus servidores (estado completo; depois vêm `VoiceUpdate`/`VoiceLeft`).
     #[serde(default)]
     pub voice: Vec<VoiceState>,
+    /// Bytes enviados pelo servidor no mês UTC atual (conta payload da aplicação).
+    #[serde(default)]
+    pub egress_month: String,
+    #[serde(default)]
+    pub egress_bytes: u64,
 }
 
 /// Quadro de áudio no WebSocket do gateway (mensagem **binária**; o texto continua sendo JSON).
@@ -382,6 +387,8 @@ pub enum C2S {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum S2C {
     Auth { token: String, me: User },
+    /// Total de bytes enviados pelo servidor no mês UTC atual.
+    EgressUsage { month: String, bytes: u64 },
     /// Quem está assistindo à transmissão do canal (vai ao transmissor e aos espectadores; lista vazia = ninguém).
     Viewers { channel_id: i64, users: Vec<i64> },
     /// Alguém entrou num canal de voz ou mudou de estado (inclui você).

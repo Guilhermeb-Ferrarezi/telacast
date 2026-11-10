@@ -4,13 +4,15 @@
 //! `manifest-<plataforma>.json`. Publicar: `telacast-server publish-update --file ... --version ...`.
 //! A assinatura Ed25519 usa a chave secreta de `TELACAST_UPDATE_KEY_FILE` (criada por `update-keygen`).
 use axum::{
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, path::PathBuf};
+use std::sync::Arc;
+use crate::App;
 use telacast_proto::{update_signing_message, UpdateManifest};
 
 pub fn dir() -> PathBuf {
@@ -36,12 +38,12 @@ pub async fn manifest(Query(q): Query<HashMap<String, String>>) -> Response {
 }
 
 /// `GET /update/file/{sha256}`
-pub async fn file(Path(hash): Path<String>) -> Response {
+pub async fn file(State(app): State<Arc<App>>, Path(hash): Path<String>) -> Response {
     if !valid_hash(&hash) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     match tokio::fs::read(dir().join(&hash)).await {
-        Ok(b) => ([(header::CONTENT_TYPE, "application/octet-stream")], b).into_response(),
+        Ok(b) => { app.count_egress(b.len()); ([(header::CONTENT_TYPE, "application/octet-stream")], b).into_response() },
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }

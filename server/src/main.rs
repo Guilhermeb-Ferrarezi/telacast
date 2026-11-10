@@ -162,6 +162,8 @@ struct App {
     dummy_hash: String,
     /// Quem está em canal de voz (só em memória): usuário -> estado.
     voice: Mutex<HashMap<i64, VoiceEntry>>,
+    egress_bytes: AtomicU64,
+    egress_month: Mutex<String>,
 }
 
 /// Estado de voz de um usuário no servidor, mais o balde de fichas que limita os quadros dele.
@@ -453,8 +455,12 @@ impl App {
         let me_name = self.store.display_name(me).await?.unwrap_or_default();
         let blocked = self.store.blocked_by(me).await?.into_iter().map(|(id, name)| user(id, name)).collect();
         let voice = self.voice_in(&ids.iter().copied().collect());
-        Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live, live_revision, blocked, voice })
+        Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live, live_revision, blocked, voice,
+            egress_month: self.egress_month.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            egress_bytes: self.egress_bytes.load(Ordering::Relaxed) })
     }
+
+    fn count_egress(&self, bytes: usize) { self.egress_bytes.fetch_add(bytes as u64, Ordering::Relaxed); }
 
     async fn push_snapshot(&self, uid: i64) {
         match self.snapshot(uid).await {
@@ -713,6 +719,8 @@ async fn serve(store: Store, sf: ids::Snowflake) {
     let addr = std::env::var("TELACAST_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let permits = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 4);
     let dummy_hash = auth::hash_password("senha-falsa-para-igualar-o-tempo").expect("argon2");
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    let egress_bytes = store.load_egress(&month).await.unwrap_or(0);
     let app = Arc::new(App {
         store,
         sf,
@@ -731,6 +739,29 @@ async fn serve(store: Store, sf: ids::Snowflake) {
         nonces: Mutex::new(Default::default()),
         dummy_hash,
         voice: Mutex::new(HashMap::new()),
+        egress_bytes: AtomicU64::new(egress_bytes),
+        egress_month: Mutex::new(month),
+    });
+    let usage_app = app.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            let month = chrono::Utc::now().format("%Y-%m").to_string();
+            let bytes = {
+                let mut current = usage_app.egress_month.lock().unwrap_or_else(|e| e.into_inner());
+                if *current != month {
+                    *current = month.clone();
+                    usage_app.egress_bytes.store(0, Ordering::Relaxed);
+                }
+                usage_app.egress_bytes.load(Ordering::Relaxed)
+            };
+            if let Err(e) = usage_app.store.save_egress(&month, bytes).await { tracing::warn!("persistência do tráfego de saída: {e}"); }
+            let month = usage_app.egress_month.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let update = S2C::EgressUsage { month, bytes };
+            let users: Vec<i64> = usage_app.conns.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
+            for uid in users { usage_app.send_to(uid, &update); }
+        }
     });
     let router = Router::new()
         .route("/ws", get(gateway))
@@ -825,11 +856,15 @@ async fn run_conn(mut socket: WebSocket, app: Arc<App>, ip: String) {
                     None => break,
                     Some(Out::Msg(m)) => {
                         let Ok(json) = serde_json::to_string(&m) else { continue };
+                        let len = json.len();
                         if socket.send(Message::Text(json.into())).await.is_err() { break }
+                        app.count_egress(len);
                     }
                     Some(Out::Bin(b)) => {
                         tx.bin_taken();
+                        let len = b.len();
                         if socket.send(Message::Binary(b)).await.is_err() { break }
+                        app.count_egress(len);
                     }
                 }
             }
@@ -1744,9 +1779,11 @@ async fn run_viewer(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<App>
     app.viewers_notify(channel);
     let mut need_key = key.is_none();
     if let Some(k) = key {
+        let len = k.len();
         if socket.send(Message::Binary(k)).await.is_err() {
             return;
         }
+        app.count_egress(len);
     }
     loop {
         tokio::select! {
@@ -1762,7 +1799,9 @@ async fn run_viewer(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<App>
                             continue;
                         }
                     }
+                    let len = data.len();
                     if socket.send(Message::Binary(data)).await.is_err() { return; }
+                    app.count_egress(len);
                 }
                 // Espectador lento: descarta até o próximo quadro-chave.
                 Err(broadcast::error::RecvError::Lagged(_)) => need_key = true,

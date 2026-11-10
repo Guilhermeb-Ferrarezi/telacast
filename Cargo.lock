@@ -4822,7 +4822,7 @@ dependencies = [
 
 [[package]]
 name = "telacast"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4875,6 +4875,7 @@ dependencies = [
  "argon2",
  "axum",
  "bytes",
+ "chrono",
  "clap",
  "dotenvy",
  "ed25519-dalek",

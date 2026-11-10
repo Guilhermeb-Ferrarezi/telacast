@@ -37,6 +37,18 @@ impl Store {
         Ok(Self { pool })
     }
 
+    pub async fn load_egress(&self, month: &str) -> R<u64> {
+        let bytes: Option<i64> = sqlx::query_scalar("SELECT bytes FROM monthly_egress WHERE month = $1")
+            .bind(month).fetch_optional(&self.pool).await?;
+        Ok(bytes.unwrap_or(0).max(0) as u64)
+    }
+
+    pub async fn save_egress(&self, month: &str, bytes: u64) -> R<()> {
+        sqlx::query("INSERT INTO monthly_egress(month, bytes) VALUES ($1, $2) ON CONFLICT(month) DO UPDATE SET bytes = EXCLUDED.bytes, updated_at = now()")
+            .bind(month).bind(bytes.min(i64::MAX as u64) as i64).execute(&self.pool).await?;
+        Ok(())
+    }
+
     // ---------------------------------------------------------------- contas
 
     /// Consome um uso do convite de instância e cria o usuário, tudo numa transação.
