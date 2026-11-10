@@ -128,17 +128,17 @@ pub fn suggested_kbps(h: u32, fps: u32) -> u32 {
 
 /// Compatibilidade: transmite o monitor inteiro na resolução da fonte.
 pub fn start(url: String, monitor: usize, fps: u32, kbps: u32) -> Handle {
-    start_source(url, Source::Monitor(monitor), Quality { height: None, fps, kbps })
+    start_source(url, Source::Monitor(monitor), Quality { height: None, fps, kbps }, false, None)
 }
 
-pub fn start_source(url: String, source: Source, q: Quality) -> Handle {
+pub fn start_source(url: String, source: Source, q: Quality, share_system_audio: bool, audio_output: Option<String>) -> Handle {
     let stop = Arc::new(AtomicBool::new(false));
     let status = Arc::new(Mutex::new("conectando…".to_string()));
     let preview: Preview = Arc::new(Mutex::new(None));
     let preview_width = Arc::new(std::sync::atomic::AtomicU32::new(1280));
     let (s, st, pv, pw) = (stop.clone(), status.clone(), preview.clone(), preview_width.clone());
     std::thread::spawn(move || {
-        let msg = match run(&url, &source, &q, &s, &st, &pv, &pw) {
+        let msg = match run(&url, &source, &q, share_system_audio, audio_output.as_deref(), &s, &st, &pv, &pw) {
             Ok(()) => "parado".to_string(),
             Err(e) => format!("erro: {e:#}"),
         };
@@ -187,6 +187,8 @@ fn run(
     url: &str,
     source: &Source,
     q: &Quality,
+    share_system_audio: bool,
+    audio_output: Option<&str>,
     stop: &AtomicBool,
     status: &Mutex<String>,
     preview: &Preview,
@@ -199,6 +201,8 @@ fn run(
     let (w, h) = output_size(base.0, base.1, q.height);
     let (w, h) = (w as usize, h as usize);
     let mut ws = crate::net::connect_ws(url)?;
+    let stream_start = Instant::now();
+    let mut audio_capture = share_system_audio.then(|| crate::system_audio::Capture::start(audio_output.map(str::to_owned), stream_start));
 
     // Captura e codificação em threads separadas: o fps é limitado pelo
     // mais lento dos dois, não pela soma.
@@ -280,14 +284,41 @@ fn run(
         }
         None
     };
+    let mut audio_pending = std::collections::VecDeque::<(u64, Vec<u8>)>::new();
+    let mut audio_error: Option<String> = None;
+    let mut last_media_pts = 0u64;
     let mut send = |key: bool, h264: &[u8]| -> anyhow::Result<()> {
-        let mut payload = Vec::with_capacity(h264.len() + 1);
-        payload.push(key as u8);
-        payload.extend_from_slice(h264);
+        if let Some(capture) = audio_capture.as_mut() {
+            loop {
+                match capture.rx.try_recv() {
+                    Ok(crate::system_audio::Event::Packet { pts_us, opus }) => audio_pending.push_back((pts_us, opus)),
+                    Ok(crate::system_audio::Event::Failed(e)) => audio_error = Some(e),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        audio_error.get_or_insert_with(|| "captura encerrada".into());
+                        break;
+                    }
+                }
+            }
+        }
+        let video_pts = stream_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        while audio_pending.front().is_some_and(|(pts, _)| *pts <= video_pts) {
+            let (pts, opus) = audio_pending.pop_front().unwrap();
+            if pts <= last_media_pts { continue; }
+            let packet = telacast_proto::encode_media_packet(telacast_proto::MediaKind::SystemAudioOpus, pts, &opus)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            ws.send(Message::Binary(packet.into()))?;
+            last_media_pts = pts;
+        }
+        let video_pts = video_pts.max(last_media_pts);
+        let kind = if key { telacast_proto::MediaKind::H264Keyframe } else { telacast_proto::MediaKind::H264Delta };
+        let payload = telacast_proto::encode_media_packet(kind, video_pts, h264).map_err(|e| anyhow::anyhow!(e.to_string()))?;
         ws.send(Message::Binary(payload.into()))?;
+        last_media_pts = video_pts;
         sent += 1;
         if t0.elapsed() >= Duration::from_secs(1) {
-            *status.lock().unwrap() = format!("transmitindo · {sent} fps · {w}×{h}");
+            let audio_suffix = audio_error.as_deref().map(|e| format!(" · áudio indisponível: {e}")).unwrap_or_default();
+            *status.lock().unwrap() = format!("transmitindo · {sent} fps · {w}×{h}{audio_suffix}");
             (sent, t0) = (0, Instant::now());
         }
         Ok(())

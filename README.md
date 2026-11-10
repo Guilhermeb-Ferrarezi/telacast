@@ -7,6 +7,7 @@ Um clone próprio do Discord em Rust: chat, servidores e canais, voz, vídeo e t
 - **Chat:** servidores, categorias e canais, DMs, amigos, respostas, edição, reações, fixadas, busca, menções com autocomplete, anexos (imagens, prévia de texto/código, até 10 por mensagem, Ctrl+V de imagem), Markdown, bloqueio.
 - **Voz:** canais de voz com Opus pelo WebSocket, mudo/surdo, anel de fala, volume por pessoa, supressão de ruído (RNNoise), ganho automático, modo de baixa latência e "ouvir meu microfone".
 - **Transmissão de tela (Linux):** telas e janelas com miniaturas ao vivo, resolução e fps, H.264 por NVENC (com fallback em software), prévia da própria tela, espectadores, modo foco.
+- **Áudio do sistema na transmissão (Windows/Linux):** opcional e desligado por padrão; segue como faixa Opus separada da voz, com mute independente para quem assiste. No Linux requer PipeWire e `pw-cat`; no Windows usa loopback WASAPI. Áudio Android depende da implementação do app móvel e ainda não está disponível.
 - **Conta:** cadastro só por convite, trocar senha, lista de sessões, atualização do app com conferência de hash e assinatura.
 - **Visual "Grafite":** cinzas em camadas, um acento âmbar, só tema escuro. Barra de título própria.
 

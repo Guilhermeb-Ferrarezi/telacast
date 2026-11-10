@@ -10,6 +10,8 @@ mod quick;
 mod update;
 mod voice;
 mod single;
+mod system_audio;
+mod system_audio_playback;
 mod theme;
 mod viewer;
 
@@ -124,6 +126,9 @@ struct GoLive {
     /// 0 personalizado, 1 fluidez, 2 nitidez.
     preset: u8,
     advanced: bool,
+    share_system_audio: bool,
+    audio_outputs: Vec<system_audio::AudioOutput>,
+    audio_output: Option<String>,
     /// Bitrate manual (kbps); `None` = automático pela resolução e taxa.
     kbps: Option<u32>,
     items: Vec<GoItem>,
@@ -134,7 +139,23 @@ struct GoLive {
 
 impl GoLive {
     fn new() -> Self {
-        Self { tab: 0, source: None, res: Some(1080), preset: 1, advanced: false, kbps: None, items: Vec::new(), rx: None, last: None, busy: false }
+        let audio_outputs = system_audio::outputs();
+        let audio_output = audio_outputs.first().map(|o| o.id.clone());
+        Self {
+            tab: 0,
+            source: None,
+            res: Some(1080),
+            preset: 1,
+            advanced: false,
+            share_system_audio: false,
+            audio_outputs,
+            audio_output,
+            kbps: None,
+            items: Vec::new(),
+            rx: None,
+            last: None,
+            busy: false,
+        }
     }
 
     /// Atualiza as miniaturas em segundo plano (a cada ~2 s enquanto o diálogo está aberto).
@@ -2867,7 +2888,16 @@ impl App {
                         None => (capture::Source::Monitor(self.monitor), publisher::Quality { height: self.golive.res, fps: self.fps, kbps: self.kbps }),
                     };
                     self.publishing_source = Some(source.clone());
-                    self.publishing = Some((ch, publisher::start_source(url, source, q)));
+                    self.publishing = Some((
+                        ch,
+                        publisher::start_source(
+                            url,
+                            source,
+                            q,
+                            self.golive.share_system_audio,
+                            self.golive.audio_output.clone(),
+                        ),
+                    ));
                 }
                 Act::StopPublish => self.stop_publish(),
                 Act::Fullscreen => {
@@ -4914,6 +4944,27 @@ impl App {
         } else if button(ui, "stop", "Parar de assistir", true, &|p, c, col| close_icon(p, c, 22.0, col)) {
             acts.push(Act::StopWatch);
         }
+        if !mine {
+            if let Some((watching_ch, handle)) = self.watching.as_ref().filter(|(watching_ch, _)| *watching_ch == ch) {
+                let muted = handle.audio_muted.load(Ordering::Relaxed);
+                if button(
+                    ui,
+                    "system-audio-mute",
+                    if muted { "Ativar áudio da transmissão" } else { "Silenciar áudio da transmissão" },
+                    false,
+                    &|p, c, col| {
+                        speaker_icon(p, c, 20.0, col);
+                        if muted {
+                            p.line_segment([c - egui::vec2(8.0, 8.0), c + egui::vec2(8.0, 8.0)], egui::Stroke::new(2.0, col));
+                        }
+                    },
+                ) {
+                    if let Some((_, handle)) = self.watching.as_ref().filter(|(current, _)| current == watching_ch) {
+                        handle.audio_muted.store(!muted, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
         let full = self.fullscreen;
         if button(ui, "full", if full { "Sair da tela cheia" } else { "Tela cheia" }, false, &|p, c, col| fullscreen_icon(p, c, 22.0, col, full)) {
             acts.push(Act::Fullscreen);
@@ -5515,7 +5566,23 @@ impl App {
                         }
                     }
                     ui.add_space(6.0);
-                    ui.add_enabled(false, egui::Checkbox::new(&mut false, "Compartilhar áudio")).on_disabled_hover_text("Em breve");
+                    ui.checkbox(&mut gl.share_system_audio, "Compartilhar áudio do sistema");
+                    if gl.share_system_audio {
+                        ui.label(RichText::new(system_audio::capture_note()).size(11.0).color(MUTED));
+                        if gl.audio_outputs.is_empty() {
+                            ui.label(RichText::new(system_audio::unavailable_hint()).size(11.0).color(MUTED));
+                        } else {
+                            let selected = gl.audio_outputs.iter().find(|o| Some(&o.id) == gl.audio_output.as_ref()).map(|o| o.name.as_str()).unwrap_or("Saída de áudio");
+                            egui::ComboBox::from_id_salt("golive-audio-output")
+                                .selected_text(selected)
+                                .width(280.0)
+                                .show_ui(ui, |ui| {
+                                    for output in &gl.audio_outputs {
+                                        ui.selectable_value(&mut gl.audio_output, Some(output.id.clone()), &output.name);
+                                    }
+                                });
+                        }
+                    }
                     ui.add_space(4.0);
                     egui::CollapsingHeader::new("Avançado").default_open(gl.advanced).show(ui, |ui| {
                         gl.advanced = true;

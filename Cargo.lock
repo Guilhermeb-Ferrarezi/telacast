@@ -4822,7 +4822,7 @@ dependencies = [
 
 [[package]]
 name = "telacast"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4846,6 +4846,7 @@ dependencies = [
  "telacast-qs",
  "tungstenite 0.30.0",
  "ureq",
+ "wasapi",
  "webpki-roots 1.0.11",
  "windows-capture",
  "x11rb 0.14.0",
@@ -5507,6 +5508,19 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
+]
+
+[[package]]
+name = "wasapi"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58b35dbcb6fae6fbaba9f6f52a22686bb405978ee112ed6eb33d98bd63c97583"
+dependencies = [
+ "log",
+ "num-integer",
+ "thiserror 2.0.21",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

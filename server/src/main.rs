@@ -35,7 +35,7 @@ use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     Semaphore,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // ------------------------------------------------------------------ limite de taxa
 
@@ -1607,8 +1607,8 @@ async fn publish(
     let Some(uid) = app.auth_stream(&q.token, channel).await else {
         return StatusCode::FORBIDDEN.into_response();
     };
-    // 4 MiB por quadro é folga de sobra para H.264 de tela; limita o uso de memória por sala.
-    ws.max_message_size(4 << 20).on_upgrade(move |s| run_publisher(s, channel, uid, app))
+    // Limite compartilhado pelo parser do protocolo, incluindo o cabeçalho de mídia.
+    ws.max_message_size(p::MEDIA_MAX_PACKET).on_upgrade(move |s| run_publisher(s, channel, uid, app))
 }
 
 async fn run_publisher(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<App>) {
@@ -1633,10 +1633,11 @@ async fn run_publisher(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<A
 
     while let Some(Ok(msg)) = socket.recv().await {
         if let Message::Binary(data) = msg {
-            if data.len() < 2 {
-                continue;
-            }
-            if data[0] == 1 {
+            let Ok(packet) = p::parse_media_packet(&data) else {
+                warn!("[canal {channel}] pacote de mídia inválido do publicador {uid}");
+                break;
+            };
+            if packet.kind == p::MediaKind::H264Keyframe {
                 if let Some(room) = app.rooms.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&channel) {
                     room.key = Some(data.clone());
                 }
@@ -1691,7 +1692,8 @@ async fn run_viewer(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<App>
             frame = rx.recv() => match frame {
                 Ok(data) => {
                     if need_key {
-                        if data[0] != 1 { continue; }
+                        let Ok(packet) = p::parse_media_packet(&data) else { continue; };
+                        if packet.kind != p::MediaKind::H264Keyframe { continue; }
                         need_key = false;
                     }
                     if socket.send(Message::Binary(data)).await.is_err() { return; }

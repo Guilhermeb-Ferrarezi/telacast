@@ -69,6 +69,7 @@ Versões marcadas ✔ já compilam nesta máquina (projeto do widget, `~/Project
 ### Fase C: vídeo (precisa de aparelho para a prova final)
 - **C1 Assistir transmissão:** `watch` no WebSocket binário → `MediaCodec` H.264 → `SurfaceView`; tela cheia em paisagem, controles que somem em 1,8 s (spec 08). Na JVM: testes do separador de NAL/quadro-chave. *Prova final* só com aparelho/emulador conectado: marco como "pendente de aparelho" no progresso.
 - **C2 Transmitir a tela do celular:** `MediaProjection` + encoder H.264 → WebSocket `publish`, serviço em primeiro plano tipo `mediaProjection`. Mesma regra de prova.
+- **C3 Áudio do sistema na transmissão:** adicionar opção desligada por padrão e enviar Opus estéreo 48 kHz/20 ms como faixa independente, com PTS no mesmo relógio dos quadros H.264; o espectador controla o mute sem alterar microfone/voz. Capturar com `AudioPlaybackCapture`/`AudioRecord` junto da sessão `MediaProjection` e respeitar o consentimento do sistema. Requer Android 10 (API 29) ou superior; apps que bloqueiam captura ou usos não permitidos podem ficar sem áudio. Se o app de transmissão ainda não estiver implementado, não iniciar C3 antes de C2; revisar compatibilidade do protocolo versionado antes de publicar cliente.
 
 ### Fase D: acabamento
 - **D1 Notificações locais** (mensagens e menções, canal de notificação por servidor, serviço de conexão opcional).

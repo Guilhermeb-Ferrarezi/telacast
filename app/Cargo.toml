@@ -1,6 +1,6 @@
 [package]
 name = "telacast"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 
 [dependencies]
@@ -29,6 +29,7 @@ telacast-qs = { path = "../qs" }
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.15", default-features = false }
 windows-capture = "2.0.1"
+wasapi = "0.27"
 
 [target.'cfg(any(unix, windows))'.dependencies]
 nvidia-video-codec-sdk = { path = "../vendor/nvidia-video-codec-sdk" }
