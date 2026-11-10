@@ -1,5 +1,7 @@
 package app.telacast.net
 
+import app.telacast.proto.PROTO_VERSION
+
 import app.telacast.proto.C2S
 import app.telacast.proto.ErrorCode
 import app.telacast.proto.S2C
@@ -32,6 +34,16 @@ class GatewayTest {
 
     private fun TestScope.montar() = Montagem(this)
 
+    @Test fun versionMismatchNoResumeEhDefinitivoMasNaoInvalidaASessao() = runTest {
+        val m = montar()
+        m.gateway.conectar("h", Credencial.Retomar("tok")); runCurrent()
+        m.transporte.ultima.abre(); runCurrent()
+        m.transporte.ultima.envia(S2C.Error(ErrorCode.VersionMismatch, "protocolo")); runCurrent()
+        assertEquals(EventoGateway.Falha(ErrorCode.VersionMismatch, "protocolo", false), m.eventos.single())
+        advanceTimeBy(60_000); runCurrent()
+        assertEquals("não reconecta sozinho", 1, m.transporte.conexoes.size)
+    }
+
     @Test fun urlDoGatewayNormalizaOServidor() {
         assertEquals("ws://10.0.2.2:8080/ws", Gateway.urlDoGateway("10.0.2.2:8080"))
         assertEquals("ws://host:8080/ws", Gateway.urlDoGateway("ws://host:8080/"))
@@ -55,7 +67,7 @@ class GatewayTest {
 
         m.transporte.ultima.abre()
         runCurrent()
-        assertEquals(listOf<C2S>(C2S.Login("ana", "senha1234", 1)), m.transporte.ultima.c2s)
+        assertEquals(listOf<C2S>(C2S.Login("ana", "senha1234", PROTO_VERSION)), m.transporte.ultima.c2s)
 
         m.transporte.ultima.envia(S2C.Auth("tok", eu))
         runCurrent()
@@ -70,7 +82,7 @@ class GatewayTest {
         val m = montar()
         m.gateway.conectar("h", Credencial.Registro("ana", "senha1234", "ABCD-1234"))
         runCurrent(); m.transporte.ultima.abre(); runCurrent()
-        assertEquals(listOf<C2S>(C2S.Register("ana", "senha1234", "ABCD-1234", 1)), m.transporte.ultima.c2s)
+        assertEquals(listOf<C2S>(C2S.Register("ana", "senha1234", "ABCD-1234", PROTO_VERSION)), m.transporte.ultima.c2s)
     }
 
     @Test fun erroDeCredencialEhDefinitivo() = runTest {
@@ -102,7 +114,7 @@ class GatewayTest {
         val m = montar()
         m.gateway.conectar("h", Credencial.Retomar("velho"))
         runCurrent(); m.transporte.ultima.abre(); runCurrent()
-        assertEquals(listOf<C2S>(C2S.Resume("velho", 1)), m.transporte.ultima.c2s)
+        assertEquals(listOf<C2S>(C2S.Resume("velho", PROTO_VERSION)), m.transporte.ultima.c2s)
         m.transporte.ultima.envia(S2C.Error(ErrorCode.SessionExpired, "Sessão expirada"))
         runCurrent()
         assertEquals(EventoGateway.Falha(ErrorCode.SessionExpired, "Sessão expirada", true), m.eventos.single())
@@ -133,7 +145,7 @@ class GatewayTest {
         advanceTimeBy(999); assertEquals(1, m.transporte.conexoes.size)
         advanceTimeBy(1); runCurrent(); assertEquals(2, m.transporte.conexoes.size)
         m.transporte.ultima.abre(); runCurrent()
-        assertEquals(listOf<C2S>(C2S.Resume("tok", 1)), m.transporte.ultima.c2s)
+        assertEquals(listOf<C2S>(C2S.Resume("tok", PROTO_VERSION)), m.transporte.ultima.c2s)
 
         // o servidor segue fora: falha antes do Auth, esperas 2, 4, 8, 15, 15
         for (espera in listOf(2_000L, 4_000L, 8_000L, 15_000L, 15_000L)) {

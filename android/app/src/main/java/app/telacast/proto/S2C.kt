@@ -27,6 +27,8 @@ typealias SnapshotDados = Snapshot
 @Serializable(with = S2CSerializer::class)
 sealed class S2C {
     @Serializable data class Auth(val token: String, val me: User) : S2C()
+    /** Bytes enviados pelo servidor no mês UTC atual (mensagem periódica). */
+    @Serializable data class EgressUsage(val month: String, val bytes: Long) : S2C()
     @Serializable data class Viewers(val channelId: Long, val users: List<Long>) : S2C()
     data class VoiceUpdate(val state: VoiceState) : S2C()
     @Serializable data class VoiceLeft(val userId: Long, val channelId: Long) : S2C()
@@ -52,7 +54,7 @@ sealed class S2C {
     companion object {
         /** Todas as etiquetas conhecidas (para o teste que confere as fixtures; precisa acompanhar o enum do Rust). */
         val ETIQUETAS: Set<String> = setOf(
-            "Auth", "Viewers", "VoiceUpdate", "VoiceLeft", "Sessions", "PasswordChanged", "Error", "Snapshot", "Message",
+            "Auth", "EgressUsage", "Viewers", "VoiceUpdate", "VoiceLeft", "Sessions", "PasswordChanged", "Error", "Snapshot", "Message",
             "History", "SearchResults", "Pinned", "Pins", "Reaction", "MessageEdited", "MessageDeleted", "Typing",
             "DmOpened", "ServerJoined",
         )
@@ -76,6 +78,7 @@ internal object S2CCodec {
         val (tag, corpo) = Etiquetado.separar(el)
         return when (tag) {
             "Auth" -> json.decodeFromJsonElement(S2C.Auth.serializer(), Etiquetado.corpo(tag, corpo))
+            "EgressUsage" -> json.decodeFromJsonElement(S2C.EgressUsage.serializer(), Etiquetado.corpo(tag, corpo))
             "Viewers" -> json.decodeFromJsonElement(S2C.Viewers.serializer(), Etiquetado.corpo(tag, corpo))
             "VoiceUpdate" -> S2C.VoiceUpdate(json.decodeFromJsonElement(VoiceState.serializer(), Etiquetado.corpo(tag, corpo)))
             "VoiceLeft" -> json.decodeFromJsonElement(S2C.VoiceLeft.serializer(), Etiquetado.corpo(tag, corpo))
@@ -100,6 +103,7 @@ internal object S2CCodec {
 
     fun codificar(json: Json, s: S2C): JsonElement = when (s) {
         is S2C.Auth -> Etiquetado.com("Auth", json.encodeToJsonElement(S2C.Auth.serializer(), s))
+        is S2C.EgressUsage -> Etiquetado.com("EgressUsage", json.encodeToJsonElement(S2C.EgressUsage.serializer(), s))
         is S2C.Viewers -> Etiquetado.com("Viewers", json.encodeToJsonElement(S2C.Viewers.serializer(), s))
         is S2C.VoiceUpdate -> Etiquetado.com("VoiceUpdate", json.encodeToJsonElement(VoiceState.serializer(), s.state))
         is S2C.VoiceLeft -> Etiquetado.com("VoiceLeft", json.encodeToJsonElement(S2C.VoiceLeft.serializer(), s))

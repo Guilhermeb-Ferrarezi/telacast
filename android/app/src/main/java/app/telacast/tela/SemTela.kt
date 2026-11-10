@@ -11,6 +11,6 @@ object FonteSemCaptura : FonteDeTela {
 
 object DecodificadorSemVideo : DecodificadorDeVideo {
     override fun configurar(superficie: Any, largura: Int, altura: Int): String? = "Este ambiente não tem decodificador de vídeo."
-    override fun decodificar(h264: ByteArray, instanteUs: Long) = false
+    override fun decodificar(h264: ByteArray, ptsUs: Long, alvoNs: Long) = false
     override fun fechar() = Unit
 }

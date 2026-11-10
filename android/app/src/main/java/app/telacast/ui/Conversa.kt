@@ -46,6 +46,8 @@ class AcoesDaConversa(
     val compositor: AcoesDoCompositor = AcoesDoCompositor(),
     val aoAbrirBusca: () -> Unit = {},
     val aoAbrirFixadas: () -> Unit = {},
+    /** Botão "Ligar" da DM (recebe o canal da conversa). */
+    val aoLigar: (Long) -> Unit = {},
 )
 
 /** Todos os usuários que o app conhece pelo snapshot (para resolver `<@id>` com o nome atual). */

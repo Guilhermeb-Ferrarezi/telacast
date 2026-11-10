@@ -292,6 +292,7 @@ class ControladorDeVoz(
 
     private fun textoDoCanal(canal: Long): String {
         val sn = repo.estado.value.snapshot ?: return ""
+        sn.dms.firstOrNull { it.channelId == canal }?.let { return "Chamada com ${it.user.name}" }
         for (sv in sn.servers) sv.channels.firstOrNull { it.id == canal }?.let { return "${it.name} · ${sv.name}" }
         return ""
     }

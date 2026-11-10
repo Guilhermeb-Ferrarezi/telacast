@@ -99,6 +99,7 @@ fun TelaDeDm(estado: AppState, dm: Dm, aoMenu: () -> Unit, dados: DadosDaConvers
         estado, dm.channelId, "Conversar com @${dm.user.name}", aoMenu, dados, acoes, modifier,
         acaoDireita = {
             Row {
+                Toque({ acoes.aoLigar(dm.channelId) }, Modifier.size(44.dp), Formas.Cartao, fundoPressionado = Grafite.L3) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { IconeTelefone(Grafite.Texto2) } }
                 Toque(acoes.aoAbrirBusca, Modifier.size(44.dp), Formas.Cartao, fundoPressionado = Grafite.L3) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { IconeLupa(Grafite.Texto2) } }
                 Toque(acoes.aoAbrirFixadas, Modifier.size(44.dp), Formas.Cartao, fundoPressionado = Grafite.L3) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { IconeAlfinete(Grafite.Texto2) } }
             }

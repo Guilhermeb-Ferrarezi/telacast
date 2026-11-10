@@ -63,8 +63,9 @@ class TransmissaoTest {
         val ws get() = transporte.ultima
         /** Permissão concedida e o socket aberto. */
         fun noAr() { c.pedir(CANAL, OpcoesDeTransmissao()); c.permissaoConcedida("concessao"); rodar(); ws.abre(); rodar() }
-        fun chave() = fonte.ouvinte!!.aoQuadro(true, byteArrayOf(0, 0, 0, 1, 0x65))
-        fun p() = fonte.ouvinte!!.aoQuadro(false, byteArrayOf(0, 0, 0, 1, 0x41))
+        var pts = 0L
+        fun chave() = fonte.ouvinte!!.aoQuadro(true, byteArrayOf(0, 0, 0, 1, 0x65), pts.also { pts += 33_333 })
+        fun p() = fonte.ouvinte!!.aoQuadro(false, byteArrayOf(0, 0, 0, 1, 0x41), pts.also { pts += 33_333 })
     }
 
     private companion object { const val CANAL = 77L }
@@ -85,8 +86,10 @@ class TransmissaoTest {
         assertEquals(FaseDaTransmissao.Transmitindo, s.fase); assertNotNull(s.desdeMs); assertEquals(listOf(15, 30), s.fpsDisponiveis)
         assertEquals("pede um quadro-chave ao abrir", 1, a.fonte.chavesPedidas)
         a.chave(); a.p(); a.p()
-        assertEquals(listOf<Byte>(1, 0, 0, 0, 1, 0x65), a.ws.enviados[0].toList())
-        assertEquals(0.toByte(), a.ws.enviados[1][0])
+        val primeiro = PacoteDeMidia.decodificar(a.ws.enviados[0])!!
+        assertEquals(TipoDeMidia.H264Chave, primeiro.tipo); assertEquals(listOf<Byte>(0, 0, 0, 1, 0x65), primeiro.conteudo.toList())
+        val segundo = PacoteDeMidia.decodificar(a.ws.enviados[1])!!
+        assertEquals(TipoDeMidia.H264Delta, segundo.tipo); assertTrue("pts monotônico em microssegundos", segundo.ptsUs > primeiro.ptsUs)
         assertEquals(3, a.ws.enviados.size)
     }
 
@@ -263,6 +266,14 @@ class TransmissaoTest {
         a.fonte.ouvinte!!.aoTamanho(1552, 720); a.rodar()
         assertEquals(1552 to 720, a.c.estado.value.tamanho)
         assertEquals(FaseDaTransmissao.Transmitindo, a.c.estado.value.fase)
+    }
+
+    @Test fun quadroVazioNuncaVaiParaOSocketPoisDerrubaOPublicador() = runTest {
+        val a = amb(); a.noAr()
+        a.fonte.ouvinte!!.aoQuadro(true, ByteArray(0), 0)
+        assertTrue("um pacote inválido derrubaria a transmissão no servidor", a.ws.enviados.isEmpty())
+        a.chave()
+        assertEquals(1, a.ws.enviados.size)
     }
 
     @Test fun semSessaoNaoAbreSocket() = runTest {

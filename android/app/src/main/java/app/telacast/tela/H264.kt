@@ -113,17 +113,67 @@ object H264 {
     }
 }
 
-/** Quadro de vídeo no fio (`/publish` e `/watch`): `[flag: 1 byte][H.264 Annex B]`, flag 1 = quadro-chave. */
-class QuadroDeVideo(val chave: Boolean, val h264: ByteArray) {
+/** Tipo de pacote de mídia (`proto::MediaKind`). */
+enum class TipoDeMidia(val id: Int) {
+    H264Delta(0), H264Chave(1),
+    /** Áudio do sistema da transmissão: um pacote Opus estéreo de 48 kHz e 20 ms. */
+    AudioDoSistema(2);
+
+    companion object { fun de(id: Int) = entries.firstOrNull { it.id == id } }
+}
+
+/**
+ * Pacote de mídia no fio (`/publish` e `/watch`, protocolo 2): `[tipo: 1 byte][pts em microssegundos: u64 big-endian][conteúdo]`
+ * (`proto::parse_media_packet`/`encode_media_packet`). `pts` é o relógio da transmissão, o mesmo do vídeo e do áudio (serve para sincronizá-los);
+ * o conteúdo não pode ser vazio nem passar de 4 MiB com o cabeçalho. O servidor DERRUBA quem publica pacote inválido, por isso [codificar] recusa.
+ */
+class PacoteDeMidia(val tipo: TipoDeMidia, val ptsUs: Long, val conteudo: ByteArray) {
+    val chave: Boolean get() = tipo == TipoDeMidia.H264Chave
+    val ehVideo: Boolean get() = tipo != TipoDeMidia.AudioDoSistema
+
     companion object {
-        fun codificar(chave: Boolean, h264: ByteArray): ByteArray {
-            val s = ByteArray(h264.size + 1)
-            s[0] = if (chave) 1 else 0
-            System.arraycopy(h264, 0, s, 1, h264.size)
+        const val CABECALHO = 9
+        const val MAX = 4 shl 20
+
+        /** `null` se o conteúdo for vazio ou grande demais (o chamador descarta o quadro). */
+        fun codificar(tipo: TipoDeMidia, ptsUs: Long, conteudo: ByteArray): ByteArray? {
+            if (conteudo.isEmpty() || conteudo.size > MAX - CABECALHO) return null
+            val s = ByteArray(CABECALHO + conteudo.size)
+            s[0] = tipo.id.toByte()
+            var v = ptsUs.coerceAtLeast(0)
+            for (i in 8 downTo 1) { s[i] = (v and 0xFF).toByte(); v = v ushr 8 }
+            System.arraycopy(conteudo, 0, s, CABECALHO, conteudo.size)
             return s
         }
 
-        /** `null` se tiver menos de 2 bytes (o servidor também descarta). */
-        fun decodificar(b: ByteArray): QuadroDeVideo? = if (b.size < 2) null else QuadroDeVideo(b[0] == 1.toByte(), b.copyOfRange(1, b.size))
+        /** `null` se for curto, longo, de tipo desconhecido ou sem conteúdo (o espectador ignora, como o desktop). */
+        fun decodificar(b: ByteArray): PacoteDeMidia? {
+            if (b.size <= CABECALHO || b.size > MAX) return null
+            val tipo = TipoDeMidia.de(b[0].toInt() and 0xFF) ?: return null
+            var pts = 0L
+            for (i in 1..8) pts = (pts shl 8) or (b[i].toLong() and 0xFF)
+            return PacoteDeMidia(tipo, pts and Long.MAX_VALUE, b.copyOfRange(CABECALHO, b.size))
+        }
+    }
+}
+
+/**
+ * Relógio da transmissão no espectador: ancora o `pts` do primeiro pacote no relógio local e devolve, para cada pacote (vídeo e áudio), o instante
+ * em que ele deve aparecer/tocar: `âncora + (pts - pts0) + atraso`. O atraso fixo (padrão 120 ms) absorve o jitter da rede; um pacote muito
+ * atrasado ou adiantado (o transmissor recomeçou o relógio) reancora.
+ */
+class LinhaDoTempo(private val atrasoMs: Long = 120, private val relogioNs: () -> Long = System::nanoTime) {
+    private var ancoraNs = 0L
+    private var ancoraPts = 0L
+    private var tem = false
+
+    @Synchronized fun reiniciar() { tem = false }
+
+    @Synchronized fun alvoNs(ptsUs: Long): Long {
+        val agora = relogioNs()
+        if (!tem) { ancoraNs = agora; ancoraPts = ptsUs; tem = true }
+        var alvo = ancoraNs + (ptsUs - ancoraPts) * 1000 + atrasoMs * 1_000_000
+        if (alvo < agora - 400_000_000L || alvo > agora + 3_000_000_000L) { ancoraNs = agora; ancoraPts = ptsUs; alvo = agora + atrasoMs * 1_000_000 }
+        return alvo
     }
 }

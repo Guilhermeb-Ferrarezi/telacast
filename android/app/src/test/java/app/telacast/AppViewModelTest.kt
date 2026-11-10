@@ -1,5 +1,7 @@
 package app.telacast
 
+import app.telacast.proto.PROTO_VERSION
+
 import app.telacast.armazenamento.CofreEmMemoria
 import app.telacast.armazenamento.PreferenciasEmMemoria
 import app.telacast.estado.Destino
@@ -68,7 +70,7 @@ class AppViewModelTest {
         a.vm.entrar(); a.rodar()
         assertTrue(a.vm.form.value.entrando)
         a.c.abre(); a.rodar()
-        assertEquals(C2S.Login("guilherme", "senha1234", 1), a.c.c2s.single())
+        assertEquals(C2S.Login("guilherme", "senha1234", PROTO_VERSION), a.c.c2s.single())
         a.autenticarSemAbrir()
         assertEquals(Fase.Principal, a.vm.fase.value)
         assertEquals("tok-novo", a.cofre.ler())
@@ -96,7 +98,7 @@ class AppViewModelTest {
         a.vm.alternarModo()
         a.vm.editarForm { it.copy(usuario = "nova", senha = "12345678", convite = " ABCD-1234 ") }
         a.vm.entrar(); a.rodar(); a.c.abre(); a.rodar()
-        assertEquals(C2S.Register("nova", "12345678", "ABCD-1234", 1), a.c.c2s.single())
+        assertEquals(C2S.Register("nova", "12345678", "ABCD-1234", PROTO_VERSION), a.c.c2s.single())
     }
 
     @Test fun retomaASessaoSalvaSemMostrarOFormulario() = runTest {
@@ -104,7 +106,7 @@ class AppViewModelTest {
         assertEquals(Fase.Retomando, a.vm.fase.value)
         a.c.abre(); a.rodar()
         assertEquals("ws://meu.servidor:9/ws", a.c.url)
-        assertEquals(C2S.Resume("salvo", 1), a.c.c2s.single())
+        assertEquals(C2S.Resume("salvo", PROTO_VERSION), a.c.c2s.single())
         a.c.envia(S2C.Auth("salvo", eu)); a.c.envia(S2C.Snapshot(snapshot)); a.rodar()
         assertEquals(Fase.Principal, a.vm.fase.value)
     }
@@ -116,6 +118,32 @@ class AppViewModelTest {
         assertEquals(Fase.Login, a.vm.fase.value)
         assertNull(a.cofre.ler())
         assertEquals("Sua sessão expirou. Entre de novo.", a.vm.form.value.erro)
+    }
+
+    @Test fun appVelhoDemaisNaoApagaOTokenEMostraATelaDeAtualizar() = runTest {
+        val a = amb(token = "salvo", servidorSalvo = "h:1")
+        a.c.abre(); a.rodar()
+        a.c.envia(S2C.Error(ErrorCode.VersionMismatch, "versão do protocolo")); a.rodar()
+        assertEquals(Fase.Desatualizado, a.vm.fase.value)
+        assertEquals("o token continua guardado: depois de atualizar a sessão vale", "salvo", a.cofre.ler())
+        assertNull("sem mensagem de erro no formulário", a.vm.form.value.erro)
+        assertEquals("não fica tentando de novo sozinho", 1, a.transporte.conexoes.size)
+        assertTrue(a.vm.urlDeDownload().endsWith("/download/android-arm64"))
+    }
+
+    @Test fun tentarDeNovoDepoisDeVersaoVoltaARetomar() = runTest {
+        val a = amb(token = "salvo", servidorSalvo = "h:1")
+        a.c.abre(); a.rodar(); a.c.envia(S2C.Error(ErrorCode.VersionMismatch, "x")); a.rodar()
+        a.vm.tentarDeNovoAposVersao(); a.rodar()
+        assertEquals(2, a.transporte.conexoes.size)
+        a.c.abre(); a.c.envia(S2C.Auth("salvo", eu)); a.c.envia(S2C.Snapshot(snapshot)); a.rodar()
+        assertEquals(Fase.Principal, a.vm.fase.value)
+    }
+
+    @Test fun loginComAppVelhoTambemPedeAtualizacaoSemApagarNada() = runTest {
+        val a = amb(); a.vm.editarForm { it.copy(usuario = "g", senha = "s") }; a.vm.entrar(); a.rodar(); a.c.abre(); a.rodar()
+        a.c.envia(S2C.Error(ErrorCode.VersionMismatch, "x")); a.rodar()
+        assertEquals(Fase.Desatualizado, a.vm.fase.value)
     }
 
     @Test fun abreOPrimeiroCanalDeTextoAoEntrar() = runTest {

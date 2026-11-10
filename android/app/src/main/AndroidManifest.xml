@@ -33,6 +33,7 @@
             </intent-filter>
         </service>
         <receiver android:name=".atualizacao.ReceptorDeInstalacao" android:exported="false" />
+        <receiver android:name=".chamada.ReceptorDeChamada" android:exported="false" />
         <receiver android:name=".conexao.ReceptorDeInicializacao" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />

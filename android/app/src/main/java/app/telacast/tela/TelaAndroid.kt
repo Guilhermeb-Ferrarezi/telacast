@@ -176,6 +176,7 @@ class FonteAndroid(private val ctx: Context) : FonteDeTela {
             p.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() { if (rodando) falhar("A captura de tela foi encerrada pelo sistema.") }
             }, principal)
+            baseUs = -1; ultimoPts = 0
             tamanhoDaTela = medirTela()
             val (l, a) = tamanhoDaCodificacao(tamanhoDaTela.first, tamanhoDaTela.second, opcoes.qualidade.ladoMenor)
             val superficie = abrirCodificador(l, a) ?: return limpar("O aparelho não conseguiu abrir o codificador de vídeo H.264.")
@@ -232,6 +233,8 @@ class FonteAndroid(private val ctx: Context) : FonteDeTela {
     }
 
     @Volatile private var spsPps: ByteArray? = null
+    @Volatile private var baseUs = -1L
+    @Volatile private var ultimoPts = 0L
 
     private fun iniciarLeitor(c: MediaCodec) {
         val t = Thread({
@@ -248,7 +251,11 @@ class FonteAndroid(private val ctx: Context) : FonteDeTela {
                             if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) spsPps = H264.spsPps(bytes) ?: bytes
                             else {
                                 val chave = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
-                                ouvinte?.aoQuadro(chave, if (chave) H264.comSpsPps(bytes, spsPps) else bytes)
+                                // relógio da transmissão: microssegundos desde o primeiro quadro, monotônico (o `pts` do pacote de mídia)
+                                val bruto = info.presentationTimeUs
+                                if (baseUs < 0) baseUs = bruto
+                                val pts = maxOf(ultimoPts, bruto - baseUs).also { ultimoPts = it }
+                                ouvinte?.aoQuadro(chave, if (chave) H264.comSpsPps(bytes, spsPps) else bytes, pts)
                             }
                         }
                     } finally { runCatching { c.releaseOutputBuffer(i, false) } }
@@ -322,7 +329,16 @@ class DecodificadorAndroid : DecodificadorDeVideo {
             codec = c; rodando = true
             thread = Thread({
                 val info = MediaCodec.BufferInfo()
-                try { while (rodando) { val i = c.dequeueOutputBuffer(info, 20_000); if (i >= 0) c.releaseOutputBuffer(i, true) } } catch (_: Exception) { }
+                try {
+                    while (rodando) {
+                        val i = c.dequeueOutputBuffer(info, 20_000)
+                        if (i >= 0) {
+                            // aparece no instante da linha do tempo (sincronizado com o áudio); no passado, aparece já
+                            val alvo = alvos.remove(info.presentationTimeUs)
+                            if (alvo != null) c.releaseOutputBuffer(i, alvo) else c.releaseOutputBuffer(i, true)
+                        }
+                    }
+                } catch (_: Exception) { }
             }, "tela-decodificador").also { it.start() }
             null
         } catch (e: Exception) {
@@ -331,7 +347,11 @@ class DecodificadorAndroid : DecodificadorDeVideo {
         }
     }
 
-    override fun decodificar(h264: ByteArray, instanteUs: Long): Boolean {
+    /** Instante (ns) em que cada quadro deve aparecer, por `pts`: o mesmo relógio do áudio. */
+    private val alvos = java.util.concurrent.ConcurrentHashMap<Long, Long>()
+
+    override fun decodificar(h264: ByteArray, ptsUs: Long, alvoNs: Long): Boolean {
+        val instanteUs = ptsUs
         val c = codec ?: return false
         return try {
             val i = c.dequeueInputBuffer(0)
@@ -339,6 +359,8 @@ class DecodificadorAndroid : DecodificadorDeVideo {
             val buf = c.getInputBuffer(i) ?: return false
             if (h264.size > buf.capacity()) { c.queueInputBuffer(i, 0, 0, instanteUs, 0); return false }
             buf.clear(); buf.put(h264)
+            alvos[instanteUs] = alvoNs
+            if (alvos.size > 120) alvos.clear() // quadros que nunca saíram (descartados pelo codec): não acumula
             c.queueInputBuffer(i, 0, h264.size, instanteUs, 0)
             true
         } catch (e: Exception) { false }
@@ -348,5 +370,56 @@ class DecodificadorAndroid : DecodificadorDeVideo {
         rodando = false
         thread?.takeIf { it !== Thread.currentThread() }?.join(300); thread = null
         runCatching { codec?.stop() }; runCatching { codec?.release() }; codec = null
+    }
+}
+
+/**
+ * Áudio do sistema da transmissão: Opus estéreo de 48 kHz (pacotes de 20 ms) decodificado com o Concentus e tocado num `AudioTrack` de mídia.
+ * Cada pacote só é escrito perto do instante `alvoNs` da linha do tempo (a mesma do vídeo), então a imagem e o som andam juntos; pacote atrasado
+ * demais é descartado. Qualquer erro de decodificação ou do `AudioTrack` só desliga o áudio (o vídeo segue).
+ */
+class ReprodutorDeAudioAndroid private constructor(private val track: android.media.AudioTrack) : ReprodutorDeAudioDaTransmissao {
+    private val decodificador = io.github.jaredmdobson.concentus.OpusDecoder(48_000, 2)
+    private val fila = java.util.concurrent.PriorityBlockingQueue<Item>()
+    @Volatile private var rodando = true
+    private class Item(val alvoNs: Long, val pcm: ShortArray) : Comparable<Item> { override fun compareTo(other: Item) = alvoNs.compareTo(other.alvoNs) }
+    private val thread = Thread({
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
+        try {
+            while (rodando) {
+                val item = fila.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                val espera = item.alvoNs - LATENCIA_DO_TRACK_NS - System.nanoTime()
+                if (espera < -250_000_000L) continue // atrasado demais: pula
+                if (espera > 0) Thread.sleep(espera / 1_000_000, (espera % 1_000_000).toInt())
+                track.write(item.pcm, 0, item.pcm.size)
+            }
+        } catch (_: Exception) { }
+    }, "tela-audio").also { it.isDaemon = true }
+
+    init { track.play(); thread.start() }
+
+    override fun empurrar(opus: ByteArray, alvoNs: Long) {
+        val pcm = ShortArray(960 * 2)
+        val n = decodificador.decode(opus, 0, opus.size, pcm, 0, 960, false)
+        if (n <= 0) return
+        if (fila.size < 50) fila.add(Item(alvoNs, if (n == 960) pcm else pcm.copyOf(n * 2)))
+    }
+
+    override fun definirMudo(mudo: Boolean) { runCatching { track.setVolume(if (mudo) 0f else 1f) } }
+
+    override fun fechar() { rodando = false; fila.clear(); runCatching { track.stop() }; runCatching { track.release() } }
+
+    companion object {
+        /** O `AudioTrack` guarda alguns milissegundos antes de tocar: escreve um pouco antes do instante alvo. */
+        private const val LATENCIA_DO_TRACK_NS = 40_000_000L
+
+        fun criar(): ReprodutorDeAudioDaTransmissao? = try {
+            val formato = android.media.AudioFormat.Builder().setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT).setSampleRate(48_000).setChannelMask(android.media.AudioFormat.CHANNEL_OUT_STEREO).build()
+            val min = android.media.AudioTrack.getMinBufferSize(48_000, android.media.AudioFormat.CHANNEL_OUT_STEREO, android.media.AudioFormat.ENCODING_PCM_16BIT)
+            val t = android.media.AudioTrack.Builder()
+                .setAudioAttributes(android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_MEDIA).setContentType(android.media.AudioAttributes.CONTENT_TYPE_MOVIE).build())
+                .setAudioFormat(formato).setBufferSizeInBytes(maxOf(min, 48_000 * 4 / 4)).setTransferMode(android.media.AudioTrack.MODE_STREAM).build()
+            if (t.state == android.media.AudioTrack.STATE_INITIALIZED) ReprodutorDeAudioAndroid(t) else { t.release(); null }
+        } catch (_: Exception) { null }
     }
 }

@@ -1,5 +1,7 @@
 package app.telacast.net
 
+import app.telacast.proto.PROTO_VERSION
+
 import app.telacast.proto.C2S
 import app.telacast.proto.ErrorCode
 import app.telacast.proto.Proto
@@ -70,7 +72,7 @@ class OkHttpTransporteTest {
         val g = gateway()
         g.conectar(enderecoDoServidor(), Credencial.Login("ana", "senha1234"))
         withTimeout(5_000) { g.estado.first { it == EstadoConexao.Conectado } }
-        assertEquals(C2S.Login("ana", "senha1234", 1), roteiro.recebidos.poll(2, TimeUnit.SECONDS))
+        assertEquals(C2S.Login("ana", "senha1234", PROTO_VERSION), roteiro.recebidos.poll(2, TimeUnit.SECONDS))
         assertEquals("/ws", servidor.takeRequest(2, TimeUnit.SECONDS)!!.path)
         assertEquals("tok", g.token)
         assertTrue(g.enviar(C2S.Typing(9)))
@@ -99,7 +101,7 @@ class OkHttpTransporteTest {
         val eventos = mutableListOf<EventoGateway>()
         val coleta = escopo.launchColeta(g, eventos)
         g.conectar(enderecoDoServidor(), Credencial.Login("ana", "senha1234"))
-        assertEquals(C2S.Resume("tok", 1), segundo.recebidos.poll(5, TimeUnit.SECONDS))
+        assertEquals(C2S.Resume("tok", PROTO_VERSION), segundo.recebidos.poll(5, TimeUnit.SECONDS))
         withTimeout(5_000) { while (eventos.size < 2) kotlinx.coroutines.delay(10) }
         assertEquals(EventoGateway.Autenticado("tok", eu, false), eventos[0])
         assertEquals(EventoGateway.Autenticado("tok", eu, true), eventos[1])

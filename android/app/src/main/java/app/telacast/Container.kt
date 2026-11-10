@@ -64,6 +64,8 @@ class Container(
     fabricaDeFonte: app.telacast.tela.FabricaDeFonte = app.telacast.tela.FabricaDeFonte { app.telacast.tela.FonteSemCaptura },
     fabricaDeDecodificador: app.telacast.tela.FabricaDeDecodificador = app.telacast.tela.FabricaDeDecodificador { app.telacast.tela.DecodificadorSemVideo },
     transporteDeVideo: app.telacast.tela.TransporteDeVideo = app.telacast.tela.OkHttpTransporteDeVideo(),
+    /** Áudio do sistema da transmissão (no app: `ReprodutorDeAudioAndroid`); nos testes, nenhum. */
+    fabricaDeAudioDaTransmissao: app.telacast.tela.FabricaDeReprodutorDeAudio? = null,
     /** Atualização pelo app: chave pública (hex) do servidor; vazia = atualização desligada. */
     chaveDeAtualizacao: String = "",
     versaoDoApp: String = "0.0.0",
@@ -72,6 +74,9 @@ class Container(
     apiDeAtualizacao: app.telacast.atualizacao.ApiDeAtualizacao? = null,
     /** Relatório do último crash (no app, o arquivo privado). */
     val relatorioDeCrash: app.telacast.diagnostico.RelatorioDeCrash? = null,
+    /** Toque e notificação das chamadas em DM (no app: `ToqueAndroid`, `NotificadorDeChamadaAndroid`). */
+    toqueDeChamada: app.telacast.chamada.ToqueDeChamada = app.telacast.chamada.ToqueNulo,
+    notificadorDeChamada: app.telacast.chamada.NotificadorDeChamada = app.telacast.chamada.NotificadorDeChamadaNulo,
     /** Serviço em primeiro plano "Telacast conectado" (no app: `FachadaDoServicoDeConexao`). */
     servicoDeConexao: app.telacast.conexao.ServicoPersistente = app.telacast.conexao.ServicoPersistenteNulo,
 ) {
@@ -106,6 +111,7 @@ class Container(
     val player = app.telacast.tela.ControladorDoPlayer(
         escopo, repositorio.estado, transporteDeVideo, fabricaDeDecodificador,
         { id -> repositorio.token?.let { app.telacast.tela.urlDeVideo(baseHttp(), "watch", id, it) } },
+        fabricaDeAudio = fabricaDeAudioDaTransmissao,
     )
 
     /** Atualização pelo próprio app (APK assinado pelo servidor, verificado antes de instalar). */
@@ -140,4 +146,12 @@ class Container(
         repositorio.entrar(servidor, app.telacast.net.Credencial.Retomar(token))
         return true
     }
+
+    /** Avisos curtos de chamada ("Chamada perdida", "A ligação expirou"): quem observa (o ViewModel) mostra. */
+    val avisosDeChamada = kotlinx.coroutines.flow.MutableSharedFlow<String>(extraBufferCapacity = 8)
+
+    /** Chamadas em DM individual (ligar, receber, atender, 60 s sem atender). */
+    val chamadas = app.telacast.chamada.ControladorDeChamadasEmDm(
+        escopo, repositorio.estado, { voz.sair() }, { avisosDeChamada.tryEmit(it) }, toqueDeChamada, notificadorDeChamada, { foco.emPrimeiroPlano }, relogio,
+    )
 }

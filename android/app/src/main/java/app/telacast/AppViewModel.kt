@@ -39,7 +39,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 /** Qual das três telas raiz aparece. */
-enum class Fase { Retomando, Login, Principal }
+enum class Fase { Retomando, Login, Principal, Desatualizado }
 
 /**
  * ViewModel fino: junta o [app.telacast.data.Repository] com a navegação, o formulário de entrada e o
@@ -72,9 +72,13 @@ class AppViewModel(private val c: Container) : ViewModel() {
     private val retomando = MutableStateFlow(false)
     private var navInicializada = false
 
-    val fase: StateFlow<Fase> = combine(repo.estado, retomando) { s, r ->
+    /** O servidor recusou este app por versão de protocolo (`VersionMismatch`): a tela pede para atualizar; o token continua guardado. */
+    private val versaoIncompativel = MutableStateFlow(false)
+
+    val fase: StateFlow<Fase> = combine(repo.estado, retomando, versaoIncompativel) { s, r, velha ->
         when {
             s.autenticado -> Fase.Principal
+            velha -> Fase.Desatualizado
             r && s.erroDeEntrada == null -> Fase.Retomando
             else -> Fase.Login
         }
@@ -83,6 +87,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
     init {
         escopo.launch { repo.estado.collect { aoMudarEstado(it) } }
         escopo.launch { repo.avisos.collect { aoReceberAviso(it) } }
+        escopo.launch { c.avisosDeChamada.collect { mostrarAviso(it) } }
         // o player abre e fecha junto com o diálogo "Assistir" (inclusive pelo botão Voltar)
         escopo.launch { _nav.map { (it.dialogo as? Dialogo.Assistir)?.canal }.distinctUntilChanged().collect { canal -> if (canal != null) c.player.abrir(canal) else c.player.parar() } }
         // erro ou fim da transmissão viram aviso curto em qualquer tela
@@ -159,6 +164,15 @@ class AppViewModel(private val c: Container) : ViewModel() {
     fun devePedirNotificacoes(): Boolean = !c.preferencias.pediuNotificacoes
     fun marcarPediuNotificacoes() { c.preferencias.pediuNotificacoes = true }
 
+    /** "Tentar de novo" na tela de app desatualizado (o servidor pode ter voltado a aceitar esta versão). */
+    fun tentarDeNovoAposVersao() {
+        versaoIncompativel.value = false
+        if (c.cofre.ler() != null) retomarSessaoSalva() else _form.update { it.copy(erro = null) }
+    }
+
+    /** Endereço de download do APK mais recente no servidor (abre no navegador quando a atualização pelo app não está disponível). */
+    fun urlDeDownload(): String = "${c.baseHttp()}/download/android-arm64"
+
     /** Na tela "Entrando…" quando a retomada demora: desiste e mostra o formulário. */
     fun usarOutraConta() = sair()
 
@@ -174,6 +188,14 @@ class AppViewModel(private val c: Container) : ViewModel() {
         }
         s.erroDeEntrada?.let { e ->
             retomando.value = false
+            if (e.codigo == app.telacast.proto.ErrorCode.VersionMismatch) {
+                // NÃO apaga o token nem a navegação: depois de atualizar o app a sessão continua
+                versaoIncompativel.value = true
+                _form.update { it.copy(entrando = false, erro = null) }
+                repo.limparErroDeEntrada()
+                c.atualizacao.verificar(forcar = true)
+                return@let
+            }
             if (e.sessaoInvalida) { c.cofre.apagar(); navInicializada = false; _nav.value = Navegacao() }
             _form.update { it.copy(entrando = false, erro = TextosDeErro.paraEntrada(e.codigo, e.msg)) }
             repo.limparErroDeEntrada()
@@ -203,7 +225,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
             Destino.Amigos -> true
             is Destino.Dm -> sn.dms.any { it.channelId == d.canal }
             is Destino.Canal -> sn.servers.any { sv -> sv.id == d.servidor && sv.channels.any { it.id == d.canal } }
-            is Destino.Voz -> sn.servers.any { sv -> sv.id == d.servidor && sv.channels.any { it.id == d.canal && it.kind == Channel.VOZ } }
+            is Destino.Voz -> if (d.servidor == 0L) sn.dms.any { it.channelId == d.canal } else sn.servers.any { sv -> sv.id == d.servidor && sv.channels.any { it.id == d.canal && it.kind == Channel.VOZ } }
         }
         if (!existe) { _nav.update { it.irPara(Destino.Amigos) }; repo.fecharCanal() }
         _nav.value.servidorNoPainel?.let { id -> if (sn.servers.none { it.id == id }) _nav.update { it.selecionarServidor(null) } }
@@ -449,6 +471,7 @@ class AppViewModel(private val c: Container) : ViewModel() {
     // ------------------------------------------------------------------ atualização do app e relatório de crash (C7)
 
     val atualizacao: StateFlow<app.telacast.atualizacao.EstadoDaAtualizacao> = c.atualizacao.estado
+    val atualizacaoLigada: Boolean get() = c.atualizacao.ligada
     fun atualizar() = c.atualizacao.atualizar()
     fun instalarAtualizacao() = c.atualizacao.instalar()
     fun dispensarFolhaDeAtualizacao() = c.atualizacao.dispensarFolha()
@@ -489,8 +512,23 @@ class AppViewModel(private val c: Container) : ViewModel() {
         _nav.update { it.abrirDialogo(Dialogo.Assistir(canal, usuario)) }
     }
     fun definirSuperficieDoPlayer(s: Any?) = c.player.definirSuperficie(s)
+    fun definirMudoDoPlayer(m: Boolean) = c.player.definirMudo(m)
 
-    fun entrarNaVoz(canal: Long) = c.voz.entrar(canal)
+    fun entrarNaVoz(canal: Long) { c.chamadas.aoEntrarNaChamada(canal); c.voz.entrar(canal) }
+
+    // ------------------------------------------------------------------ chamadas em DM (C9)
+
+    val chamada: StateFlow<app.telacast.chamada.EstadoDaChamada> = c.chamadas.estado
+    private val _pedidoDeEntrada = MutableStateFlow<Long?>(null)
+    /** Canal em que a interface deve entrar na voz (pede o microfone antes): o toque em "Atender" e o botão "Ligar". */
+    val pedidoDeEntrada: StateFlow<Long?> = _pedidoDeEntrada.asStateFlow()
+    fun consumirPedidoDeEntrada() { _pedidoDeEntrada.value = null }
+
+    /** Botão "Ligar" da DM: abre a tela da chamada e pede para entrar. */
+    fun ligar(dm: Long) { abrirVoz(0L, dm); _pedidoDeEntrada.value = dm }
+    /** "Atender" (na faixa ou na notificação). */
+    fun atenderChamada(canal: Long) { abrirVoz(0L, canal); _pedidoDeEntrada.value = canal }
+    fun recusarChamada(canal: Long) = c.chamadas.recusar(canal)
     fun sairDaVoz() = c.voz.sair()
     fun alternarMudo() = c.voz.alternarMudo()
     fun alternarSurdo() = c.voz.alternarSurdo()

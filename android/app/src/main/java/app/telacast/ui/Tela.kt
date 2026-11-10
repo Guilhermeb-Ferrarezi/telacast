@@ -54,6 +54,7 @@ class AcoesDeTela(
     val aoAssistir: (usuario: Long) -> Unit = {},
     val aoFecharPlayer: () -> Unit = {},
     val aoTelaCheia: () -> Unit = {},
+    val aoAlternarSom: () -> Unit = {},
 )
 
 /** O que as telas precisam saber da tela compartilhada. */
@@ -194,6 +195,7 @@ fun TelaDoPlayer(nome: String, p: EstadoDoPlayer, dados: DadosDeTela, acoes: Aco
                 Text(nome, style = Tipos.Corpo.copy(fontSize = 14.sp, fontWeight = FontWeight.SemiBold), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 if (p.fase == FaseDoPlayer.AoVivo) Text(if (p.espectadores == 1) "1 assistindo" else "${p.espectadores} assistindo", style = Tipos.Pequeno.copy(color = Grafite.Texto2))
             }
+            if (p.temAudio) { Botao(if (p.mudo) "Som: desligado" else "Som: ligado", TipoBotao.Quieto, altura = 34.dp, aoClicar = acoes.aoAlternarSom); Spacer(Modifier.width(6.dp)) }
             Botao(if (dados.telaCheia) "Sair da tela cheia" else "Tela cheia", TipoBotao.Quieto, altura = 34.dp, aoClicar = acoes.aoTelaCheia)
             Spacer(Modifier.width(8.dp))
             Toque(acoes.aoFecharPlayer, Modifier.size(40.dp), CircleShape, fundoPressionado = Grafite.L3) { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { IconeFechar(Grafite.Texto) } }

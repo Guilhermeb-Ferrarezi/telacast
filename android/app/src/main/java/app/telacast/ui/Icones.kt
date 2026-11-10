@@ -268,3 +268,18 @@ fun IconeSinal(cor: Color, modifier: Modifier = Modifier, tamanho: Dp = 18.dp) {
         }
     }
 }
+
+/** Telefone (ligar). */
+@Composable
+fun IconeTelefone(cor: Color, modifier: Modifier = Modifier, tamanho: Dp = 22.dp) {
+    Canvas(modifier.size(tamanho)) {
+        val s = size.width
+        val p = Path().apply {
+            moveTo(0.22f * s, 0.16f * s); lineTo(0.38f * s, 0.16f * s); lineTo(0.45f * s, 0.34f * s); lineTo(0.34f * s, 0.42f * s)
+            cubicTo(0.40f * s, 0.55f * s, 0.46f * s, 0.62f * s, 0.58f * s, 0.67f * s); lineTo(0.66f * s, 0.56f * s)
+            lineTo(0.84f * s, 0.63f * s); lineTo(0.84f * s, 0.79f * s); cubicTo(0.84f * s, 0.84f * s, 0.80f * s, 0.86f * s, 0.76f * s, 0.86f * s)
+            cubicTo(0.44f * s, 0.84f * s, 0.18f * s, 0.58f * s, 0.14f * s, 0.24f * s); cubicTo(0.14f * s, 0.20f * s, 0.18f * s, 0.16f * s, 0.22f * s, 0.16f * s); close()
+        }
+        drawPath(p, cor)
+    }
+}

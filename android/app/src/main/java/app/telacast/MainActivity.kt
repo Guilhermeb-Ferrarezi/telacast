@@ -49,6 +49,11 @@ class MainActivity : ComponentActivity() {
 
     private fun tratarToque(intent: Intent?) {
         if (intent?.action == app.telacast.atualizacao.ACAO_INSTALAR_ATUALIZACAO) { vm.instalarAtualizacao(); return }
+        if (intent?.action == app.telacast.chamada.ACAO_ATENDER_CHAMADA) {
+            val canal = intent.getLongExtra("canal", 0)
+            if (canal != 0L) { if (intent.getBooleanExtra("so_abrir", false)) vm.abrirVoz(0L, canal) else vm.atenderChamada(canal) }
+            return
+        }
         destinoDoIntent(intent)?.let { vm.abrirPorNotificacao(it) }
     }
 }

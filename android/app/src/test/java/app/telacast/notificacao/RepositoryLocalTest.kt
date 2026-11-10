@@ -1,5 +1,7 @@
 package app.telacast.notificacao
 
+import app.telacast.proto.PROTO_VERSION
+
 import app.telacast.Container
 import app.telacast.armazenamento.CofreEmMemoria
 import app.telacast.armazenamento.PreferenciasEmMemoria
@@ -21,6 +23,7 @@ import app.telacast.proto.Status
 import app.telacast.proto.User
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -81,7 +84,7 @@ class RepositoryLocalTest {
         val c = Container(prefs, CofreEmMemoria("tok-salvo"), "x:2", transporte, backgroundScope, { currentTime })
         assertTrue(c.retomarSessaoSalva()); runCurrent()
         transporte.ultima.abre(); runCurrent()
-        assertEquals(C2S.Resume("tok-salvo", 1), transporte.ultima.c2s.first())
+        assertEquals(C2S.Resume("tok-salvo", PROTO_VERSION), transporte.ultima.c2s.first())
         assertFalse("já está conectando: não abre outra conexão", c.retomarSessaoSalva())
         assertEquals(1, transporte.conexoes.size)
     }
@@ -99,5 +102,33 @@ class RepositoryLocalTest {
         assertTrue(c.manterConectado.value)
         c.definirManterConectado(false)
         assertFalse(c.manterConectado.value); assertFalse(prefs.manterConectado)
+    }
+
+    // ---------------------------------------------------------------- protocolo 2: live_revision e tráfego do mês
+    @Test fun snapshotMaisVelhoQueOJaVistoEIgnorado() = runTest {
+        val novo = snapshot.copy(liveRevision = 10, live = listOf(app.telacast.proto.Live(geral, eu.id)))
+        val a = Amb(this, novo)
+        assertEquals(1, a.repo.estado.value.snapshot!!.live.size)
+        a.c.envia(S2C.Snapshot(snapshot.copy(liveRevision = 9, live = emptyList()))); a.rodar()
+        assertEquals("o velho chegou atrasado e não apaga a transmissão", 1, a.repo.estado.value.snapshot!!.live.size)
+        a.c.envia(S2C.Snapshot(snapshot.copy(liveRevision = 11, live = emptyList()))); a.rodar()
+        assertTrue("o mais novo vale", a.repo.estado.value.snapshot!!.live.isEmpty())
+        assertEquals(11L, a.repo.estado.value.liveRevisionVisto)
+    }
+
+    @Test fun conexaoNovaRecomecaARevisaoPoisServidorPodeTerReiniciado() = runTest {
+        val a = Amb(this, snapshot.copy(liveRevision = 500))
+        a.c.cai(); a.rodar(); a.t.advanceTimeBy(1_000); a.rodar()
+        a.c.abre(); a.c.envia(S2C.Auth("tok", eu)); a.c.envia(S2C.Snapshot(snapshot.copy(liveRevision = 1, live = listOf(app.telacast.proto.Live(geral, eu.id))))); a.rodar()
+        assertEquals("servidor reiniciado (revisão 1 < 500) não pode ser ignorado", 1, a.repo.estado.value.snapshot!!.live.size)
+    }
+
+    @Test fun trafegoDoMesVemNoSnapshotENaMensagemPeriodica() = runTest {
+        val a = Amb(this, snapshot.copy(egressMonth = "2026-11", egressBytes = 1000))
+        assertEquals("2026-11" to 1000L, a.repo.estado.value.trafegoDoMes)
+        a.c.envia(S2C.EgressUsage("2026-11", 1_048_576)); a.rodar()
+        assertEquals("2026-11" to 1_048_576L, a.repo.estado.value.trafegoDoMes)
+        a.c.envia(S2C.Snapshot(snapshot.copy(liveRevision = 1))); a.rodar() // sem o campo (servidor antigo): mantém o último valor
+        assertEquals("2026-11" to 1_048_576L, a.repo.estado.value.trafegoDoMes)
     }
 }

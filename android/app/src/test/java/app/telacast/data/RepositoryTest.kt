@@ -1,5 +1,7 @@
 package app.telacast.data
 
+import app.telacast.proto.PROTO_VERSION
+
 import app.telacast.net.Credencial
 import app.telacast.net.FakeConexao
 import app.telacast.net.FakeTransporte
@@ -198,7 +200,7 @@ class RepositoryTest {
         a.c.abre(); a.servidor(S2C.Auth("tok", eu), S2C.Snapshot(snapshot))
         // conexão nova: Resume, recarrega o histórico do canal aberto e reenvia a pendente com o MESMO nonce
         val enviados = a.c.c2s
-        assertEquals(C2S.Resume("tok", 1), enviados[0])
+        assertEquals(C2S.Resume("tok", PROTO_VERSION), enviados[0])
         assertEquals(C2S.History(geral, null), enviados[1])
         assertEquals(C2S.Send(geral, "offline", null, nonce, emptyList()), enviados[2])
         // o servidor responde: histórico (sem a nova) e depois o eco

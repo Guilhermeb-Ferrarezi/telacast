@@ -63,15 +63,50 @@ class TelaPuraTest {
         assertEquals(listOf(3, 3, 2), H264.nals(d).map { it.fim - it.inicio })
     }
 
-    // ---------------------------------------------------------------- quadro no fio
-    @Test fun quadroDeVideoVaiEVolta() {
-        val b = QuadroDeVideo.codificar(true, byteArrayOf(0, 0, 0, 1, 0x65))
-        assertEquals(1.toByte(), b[0]); assertEquals(6, b.size)
-        val q = QuadroDeVideo.decodificar(b)!!
-        assertTrue(q.chave); assertEquals(listOf<Byte>(0, 0, 0, 1, 0x65), q.h264.toList())
-        assertFalse(QuadroDeVideo.decodificar(QuadroDeVideo.codificar(false, byteArrayOf(5)))!!.chave)
-        assertNull("menos de 2 bytes o servidor também descarta", QuadroDeVideo.decodificar(byteArrayOf(1)))
-        assertNull(QuadroDeVideo.decodificar(ByteArray(0)))
+    // ---------------------------------------------------------------- pacote de mídia no fio (protocolo 2)
+    @Test fun pacoteDeMidiaTemCabecalhoDe9BytesComPtsBigEndian() {
+        val b = PacoteDeMidia.codificar(TipoDeMidia.H264Chave, 0x0102030405060708L, byteArrayOf(0, 0, 0, 1, 0x65))!!
+        assertEquals(listOf<Byte>(1, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 1, 0x65), b.toList())
+        val p = PacoteDeMidia.decodificar(b)!!
+        assertTrue(p.chave); assertEquals(TipoDeMidia.H264Chave, p.tipo); assertEquals(0x0102030405060708L, p.ptsUs); assertEquals(listOf<Byte>(0, 0, 0, 1, 0x65), p.conteudo.toList())
+    }
+
+    @Test fun tiposDePacote() {
+        assertEquals(0, PacoteDeMidia.codificar(TipoDeMidia.H264Delta, 1, byteArrayOf(1))!![0].toInt())
+        assertEquals(2, PacoteDeMidia.codificar(TipoDeMidia.AudioDoSistema, 1, byteArrayOf(1))!![0].toInt())
+        assertFalse(PacoteDeMidia.decodificar(PacoteDeMidia.codificar(TipoDeMidia.H264Delta, 7, byteArrayOf(9))!!)!!.chave)
+        assertFalse(PacoteDeMidia.decodificar(PacoteDeMidia.codificar(TipoDeMidia.AudioDoSistema, 7, byteArrayOf(9))!!)!!.ehVideo)
+    }
+
+    @Test fun pacoteInvalidoNuncaSaiNemEntra() {
+        assertNull("conteúdo vazio derrubaria o publicador no servidor", PacoteDeMidia.codificar(TipoDeMidia.H264Chave, 0, ByteArray(0)))
+        assertNull("passou de 4 MiB", PacoteDeMidia.codificar(TipoDeMidia.H264Chave, 0, ByteArray(PacoteDeMidia.MAX)))
+        assertNotNull(PacoteDeMidia.codificar(TipoDeMidia.H264Chave, 0, ByteArray(PacoteDeMidia.MAX - PacoteDeMidia.CABECALHO)))
+        assertNull("curto", PacoteDeMidia.decodificar(ByteArray(5)))
+        assertNull("só o cabeçalho, sem conteúdo", PacoteDeMidia.decodificar(ByteArray(9)))
+        assertNull("tipo desconhecido", PacoteDeMidia.decodificar(byteArrayOf(9, 0, 0, 0, 0, 0, 0, 0, 0, 1)))
+        assertNull(PacoteDeMidia.decodificar(ByteArray(0)))
+        assertEquals("pts negativo vira 0", 0L, PacoteDeMidia.decodificar(PacoteDeMidia.codificar(TipoDeMidia.H264Delta, -5, byteArrayOf(1))!!)!!.ptsUs)
+    }
+
+    // ---------------------------------------------------------------- linha do tempo (sincronia de vídeo e áudio)
+    @Test fun linhaDoTempoAncoraNoPrimeiroPacoteEUsaOAtraso() {
+        var agora = 1_000_000_000L
+        val l = LinhaDoTempo(120) { agora }
+        assertEquals(1_000_000_000L + 120_000_000L, l.alvoNs(5_000_000))
+        assertEquals("33 ms depois no relógio da transmissão", 1_000_000_000L + 153_000_000L, l.alvoNs(5_033_000))
+        agora += 50_000_000L
+        assertEquals("áudio e vídeo com o mesmo pts caem no mesmo instante", l.alvoNs(5_033_000), l.alvoNs(5_033_000))
+    }
+
+    @Test fun linhaDoTempoReancoraSeORelogioDoTransmissorRecomecaOuAtrasaMuito() {
+        var agora = 0L
+        val l = LinhaDoTempo(100) { agora }
+        l.alvoNs(1_000_000)
+        agora = 5_000_000_000L
+        assertEquals("pacote muito atrasado: reancora", 5_000_000_000L + 100_000_000L, l.alvoNs(1_050_000))
+        agora = 6_000_000_000L
+        assertEquals("o transmissor recomeçou o relógio (pts voltou a 0)", 6_100_000_000L, l.alvoNs(0))
     }
 
     // ---------------------------------------------------------------- escolha de resolução

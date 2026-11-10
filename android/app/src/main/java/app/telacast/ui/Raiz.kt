@@ -10,6 +10,7 @@ import androidx.core.content.ContextCompat
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -53,11 +54,16 @@ private fun ConteudoDoApp(vm: AppViewModel) {
     val fase by vm.fase.collectAsState()
     val estado by vm.estado.collectAsState()
     when (fase) {
-        Fase.Login -> {
+        Fase.Login -> ComAtualizacao(vm) {
             val form by vm.form.collectAsState()
             TelaDeLogin(form, AcoesLogin(vm::editarForm, vm::entrar, vm::alternarModo))
         }
-        Fase.Retomando -> TelaDeCarregamento(estado.conexao is EstadoConexao.Reconectando, vm::usarOutraConta)
+        Fase.Retomando -> ComAtualizacao(vm) { TelaDeCarregamento(estado.conexao is EstadoConexao.Reconectando, vm::usarOutraConta) }
+        Fase.Desatualizado -> ComAtualizacao(vm) {
+            val atu by vm.atualizacao.collectAsState()
+            val ctxD = LocalContext.current
+            TelaDesatualizada(atu, vm.atualizacaoLigada, acoesDeAtualizacao(vm), aoBaixarPeloNavegador = { runCatching { ctxD.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(vm.urlDeDownload())).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) } }, aoTentarDeNovo = vm::tentarDeNovoAposVersao)
+        }
         Fase.Principal -> {
             val nav by vm.nav.collectAsState()
             val recolhidas by vm.recolhidas.collectAsState()
@@ -74,6 +80,8 @@ private fun ConteudoDoApp(vm: AppViewModel) {
             val vozEstado by vm.voz.collectAsState()
             val telaTransmissao by vm.transmissao.collectAsState()
             val atualizacaoEstado by vm.atualizacao.collectAsState()
+            val chamadaEstado by vm.chamada.collectAsState()
+            val pedidoDeEntrada by vm.pedidoDeEntrada.collectAsState()
             val manterConectado by vm.manterConectado.collectAsState()
             // volta das configurações do Android: reavalia se as notificações estão permitidas
             var retomadas by remember { mutableStateOf(0) }
@@ -136,6 +144,10 @@ private fun ConteudoDoApp(vm: AppViewModel) {
                     pedirPermissoes.launch(pedir.toTypedArray())
                 }
             }
+            // "Ligar" na DM e "Atender" (faixa ou notificação): entra na chamada pedindo o microfone se faltar
+            androidx.compose.runtime.LaunchedEffect(pedidoDeEntrada) {
+                pedidoDeEntrada?.let { canal -> vm.consumirPedidoDeEntrada(); entrarNaVoz(canal) }
+            }
             // tocar num canal de voz abre a tela dele e entra (como no desktop); se já está nele, só abre
             val abrirVoz: (Long, Long) -> Unit = { servidor, canal ->
                 vm.abrirVoz(servidor, canal)
@@ -172,9 +184,9 @@ private fun ConteudoDoApp(vm: AppViewModel) {
                     acoesDe(vm, copiar = { area.setText(AnnotatedString(it)) }, abrirLink = { runCatching { links.openUri(it) } }, anexar = { seletor.launch("*/*") }, baixar = baixar, aoAbrirVoz = abrirVoz, aoEntrarNaVoz = entrarNaVoz, aoTelaCheia = { telaCheia = !telaCheia },
                         abrirConfig = { acao, comPacote -> runCatching { ctxTela.startActivity(android.content.Intent(acao).apply { if (comPacote) putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, ctxTela.packageName) }.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) } },
                     ),
-                    conversa = DadosDaConversa(compositor, anexos, spoilers, textos, reveladas, agora, consultaDaBusca = consulta, buscaNoCanal = buscaNoCanal, tamanhoDoTexto = tamanhoTexto, senhaTrocada = senhaTrocada, notificacoes = DadosDeNotificacoes(manterConectado, permitidas)),
+                    conversa = DadosDaConversa(compositor, anexos, spoilers, textos, reveladas, agora, consultaDaBusca = consulta, buscaNoCanal = buscaNoCanal, tamanhoDoTexto = tamanhoTexto, senhaTrocada = senhaTrocada, notificacoes = DadosDeNotificacoes(manterConectado, permitidas, estado.trafegoDoMes)),
                     voz = DadosDeVoz(vozEstado),
-                    atualizacao = atualizacaoEstado,
+                    atualizacao = atualizacaoEstado, chamada = chamadaEstado,
                     dadosDeTela = DadosDeTela(
                         telaTransmissao, telaPlayer, telaCheia = telaCheia,
                         superficie = { m ->
@@ -276,6 +288,7 @@ private fun acoesDe(
         ),
         aoAbrirBusca = vm::abrirBusca,
         aoAbrirFixadas = vm::abrirFixadas,
+        aoLigar = vm::ligar,
     ),
     perfil = AcoesDoPerfil(
         aoFechar = vm::fecharPerfil,
@@ -311,6 +324,7 @@ private fun acoesDe(
     ),
     aoAbrirAjustes = vm::abrirAjustes,
     aoAbrirPerfil = vm::abrirPerfil,
+    chamada = AcoesDeChamada(aoAtender = vm::atenderChamada, aoRecusar = vm::recusarChamada),
     atualizacao = AcoesDeAtualizacao(
         aoAtualizar = vm::atualizar, aoInstalar = vm::instalarAtualizacao, aoDispensarFolha = vm::dispensarFolhaDeAtualizacao,
         aoAbrirPermissao = vm::abrirPermissaoDeInstalacao, aoCancelarPermissao = vm::cancelarPermissaoDeInstalacao,
@@ -323,6 +337,7 @@ private fun acoesDe(
         aoAssistir = vm::assistir,
         aoFecharPlayer = vm::fecharDialogo,
         aoTelaCheia = aoTelaCheia,
+        aoAlternarSom = { vm.definirMudoDoPlayer(!vm.player.value.mudo) },
     ),
     voz = AcoesDeVoz(
         aoEntrar = aoEntrarNaVoz,
@@ -346,3 +361,26 @@ private fun acoesDe(
         aoApagar = { vm.nav.value.folha?.let { vm.pedirApagar(it.mensagem) } },
     ),
 )
+
+private fun acoesDeAtualizacao(vm: AppViewModel) = AcoesDeAtualizacao(
+    aoAtualizar = vm::atualizar, aoInstalar = vm::instalarAtualizacao, aoDispensarFolha = vm::dispensarFolhaDeAtualizacao,
+    aoAbrirPermissao = vm::abrirPermissaoDeInstalacao, aoCancelarPermissao = vm::cancelarPermissaoDeInstalacao,
+)
+
+/**
+ * Telas sem login (entrar, retomando, app desatualizado) com a faixa "Nova versão X disponível · Atualizar" e as folhas de atualização por cima:
+ * a consulta é HTTP e não depende de estar logado, então dá para atualizar sem entrar (e sem conseguir conectar).
+ */
+@Composable
+private fun ComAtualizacao(vm: AppViewModel, conteudo: @Composable () -> Unit) {
+    val atu by vm.atualizacao.collectAsState()
+    val acoes = acoesDeAtualizacao(vm)
+    androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.fillMaxSize()) {
+        androidx.compose.foundation.layout.Column(androidx.compose.ui.Modifier.fillMaxSize()) {
+            if (atu.temNovidade) androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.statusBarsPadding()) { FaixaDeAtualizacao(atu, acoes) }
+            androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.weight(1f)) { conteudo() }
+        }
+        if (atu.fase == app.telacast.atualizacao.FaseDaAtualizacao.PrecisaDePermissao) FolhaDeFonteDesconhecida(acoes)
+        else if (atu.folhaPendente && (atu.fase == app.telacast.atualizacao.FaseDaAtualizacao.Disponivel || atu.fase == app.telacast.atualizacao.FaseDaAtualizacao.Pronta)) FolhaDeAtualizacao(atu, acoes)
+    }
+}

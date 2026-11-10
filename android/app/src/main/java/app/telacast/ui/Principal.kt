@@ -77,6 +77,7 @@ class AcoesPrincipais(
     val voz: AcoesDeVoz = AcoesDeVoz(),
     val tela: AcoesDeTela = AcoesDeTela(),
     val atualizacao: AcoesDeAtualizacao = AcoesDeAtualizacao(),
+    val chamada: AcoesDeChamada = AcoesDeChamada(),
 )
 
 /**
@@ -96,6 +97,7 @@ fun TelaPrincipal(
     voz: DadosDeVoz = DadosDeVoz(),
     dadosDeTela: DadosDeTela = DadosDeTela(),
     atualizacao: app.telacast.atualizacao.EstadoDaAtualizacao = app.telacast.atualizacao.EstadoDaAtualizacao(),
+    chamada: app.telacast.chamada.EstadoDaChamada = app.telacast.chamada.EstadoDaChamada.Nenhuma,
 ) {
     BoxWithConstraints(modifier.fillMaxSize().background(Grafite.L2)) {
         val larguraGaveta = minOf((LARGURA_TRILHO + LARGURA_PAINEL).dp, maxWidth - 56.dp)
@@ -140,6 +142,7 @@ fun TelaPrincipal(
             },
         ) {
             Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.statusBars)) {
+                FaixaDeChamada(chamada, acoes.chamada)
                 FaixaDeAtualizacao(atualizacao, acoes.atualizacao)
                 (estado.conexao as? EstadoConexao.Reconectando)?.let { FaixaDeReconexao(it.tentativa) }
                 // enquanto você está numa chamada e não está na tela dela, a faixa fica no topo do centro
@@ -203,7 +206,19 @@ private fun Centro(estado: AppState, nav: Navegacao, acoes: AcoesPrincipais, con
             if (dm != null) TelaDeDm(estado, dm, acoes.aoAbrirGaveta, conversa, acoes.conversa)
             else TelaDeAmigos(estado, nav.abaInicio, acoes.aoAbrirGaveta, acoes.amigos)
         }
-        is Destino.Voz -> {
+        is Destino.Voz -> if (d.servidor == 0L) {
+            // chamada em DM individual: a "sala" é o canal da conversa; o nome é o da outra pessoa
+            val dm = sn?.dms?.firstOrNull { it.channelId == d.canal }
+            if (dm != null) {
+                val nomes = mapOf(dm.user.id to dm.user.name, (estado.eu?.id ?: 0L) to (estado.eu?.name ?: "Você"))
+                TelaDeVoz(
+                    voz.estado, dm.user.name, "Chamada direta", dm.channelId, estado.voz.filter { it.channelId == dm.channelId },
+                    nomeDe = { nomes[it] ?: "?" }, euId = estado.eu?.id ?: 0L, agoraMs = voz.agoraMs,
+                    aoMenu = acoes.aoAbrirGaveta, acoes = acoes.voz, novidade = temNovidade(estado),
+                    aoVivo = sn.live.filter { it.channelId == dm.channelId }.map { it.userId }.toSet(), transmissao = tela.transmissao, acoesTela = acoes.tela, estatisticasAbertas = voz.estatisticasAbertas,
+                )
+            } else TelaDeAmigos(estado, nav.abaInicio, acoes.aoAbrirGaveta, acoes.amigos)
+        } else {
             val servidor = sn?.servers?.firstOrNull { it.id == d.servidor }
             val canal = servidor?.channels?.firstOrNull { it.id == d.canal }
             if (canal != null) {

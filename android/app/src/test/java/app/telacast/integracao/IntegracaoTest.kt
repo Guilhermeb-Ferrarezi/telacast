@@ -397,6 +397,7 @@ class IntegracaoTest {
     private class FonteSintetica(private val quadros: List<ByteArray>) : app.telacast.tela.FonteDeTela {
         @Volatile private var rodando = false
         @Volatile var chavesPedidas = 0
+        @Volatile var pts = 0L
         override fun fpsSuportados() = listOf(15, 30)
         override fun iniciar(concessao: Any, opcoes: app.telacast.tela.OpcoesDeTransmissao, ouvinte: app.telacast.tela.OuvinteDaFonte): String? {
             rodando = true
@@ -404,7 +405,7 @@ class IntegracaoTest {
                 var i = 0
                 while (rodando) {
                     val q = quadros[i % quadros.size]
-                    ouvinte.aoQuadro(app.telacast.tela.H264.ehQuadroChave(q), q)
+                    ouvinte.aoQuadro(app.telacast.tela.H264.ehQuadroChave(q), q, pts); pts += 33_333
                     i++
                     Thread.sleep(33)
                 }
@@ -418,7 +419,8 @@ class IntegracaoTest {
 
     private class DecodificadorGravador(val recebidos: MutableList<ByteArray>) : app.telacast.tela.DecodificadorDeVideo {
         override fun configurar(superficie: Any, largura: Int, altura: Int): String? = null
-        override fun decodificar(h264: ByteArray, instanteUs: Long): Boolean { synchronized(recebidos) { recebidos += h264 }; return true }
+        val pts = CopyOnWriteArrayList<Long>()
+        override fun decodificar(h264: ByteArray, ptsUs: Long, alvoNs: Long): Boolean { synchronized(recebidos) { recebidos += h264 }; pts += ptsUs; return true }
         override fun fechar() = Unit
     }
 
@@ -586,6 +588,100 @@ class IntegracaoTest {
             ana.repo.removerAmigo(bobId)
             esperar("amizade desfeita") { if (ana.estado.snapshot?.friends?.none { it.user.id == bobId } == true) true else null }
         }
+    }
+
+    // ------------------------------------------------------------------ chamada em DM (C9, protocolo 2)
+
+    /** Ligar numa DM é o `VoiceJoin` no canal da conversa: o outro lado vê tocar, atende e a sala tem os dois; transmitir de dentro da DM funciona. */
+    @Test fun chamadaEmDmToca_AtendeETransmiteTela() {
+        val anaId = ana.estado.eu!!.id; val bobId = bob.estado.eu!!.id
+        ana.repo.pedirAmizade(bob.nome)
+        esperar("bob vê o pedido") { bob.estado.snapshot?.friends?.firstOrNull { it.user.id == anaId && it.status == app.telacast.proto.FriendStatus.Incoming } }
+        bob.repo.aceitarAmigo(anaId)
+        esperar("são amigos") { ana.estado.snapshot?.friends?.firstOrNull { it.user.id == bobId && it.status == app.telacast.proto.FriendStatus.Friend } }
+        val antes = ana.avisos.size
+        ana.repo.abrirDm(bobId)
+        val dm = esperar("DM aberta") { ana.avisos.drop(antes).filterIsInstance<Aviso.DmAberta>().firstOrNull() }.canal
+        esperar("bob conhece a DM") { bob.estado.snapshot?.dms?.firstOrNull { it.channelId == dm } }
+        val toques = CopyOnWriteArrayList<String>()
+        val toque = object : app.telacast.chamada.ToqueDeChamada {
+            override fun tocarRecebendo() { toques += "recebendo" }
+            override fun tocarChamando() { toques += "chamando" }
+            override fun parar() { toques += "parar" }
+            override fun fim() { toques += "fim" }
+        }
+        val chamadas = app.telacast.chamada.ControladorDeChamadasEmDm(escopo, bob.repo.estado, { bob.repo.sairDaVoz() }, {}, toque)
+        try {
+            ana.repo.entrarNaVoz(dm)
+            val e = esperar("bob vê a chamada tocar") { chamadas.estado.value as? app.telacast.chamada.EstadoDaChamada.Recebendo }
+            assertEquals(dm, e.canal); assertEquals(anaId, e.usuario); assertEquals(ana.nome, e.nome)
+            assertTrue("o toque começou", "recebendo" in toques)
+            bob.repo.entrarNaVoz(dm)
+            esperar("a sala da DM tem os dois") { if (bob.estado.voz.count { it.channelId == dm } == 2 && ana.estado.voz.count { it.channelId == dm } == 2) true else null }
+            esperar("atendida: para de tocar") { if (chamadas.estado.value == app.telacast.chamada.EstadoDaChamada.Nenhuma) true else null }
+
+            // transmitir a tela de dentro da chamada da DM (o servidor exige estar na chamada)
+            val base = app.telacast.arquivos.Arquivos.urlHttp(url!!)
+            val transporte = app.telacast.tela.OkHttpTransporteDeVideo()
+            val enviados = CopyOnWriteArrayList<app.telacast.tela.PacoteDeMidia>()
+            val aberta = java.util.concurrent.CompletableFuture<Unit>()
+            val publisher = transporte.abrir(app.telacast.tela.urlDeVideo(base, "publish", dm, ana.gateway.token!!), object : app.telacast.tela.OuvinteDeVideo {
+                override fun aoAbrir() { aberta.complete(Unit) }
+                override fun aoTexto(texto: String) { aberta.completeExceptionally(AssertionError("recusado: $texto")) }
+                override fun aoBinario(dados: ByteArray) = Unit
+                override fun aoFim(motivo: String, http: Int?) { aberta.completeExceptionally(AssertionError("fim: $motivo $http")) }
+            })
+            aberta.get(10, java.util.concurrent.TimeUnit.SECONDS)
+            val recebidoAudio = java.util.concurrent.CompletableFuture<app.telacast.tela.PacoteDeMidia>()
+            val espectador = transporte.abrir(app.telacast.tela.urlDeVideo(base, "watch", dm, bob.gateway.token!!), object : app.telacast.tela.OuvinteDeVideo {
+                override fun aoAbrir() = Unit
+                override fun aoTexto(texto: String) = Unit
+                override fun aoBinario(dados: ByteArray) { app.telacast.tela.PacoteDeMidia.decodificar(dados)?.let { enviados += it; if (it.tipo == app.telacast.tela.TipoDeMidia.AudioDoSistema) recebidoAudio.complete(it) } }
+                override fun aoFim(motivo: String, http: Int?) = Unit
+            })
+            Thread.sleep(300)
+            publisher.enviar(app.telacast.tela.PacoteDeMidia.codificar(app.telacast.tela.TipoDeMidia.H264Chave, 1_000, byteArrayOf(0, 0, 0, 1, 0x65, 1, 2))!!)
+            publisher.enviar(app.telacast.tela.PacoteDeMidia.codificar(app.telacast.tela.TipoDeMidia.AudioDoSistema, 21_000, byteArrayOf(9, 8, 7))!!)
+            publisher.enviar(app.telacast.tela.PacoteDeMidia.codificar(app.telacast.tela.TipoDeMidia.H264Delta, 33_000, byteArrayOf(0, 0, 0, 1, 0x41, 3))!!)
+            val audio = recebidoAudio.get(10, java.util.concurrent.TimeUnit.SECONDS)
+            assertEquals("o áudio do sistema chega com o pts do transmissor", 21_000L, audio.ptsUs); assertEquals(listOf<Byte>(9, 8, 7), audio.conteudo.toList())
+            esperar("o vídeo chegou") { if (enviados.count { it.ehVideo } >= 2) true else null }
+            assertEquals(1_000L, enviados.first { it.ehVideo }.ptsUs); assertTrue(enviados.first { it.ehVideo }.chave)
+            publisher.fechar(); espectador.fechar()
+        } finally {
+            ana.repo.sairDaVoz(); bob.repo.sairDaVoz()
+            ana.repo.removerAmigo(bobId)
+            esperar("amizade desfeita") { if (ana.estado.snapshot?.friends?.none { it.user.id == bobId } == true) true else null }
+        }
+    }
+
+    /** O servidor derruba quem publica pacote de mídia inválido (protocolo 2). */
+    @Test fun publicadorComPacoteInvalidoEDerrubado() {
+        val nome = "inv-${System.nanoTime().toString().takeLast(5)}"
+        ana.repo.criarCanal(servidor, nome, Channel.VOZ)
+        val canal = esperar("canal de voz") { ana.canalPorNome(nome)?.id }
+        ana.repo.entrarNaVoz(canal)
+        esperar("ana na voz") { if (ana.estado.voz.any { it.channelId == canal }) true else null }
+        val base = app.telacast.arquivos.Arquivos.urlHttp(url!!)
+        val fim = java.util.concurrent.CompletableFuture<String>()
+        val c = app.telacast.tela.OkHttpTransporteDeVideo().abrir(app.telacast.tela.urlDeVideo(base, "publish", canal, ana.gateway.token!!), object : app.telacast.tela.OuvinteDeVideo {
+            override fun aoAbrir() = Unit
+            override fun aoTexto(texto: String) = Unit
+            override fun aoBinario(dados: ByteArray) = Unit
+            override fun aoFim(motivo: String, http: Int?) { fim.complete(motivo) }
+        })
+        try {
+            Thread.sleep(300)
+            c.enviar(byteArrayOf(1, 0, 0, 0, 0, 0, 0, 0, 0)) // só o cabeçalho, sem conteúdo
+            fim.get(10, java.util.concurrent.TimeUnit.SECONDS)
+        } finally { ana.repo.sairDaVoz() }
+    }
+
+    /** O servidor novo manda o tráfego do mês no snapshot (e aceita `proto = 2`). */
+    @Test fun servidorNovoAceitaProtoDoisEMandaOTrafegoDoMes() {
+        assertEquals(2, app.telacast.proto.PROTO_VERSION)
+        val t = esperar("tráfego do mês no estado") { ana.estado.trafegoDoMes }
+        assertTrue("mês no formato AAAA-MM (${t.first})", Regex("\\d{4}-\\d{2}").matches(t.first))
     }
 
     // ------------------------------------------------------------------ amizade, bloqueio, fixadas, busca e conta (B7/B8)

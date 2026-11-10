@@ -224,6 +224,8 @@ class Gateway(
      */
     private fun erroAntesDeAutenticar(e: S2C.Error, cred: Credencial): Fim {
         val retomando = cred is Credencial.Retomar
+        // app velho demais para o servidor: definitivo (não adianta tentar de novo), mas NÃO invalida a sessão
+        if (e.code == ErrorCode.VersionMismatch) return Fim.Fatal(EventoGateway.Falha(e.code, e.msg, sessaoInvalida = false))
         return if (!retomando || e.code in SESSAO_INVALIDA) {
             Fim.Fatal(EventoGateway.Falha(e.code, e.msg, sessaoInvalida = retomando))
         } else {
@@ -242,7 +244,8 @@ class Gateway(
         val ESPERAS_PADRAO_MS = listOf(1_000L, 2_000L, 4_000L, 8_000L, 15_000L)
 
         /** Códigos que dizem "esta sessão não vale mais" (docs/PROTOCOL.md, seção 4). */
-        val SESSAO_INVALIDA = setOf(ErrorCode.SessionExpired, ErrorCode.NotAuthenticated, ErrorCode.VersionMismatch, ErrorCode.InvalidCredentials)
+        /** Códigos que dizem "esta sessão não vale mais". `VersionMismatch` NÃO está aqui: o app é que está velho; a sessão continua boa e o token fica guardado. */
+        val SESSAO_INVALIDA = setOf(ErrorCode.SessionExpired, ErrorCode.NotAuthenticated, ErrorCode.InvalidCredentials)
 
         /** `host:porta`, `http(s)://...` ou `ws(s)://...` viram `ws(s)://.../ws`. Sem esquema: domínio público vale `wss://`, o resto `ws://` (ver [Endereco]). */
         fun urlDoGateway(servidor: String): String {

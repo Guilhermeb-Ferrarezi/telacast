@@ -49,7 +49,7 @@ class AcoesDeAjustes(
 )
 
 /** O que a seção Notificações mostra: a opção "Manter conectado" e se o Android deixa o app notificar. */
-class DadosDeNotificacoes(val manterConectado: Boolean = true, val permitidas: Boolean = true)
+class DadosDeNotificacoes(val manterConectado: Boolean = true, val permitidas: Boolean = true, val trafegoDoMes: Pair<String, Long>? = null)
 
 /** Multiplicador do tamanho do texto das mensagens: 0 pequeno, 1 normal, 2 grande. */
 fun escalaDoTexto(nivel: Int): Float = when (nivel) { 0 -> 0.9f; 2 -> 1.15f; else -> 1f }
@@ -69,6 +69,19 @@ fun TelaDeAjustes(eu: User, sessoes: List<SessionInfo>, agoraMs: Long, tamanho: 
                 Column {
                     Text(eu.name, style = Tipos.Corpo.copy(fontWeight = FontWeight.SemiBold, fontSize = 16.sp))
                     Text("@${eu.name} · ${eu.status.rotulo()}", style = Tipos.Pequeno.copy(color = Grafite.Apagado))
+                }
+            }
+
+            if (notificacoes.trafegoDoMes != null) {
+                Spacer(Modifier.height(8.dp))
+                Rotulo("Servidor")
+                val (mes, bytes) = notificacoes.trafegoDoMes
+                Row(Modifier.fillMaxWidth().background(Grafite.L3, Formas.Cartao).padding(12.dp)) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Tráfego de saída do servidor", style = Tipos.Corpo.copy(fontSize = 14.5.sp))
+                        Text("Mês $mes (UTC). Soma de mensagens, voz e transmissões de todos.", style = Tipos.Pequeno.copy(fontSize = 12.sp, color = Grafite.Apagado))
+                    }
+                    Text(textoDeBytes(bytes), style = Tipos.Corpo.copy(fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold))
                 }
             }
 
@@ -207,4 +220,12 @@ fun SecaoDeNotificacoes(n: DadosDeNotificacoes, a: AcoesDeAjustes) {
             Botao("Abrir", TipoBotao.Quieto, altura = 34.dp, aoClicar = a.aoAbrirBateria)
         }
     }
+}
+
+/** "1,5 GB", "320 MB", "12 KB". */
+fun textoDeBytes(b: Long): String = when {
+    b >= 1L shl 30 -> "${"%.1f".format(b / (1L shl 30).toDouble()).replace('.', ',')} GB"
+    b >= 1L shl 20 -> "${"%.0f".format(b / (1L shl 20).toDouble())} MB"
+    b >= 1L shl 10 -> "${b shr 10} KB"
+    else -> "$b B"
 }

@@ -274,7 +274,8 @@ class Repository(
         val atual = _estado.value
         // outra conta entrando: nada do estado anterior vale
         val base = if (!ev.reconexao && atual.eu != null && atual.eu.id != ev.eu.id) AppState(conexao = atual.conexao) else atual
-        _estado.value = base.copy(autenticado = true, erroDeEntrada = null, eu = ev.eu)
+        // a revisão é do processo do servidor: conexão nova (ou servidor reiniciado) começa de novo
+        _estado.value = base.copy(autenticado = true, erroDeEntrada = null, eu = ev.eu, liveRevisionVisto = 0)
         if (ev.reconexao) {
             // pode ter perdido mensagens enquanto estava fora: recarrega o canal aberto
             val aberto = _estado.value.canalAberto
@@ -311,6 +312,7 @@ class Repository(
             }
             is S2C.Pins -> _estado.value = s.copy(fixadas = s.fixadas + (m.channelId to m.messages))
             is S2C.Typing -> digitando(s, m)
+            is S2C.EgressUsage -> _estado.value = s.copy(trafegoDoMes = m.month to m.bytes)
             is S2C.Viewers -> _estado.value = s.copy(
                 espectadores = if (m.users.isEmpty()) s.espectadores - m.channelId else s.espectadores + (m.channelId to m.users),
             )
@@ -335,6 +337,8 @@ class Repository(
 
     /** `Snapshot` substitui o anterior inteiro. Não lido = última mensagem mais nova que a última lida (fora o canal aberto). */
     private fun snapshot(s: AppState, sn: Snapshot) {
+        // snapshot mais velho (revisão das transmissões menor) que o já aplicado: chegou atrasado, não volta no tempo
+        if (sn.liveRevision < s.liveRevisionVisto) return
         val aberto = s.canalAberto
         val canais = sn.servers.flatMap { it.channels }.filter { it.kind == 0 }
             .map { Triple(it.id, it.lastMessageId, it.lastReadId) } +
@@ -347,6 +351,8 @@ class Repository(
         _estado.value = s.copy(
             snapshot = sn, eu = sn.me, voz = sn.voice, naoLidos = naoLidos, mencoes = mencoes,
             canalAberto = if (existe) aberto else null,
+            liveRevisionVisto = maxOf(s.liveRevisionVisto, sn.liveRevision),
+            trafegoDoMes = if (sn.egressMonth.isNotEmpty()) sn.egressMonth to sn.egressBytes else s.trafegoDoMes,
         )
         for (u in app.telacast.notificacao.RegrasLocais.pedidosNovos(anterior, sn)) aoPedidoDeAmizade?.invoke(u, _estado.value)
     }

@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -123,5 +124,50 @@ fun JanelaDeCrash(relatorio: String, aoCopiar: () -> Unit, aoCompartilhar: () ->
         }
         Spacer(Modifier.height(8.dp))
         Botao("Fechar", TipoBotao.Primario, Modifier.fillMaxWidth(), aoClicar = aoFechar)
+    }
+}
+
+class AcoesDeChamada(val aoAtender: (Long) -> Unit = {}, val aoRecusar: (Long) -> Unit = {})
+
+/** Faixa "fulano está ligando…" com Atender e Recusar (a notificação faz o mesmo com o app fechado). */
+@Composable
+fun FaixaDeChamada(e: app.telacast.chamada.EstadoDaChamada, acoes: AcoesDeChamada) {
+    val r = e as? app.telacast.chamada.EstadoDaChamada.Recebendo ?: return
+    Row(Modifier.fillMaxWidth().background(Grafite.L4).padding(start = 14.dp, end = 8.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Avatar(r.nome, r.usuario, 36.dp, fundo = Grafite.L4)
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(r.nome, style = Tipos.Corpo.copy(fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text("Está ligando para você…", style = Tipos.Pequeno.copy(color = Grafite.Ambar))
+        }
+        Botao("Recusar", TipoBotao.Perigo, altura = 36.dp, aoClicar = { acoes.aoRecusar(r.canal) })
+        Spacer(Modifier.width(6.dp))
+        Botao("Atender", TipoBotao.Primario, altura = 36.dp, aoClicar = { acoes.aoAtender(r.canal) })
+    }
+}
+
+/**
+ * O servidor recusou este app (versão do protocolo): NÃO desloga (o token fica guardado). Mostra "Atualize o app" com o botão. Se a atualização pelo app
+ * não está disponível (sem chave, sem rede), oferece baixar o APK pelo navegador.
+ */
+@Composable
+fun TelaDesatualizada(e: EstadoDaAtualizacao, atualizacaoLigada: Boolean, acoes: AcoesDeAtualizacao, aoBaixarPeloNavegador: () -> Unit, aoTentarDeNovo: () -> Unit) {
+    Box(Modifier.fillMaxSize().background(Grafite.L2), contentAlignment = Alignment.Center) {
+        Column(Modifier.padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Telacast", style = Tipos.Titulo.copy(fontSize = 44.sp, lineHeight = 48.sp, letterSpacing = (-0.5).sp))
+            Text("Atualize o app", style = Tipos.Subtitulo.copy(fontSize = 24.sp))
+            Text("Esta versão do Telacast é antiga demais para falar com o servidor. Sua conta continua salva: depois de atualizar, você volta direto para as conversas.", style = Tipos.CorpoApagado, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            Spacer(Modifier.height(8.dp))
+            val m = e.manifesto
+            when {
+                m != null && e.fase == FaseDaAtualizacao.Baixando -> Text("Baixando a versão ${m.version} · ${e.progresso}%", style = Tipos.Corpo.copy(color = Grafite.Ambar))
+                m != null && e.fase == FaseDaAtualizacao.Instalando -> Text("Instalando a versão ${m.version}…", style = Tipos.Corpo.copy(color = Grafite.Ambar))
+                m != null -> Botao(if (e.fase == FaseDaAtualizacao.Pronta) "Instalar a versão ${m.version}" else "Atualizar para a ${m.version}", TipoBotao.Primario, Modifier.fillMaxWidth(), 48.dp, aoClicar = if (e.fase == FaseDaAtualizacao.Pronta) acoes.aoInstalar else acoes.aoAtualizar)
+                else -> Text(if (atualizacaoLigada) "Procurando a versão nova…" else "A atualização pelo app não está disponível.", style = Tipos.CorpoApagado)
+            }
+            if (e.fase == FaseDaAtualizacao.Erro && e.mensagem != null) Text(e.mensagem, style = Tipos.Corpo.copy(fontSize = 13.sp, color = Grafite.Vermelho), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            Botao("Baixar pelo navegador", TipoBotao.Quieto, Modifier.fillMaxWidth(), 44.dp, aoClicar = aoBaixarPeloNavegador)
+            Botao("Tentar de novo", TipoBotao.Quieto, Modifier.fillMaxWidth(), 44.dp, aoClicar = aoTentarDeNovo)
+        }
     }
 }

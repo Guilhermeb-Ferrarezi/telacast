@@ -42,6 +42,10 @@ data class AppState(
     /** Já recebeu `Auth` nesta execução (a tela de login some). */
     val autenticado: Boolean = false,
     val erroDeEntrada: ErroDeEntrada? = null,
+    /** Maior `live_revision` de snapshot já aplicado nesta conexão (snapshot mais velho que ele chegou atrasado e é ignorado). */
+    val liveRevisionVisto: Long = 0,
+    /** Tráfego de saída do servidor no mês UTC atual: (`2026-11`, bytes). */
+    val trafegoDoMes: Pair<String, Long>? = null,
     val eu: User? = null,
     val snapshot: Snapshot? = null,
     val canalAberto: Long? = null,

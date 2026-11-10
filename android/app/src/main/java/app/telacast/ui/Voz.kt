@@ -46,6 +46,7 @@ class DadosDeVoz(val estado: EstadoDeVoz = EstadoDeVoz(), val agoraMs: Long? = n
 /** "sala de reunião · Turma do Telacast". */
 fun localDaVoz(estado: app.telacast.data.AppState, canal: Long?): String {
     if (canal == null) return ""
+    estado.snapshot?.dms?.firstOrNull { it.channelId == canal }?.let { return "Chamada com ${it.user.name}" }
     for (sv in estado.snapshot?.servers.orEmpty()) sv.channels.firstOrNull { it.id == canal }?.let { return "${it.name} · ${sv.name}" }
     return ""
 }

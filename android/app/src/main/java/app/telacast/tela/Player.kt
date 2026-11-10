@@ -13,12 +13,26 @@ import kotlinx.coroutines.launch
 interface DecodificadorDeVideo {
     /** `null` = pronto. `superficie` é a `Surface` do `SurfaceView` (opaca aqui). */
     fun configurar(superficie: Any, largura: Int, altura: Int): String?
-    /** Entrega um quadro. `false` = o decodificador não aceitou (sem buffer livre ou quebrou): quem chama espera o próximo quadro-chave. */
-    fun decodificar(h264: ByteArray, instanteUs: Long): Boolean
+    /**
+     * Entrega um quadro. `ptsUs` é o relógio da transmissão; `alvoNs` é o instante (relógio `System.nanoTime`) em que o quadro deve aparecer, calculado
+     * pela [LinhaDoTempo] para ficar em sincronia com o áudio. `false` = o decodificador não aceitou (sem buffer livre ou quebrou): quem chama
+     * espera o próximo quadro-chave.
+     */
+    fun decodificar(h264: ByteArray, ptsUs: Long, alvoNs: Long): Boolean
     fun fechar()
 }
 
 fun interface FabricaDeDecodificador { fun criar(): DecodificadorDeVideo }
+
+/** Toca o áudio do sistema da transmissão (pacotes Opus estéreo de 20 ms) no instante `alvoNs`; no Android, `AudioTrack`. */
+interface ReprodutorDeAudioDaTransmissao {
+    fun empurrar(opus: ByteArray, alvoNs: Long)
+    fun definirMudo(mudo: Boolean)
+    fun fechar()
+}
+
+/** `null` se o aparelho não consegue (o áudio é ignorado sem erro; o vídeo segue). */
+fun interface FabricaDeReprodutorDeAudio { fun criar(): ReprodutorDeAudioDaTransmissao? }
 
 enum class FaseDoPlayer { Inativo, Carregando, AoVivo, Encerrou, Lotada, Erro }
 
@@ -29,6 +43,9 @@ data class EstadoDoPlayer(
     val mensagem: String? = null,
     /** Tamanho do vídeo (do SPS), para a tela reservar a proporção certa. */
     val tamanho: Pair<Int, Int>? = null,
+    /** Chegou áudio do sistema nesta transmissão (a tela mostra o botão de som). */
+    val temAudio: Boolean = false,
+    val mudo: Boolean = false,
 )
 
 /**
@@ -43,6 +60,8 @@ class ControladorDoPlayer(
     private val fabrica: FabricaDeDecodificador,
     private val urlDeAssistir: (Long) -> String?,
     private val relogio: () -> Long = System::nanoTime,
+    private val fabricaDeAudio: FabricaDeReprodutorDeAudio? = null,
+    private val linha: LinhaDoTempo = LinhaDoTempo(),
 ) {
     private val lock = Any()
     private val _estado = MutableStateFlow(EstadoDoPlayer())
@@ -53,6 +72,8 @@ class ControladorDoPlayer(
     private var superficie: Any? = null
     private var tamanhoDoDecodificador: Pair<Int, Int>? = null
     private val politica = PoliticaDeDecodificacao()
+    private var audio: ReprodutorDeAudioDaTransmissao? = null
+    private var mudo = false
     private var geracao = 0
 
     init {
@@ -110,15 +131,16 @@ class ControladorDoPlayer(
     }
 
     private fun aoQuadro(minha: Int, bytes: ByteArray) {
-        val q = QuadroDeVideo.decodificar(bytes) ?: return
+        val q = PacoteDeMidia.decodificar(bytes) ?: return // inválido ou de tipo desconhecido: ignora (o desktop também)
         synchronized(lock) {
             if (minha != geracao) return
             val fase = _estado.value.fase
             if (fase != FaseDoPlayer.Carregando && fase != FaseDoPlayer.AoVivo) return
+            if (!q.ehVideo) { aoAudio(q); return } // o áudio nunca passa pela fila nem pela política do vídeo
             val surf = superficie ?: return // sem onde desenhar: ignora (o próximo quadro-chave recomeça)
             if (!politica.aceitar(q.chave)) return
             if (q.chave) {
-                val dim = H264.dimensoes(q.h264)
+                val dim = H264.dimensoes(q.conteudo)
                 if (decodificador == null || (dim != null && dim != tamanhoDoDecodificador)) {
                     decodificador?.fechar()
                     val (l, a) = dim ?: (1280 to 720)
@@ -130,10 +152,23 @@ class ControladorDoPlayer(
                 }
             }
             val d = decodificador ?: return
-            if (!d.decodificar(q.h264, relogio() / 1000)) { politica.exigirChave(); return }
+            if (!d.decodificar(q.conteudo, q.ptsUs, linha.alvoNs(q.ptsUs))) { politica.exigirChave(); return }
             if (fase != FaseDoPlayer.AoVivo) atualizar { it.copy(fase = FaseDoPlayer.AoVivo, mensagem = null) }
         }
     }
+
+    /** Áudio do sistema: toca no mesmo relógio do vídeo. Qualquer falha só desliga o áudio. */
+    private fun aoAudio(q: PacoteDeMidia) {
+        val f = fabricaDeAudio ?: return
+        if (audio == null) {
+            audio = runCatching { f.criar() }.getOrNull()?.also { it.definirMudo(mudo) } ?: return
+            atualizar { it.copy(temAudio = true) }
+        }
+        runCatching { audio?.empurrar(q.conteudo, linha.alvoNs(q.ptsUs)) }.onFailure { audio?.fechar(); audio = null }
+    }
+
+    /** O botão de som do player: só mexe no áudio da transmissão (nunca no microfone nem na voz). */
+    fun definirMudo(m: Boolean) = synchronized(lock) { mudo = m; audio?.definirMudo(m); atualizar { it.copy(mudo = m) } }
 
     fun parar() = synchronized(lock) { encerrarInterno(); atualizar { EstadoDoPlayer() } }
 
@@ -141,6 +176,8 @@ class ControladorDoPlayer(
         geracao++
         runCatching { conexao?.cancelar() }; conexao = null
         decodificador?.fechar(); decodificador = null; tamanhoDoDecodificador = null
+        runCatching { audio?.fechar() }; audio = null
+        linha.reiniciar()
         politica.exigirChave()
     }
 }

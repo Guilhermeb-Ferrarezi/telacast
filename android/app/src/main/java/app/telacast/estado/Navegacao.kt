@@ -8,7 +8,7 @@ sealed interface Destino {
     data object Amigos : Destino
     data class Dm(val canal: Long) : Destino
     data class Canal(val servidor: Long, val canal: Long) : Destino
-    /** Tela de um canal de voz (participantes e botões da chamada). */
+    /** Tela de um canal de voz (participantes e botões da chamada). `servidor == 0` é uma chamada em DM individual (`canal` = canal da DM). */
     data class Voz(val servidor: Long, val canal: Long) : Destino
 }
 
@@ -81,7 +81,7 @@ data class Navegacao(
     fun irPara(d: Destino): Navegacao {
         val painel = when (d) {
             is Destino.Canal -> d.servidor
-            is Destino.Voz -> d.servidor
+            is Destino.Voz -> d.servidor.takeIf { it != 0L } // 0 = chamada em DM (o painel fica no Início)
             else -> null
         }
         return copy(destino = d, servidorNoPainel = painel, gavetaAberta = false, membrosAbertos = false, menu = null)

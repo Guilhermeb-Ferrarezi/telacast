@@ -41,7 +41,8 @@ interface OuvinteDeVideo {
 
 /** O que a captura (MediaProjection + VirtualDisplay + MediaCodec) entrega e avisa. Chamado da thread do codificador. */
 interface OuvinteDaFonte {
-    fun aoQuadro(chave: Boolean, h264: ByteArray)
+    /** `ptsUs`: relógio da transmissão em microssegundos (monotônico, começa perto de 0), o mesmo que vai no cabeçalho do pacote. */
+    fun aoQuadro(chave: Boolean, h264: ByteArray, ptsUs: Long)
     /** O vídeo mudou de tamanho (a tela girou): o codificador foi recriado e o primeiro quadro novo é um quadro-chave. */
     fun aoTamanho(largura: Int, altura: Int)
     /** A captura acabou (o sistema parou a projeção, o codificador quebrou). */
@@ -237,12 +238,16 @@ class ControladorDeTransmissao(
     // ------------------------------------------------------------------ quadros da captura
 
     private inner class OuvinteDaFonteImpl(private val minha: Int) : OuvinteDaFonte {
-        override fun aoQuadro(chave: Boolean, h264: ByteArray) {
+        override fun aoQuadro(chave: Boolean, h264: ByteArray, ptsUs: Long) {
             if (minha != geracao) return
             val c = conexao
             if (c == null || _estado.value.fase != FaseDaTransmissao.Transmitindo) { politica.exigirChave(); return }
             when (val d = politica.decidir(chave, c.pendente())) {
-                PoliticaDeEnvio.Decisao.Enviar -> if (c.enviar(QuadroDeVideo.codificar(chave, h264))) enviadosNoSegundo.incrementAndGet() else { politica.exigirChave(); pedirChave() }
+                PoliticaDeEnvio.Decisao.Enviar -> {
+                    // pacote inválido derrubaria a transmissão no servidor: nunca manda; vazio/enorme descarta e pede quadro-chave
+                    val pacote = PacoteDeMidia.codificar(if (chave) TipoDeMidia.H264Chave else TipoDeMidia.H264Delta, ptsUs, h264)
+                    if (pacote != null && c.enviar(pacote)) enviadosNoSegundo.incrementAndGet() else { politica.exigirChave(); pedirChave() }
+                }
                 is PoliticaDeEnvio.Decisao.Descartar -> if (d.pedirChave) pedirChave()
             }
         }

@@ -19,7 +19,7 @@ import kotlinx.serialization.encoding.Encoder
  * anulável com padrão `null`, `#[serde(default)]` vira valor padrão, campos desconhecidos são ignorados.
  * `u8` e `u32` viram `Int`; `u64` (`nonce`, `size`) vira `Long`.
  */
-const val PROTO_VERSION: Int = 1
+const val PROTO_VERSION: Int = 2
 
 /** Primeiro byte de um quadro binário de áudio no gateway. */
 const val VOICE_FRAME: Int = 1
@@ -126,8 +126,13 @@ data class Snapshot(
     val friends: List<Friend>,
     val dms: List<Dm>,
     val live: List<Live>,
+    /** Revisão monotônica do estado das transmissões: snapshot mais velho que o já visto chegou atrasado e é ignorado. */
+    val liveRevision: Long = 0,
     val blocked: List<User> = emptyList(),
     val voice: List<VoiceState> = emptyList(),
+    /** Tráfego de saída do servidor no mês UTC atual (`2026-11`) em bytes. */
+    val egressMonth: String = "",
+    val egressBytes: Long = 0,
 )
 
 @Serializable
