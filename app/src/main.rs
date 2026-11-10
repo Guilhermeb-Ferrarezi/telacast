@@ -850,7 +850,11 @@ impl Session {
 
     /// (nome do canal, nome do servidor) do canal de voz `ch`.
     fn voice_place(&self, ch: i64) -> Option<(String, String)> {
-        self.snap.servers.iter().find_map(|sv| sv.channels.iter().find(|c| c.id == ch).map(|c| (c.name.clone(), sv.name.clone())))
+        self.snap
+            .servers
+            .iter()
+            .find_map(|sv| sv.channels.iter().find(|c| c.id == ch).map(|c| (c.name.clone(), sv.name.clone())))
+            .or_else(|| self.snap.dms.iter().find(|dm| dm.channel_id == ch).map(|dm| ("Chamada".into(), dm.user.name.clone())))
     }
 
     /// Está falando agora? (o motor de áudio responde)
@@ -1337,6 +1341,13 @@ impl Session {
                         }
                     }
                     S2C::VoiceUpdate(st) => {
+                        let new_dm_call = st.user_id != self.me.id
+                            && self.snap.dms.iter().any(|dm| dm.channel_id == st.channel_id)
+                            && !self.voice.iter().any(|v| v.user_id == st.user_id && v.channel_id == st.channel_id);
+                        if new_dm_call {
+                            let caller = self.user_name_of(st.user_id);
+                            self.toast = Some((format!("{caller} está te ligando"), Instant::now()));
+                        }
                         self.voice.retain(|v| v.user_id != st.user_id);
                         let mine = st.user_id == self.me.id;
                         if mine && self.voice_since.is_none() {
@@ -4227,6 +4238,14 @@ impl App {
                 }
                 if small_button(ui, "Fixadas", FIELD) {
                     acts.push(if s.pins_open { Act::ClosePins } else { Act::OpenPins });
+                }
+                if !hash {
+                    let mine = s.my_voice().is_some_and(|v| v.channel_id == ch);
+                    let active = s.voice_members(ch).iter().any(|v| v.user_id != s.me.id);
+                    let label = if mine { "Abrir chamada" } else if active { "Entrar na chamada" } else { "Ligar" };
+                    if small_button(ui, label, GREEN) {
+                        acts.push(Act::JoinVoice(ch));
+                    }
                 }
             });
         });

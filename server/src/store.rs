@@ -323,12 +323,29 @@ impl Store {
         Ok(r.rows_affected() == 1)
     }
 
-    /// (servidor, tipo) de um canal de servidor; `None` se não existe.
-    pub async fn channel_server_kind(&self, channel: i64) -> R<Option<(i64, i16)>> {
-        sqlx::query_as("SELECT server_id, kind FROM channels WHERE id = $1 AND server_id IS NOT NULL")
+    /// Metadados de qualquer canal, incluindo DMs (server_id nulo).
+    pub async fn channel_kind_and_server(&self, channel: i64) -> R<Option<(Option<i64>, i16)>> {
+        sqlx::query_as("SELECT server_id, kind FROM channels WHERE id = $1")
             .bind(channel)
             .fetch_optional(&self.pool)
             .await
+    }
+
+    /// Só permite chamada em DM individual, e apenas aos dois participantes dela.
+    pub async fn is_direct_dm_member(&self, channel: i64, user: i64) -> R<bool> {
+        let (allowed,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS (
+                 SELECT 1 FROM channels c
+                 WHERE c.id = $1 AND c.kind = 10 AND c.server_id IS NULL
+                   AND (SELECT count(*) FROM channel_members cm WHERE cm.channel_id = c.id) = 2
+                   AND EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.user_id = $2)
+             )",
+        )
+        .bind(channel)
+        .bind(user)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(allowed)
     }
 
     pub async fn server_member_ids(&self, server: i64) -> R<Vec<i64>> {

@@ -172,7 +172,8 @@ struct VoiceEntry {
     /// Conexão que entrou na voz (se a sessão dela for revogada, a pessoa sai da voz).
     cid: u64,
     channel: i64,
-    server: i64,
+    /// `None` identifica uma chamada em DM direta; nesse caso a sala é só para os dois participantes.
+    server: Option<i64>,
     muted: bool,
     deafened: bool,
     tokens: f64,
@@ -255,10 +256,13 @@ impl App {
     }
 
     /// Quem está em voz nos servidores dados, ordenado por canal e usuário.
-    fn voice_in(&self, servers: &HashSet<i64>) -> Vec<p::VoiceState> {
+    fn voice_in(&self, servers: &HashSet<i64>, dms: &HashSet<i64>) -> Vec<p::VoiceState> {
         let v = self.voice.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out: Vec<p::VoiceState> =
-            v.iter().filter(|(_, e)| servers.contains(&e.server)).map(|(u, e)| e.state(*u)).collect();
+        let mut out: Vec<p::VoiceState> = v
+            .iter()
+            .filter(|(_, e)| e.server.is_some_and(|server| servers.contains(&server)) || (e.server.is_none() && dms.contains(&e.channel)))
+            .map(|(u, e)| e.state(*u))
+            .collect();
         out.sort_by_key(|s| (s.channel_id, s.user_id));
         out
     }
@@ -272,6 +276,19 @@ impl App {
                 }
             }
             Err(e) => error!("server_member_ids: {e}"),
+        }
+    }
+
+    async fn broadcast_voice(&self, channel: i64, server: Option<i64>, m: &S2C) {
+        if let Some(server) = server {
+            self.broadcast_server(server, m).await;
+        } else {
+            match self.store.participants(channel).await {
+                Ok(ids) => {
+                    for uid in ids { self.send_to(uid, m); }
+                }
+                Err(e) => error!("participantes da chamada DM {channel}: {e}"),
+            }
         }
     }
 
@@ -308,7 +325,7 @@ impl App {
             let people = self.store.participants(old.channel).await.unwrap_or_default();
             self.push_many(&people).await;
         }
-        self.broadcast_server(old.server, &S2C::VoiceLeft { user_id: uid, channel_id: old.channel }).await;
+        self.broadcast_voice(old.channel, old.server, &S2C::VoiceLeft { user_id: uid, channel_id: old.channel }).await;
     }
 
     /// Repassa um quadro de áudio de `uid` aos outros participantes do canal dele.
@@ -426,7 +443,7 @@ impl App {
                 },
             })
             .collect();
-        let dms = self
+        let dms: Vec<p::Dm> = self
             .store
             .dms_of(me)
             .await?
@@ -454,7 +471,8 @@ impl App {
 
         let me_name = self.store.display_name(me).await?.unwrap_or_default();
         let blocked = self.store.blocked_by(me).await?.into_iter().map(|(id, name)| user(id, name)).collect();
-        let voice = self.voice_in(&ids.iter().copied().collect());
+        let dm_channels: HashSet<i64> = dms.iter().map(|d| d.channel_id).collect();
+        let voice = self.voice_in(&ids.iter().copied().collect(), &dm_channels);
         Ok(p::Snapshot { me: user(me, me_name), servers, friends, dms, live, live_revision, blocked, voice,
             egress_month: self.egress_month.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             egress_bytes: self.egress_bytes.load(Ordering::Relaxed) })
@@ -562,9 +580,13 @@ impl App {
 
     async fn auth_stream(&self, token: &str, channel: i64) -> Option<i64> {
         let uid = self.store.session_user(&auth::hash_token(token)).await.ok().flatten()?;
-        let (server, kind) = self.store.channel_server_kind(channel).await.ok().flatten()?;
-        if kind != 1 || !self.store.is_member(server, uid).await.ok()? {
-            return None;
+        let (server, kind) = self.store.channel_kind_and_server(channel).await.ok().flatten()?;
+        match (server, kind) {
+            (Some(server), 1) if self.store.is_member(server, uid).await.ok()? => {}
+            (None, 10)
+                if self.store.is_direct_dm_member(channel, uid).await.ok()?
+                    && !self.store.dm_blocked(channel, uid).await.ok()? => {}
+            _ => return None,
         }
         // A permissão de membro do servidor não basta: stream exige estar na call agora.
         self.voice.lock().unwrap_or_else(|e| e.into_inner()).get(&uid).is_some_and(|v| v.channel == channel).then_some(uid)
@@ -1113,31 +1135,57 @@ async fn handle_authed(
                 err(ErrorCode::RateLimited, ERR_BUSY);
                 return true;
             }
-            let (server, kind) = match app.store.channel_server_kind(channel_id).await {
+            let (server, kind) = match app.store.channel_kind_and_server(channel_id).await {
                 Ok(Some(x)) => x,
                 Ok(None) => {
-                    err(ErrorCode::NotFound, "Canal de voz não encontrado");
+                    err(ErrorCode::NotFound, "Canal não encontrado");
                     return true;
                 }
                 Err(e) => {
-                    db_err("channel_server_kind", e);
+                    db_err("channel_kind_and_server", e);
                     return true;
                 }
             };
-            match app.store.is_member(server, me).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    err(ErrorCode::Forbidden, "Você não é membro deste servidor");
+            match (server, kind) {
+                (Some(server_id), 1) => match app.store.is_member(server_id, me).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        err(ErrorCode::Forbidden, "Você não é membro deste servidor");
+                        return true;
+                    }
+                    Err(e) => {
+                        db_err("is_member", e);
+                        return true;
+                    }
+                },
+                (None, 10) => {
+                    match app.store.is_direct_dm_member(channel_id, me).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            err(ErrorCode::Forbidden, "Esta conversa não permite chamada direta");
+                            return true;
+                        }
+                        Err(e) => {
+                            db_err("is_direct_dm_member", e);
+                            return true;
+                        }
+                    }
+                    match app.store.dm_blocked(channel_id, me).await {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            err(ErrorCode::Forbidden, "Não é possível ligar nesta conversa");
+                            return true;
+                        }
+                        Err(e) => {
+                            db_err("dm_blocked", e);
+                            return true;
+                        }
+                    }
+                }
+                _ => {
+                    err(ErrorCode::InvalidInput, "Este canal não aceita chamadas");
                     return true;
                 }
-                Err(e) => {
-                    db_err("is_member", e);
-                    return true;
-                }
-            }
-            if kind != 1 {
-                err(ErrorCode::InvalidInput, "Este canal não é de voz");
-                return true;
             }
             // um canal por vez: entrar noutro move (mantém mudo/surdo). Entrar no mesmo só reenvia o estado.
             let (old, state) = {
@@ -1153,7 +1201,7 @@ async fn handle_authed(
             if let Some(old) = old.filter(|entry| entry.channel != channel_id) {
                 app.voice_left(me, &old).await;
             }
-            app.broadcast_server(server, &S2C::VoiceUpdate(state)).await;
+            app.broadcast_voice(channel_id, server, &S2C::VoiceUpdate(state)).await;
         }
         C2S::VoiceLeave => {
             if let Some(old) = app.voice_take(me) {
@@ -1173,13 +1221,13 @@ async fn handle_authed(
                     Some(e) if (e.muted, e.deafened) != (muted, deafened) => {
                         e.muted = muted;
                         e.deafened = deafened;
-                        Some((e.server, e.state(me)))
+                        Some((e.channel, e.server, e.state(me)))
                     }
                     _ => None,
                 }
             };
-            if let Some((server, state)) = changed {
-                app.broadcast_server(server, &S2C::VoiceUpdate(state)).await;
+            if let Some((channel, server, state)) = changed {
+                app.broadcast_voice(channel, server, &S2C::VoiceUpdate(state)).await;
             }
         }
         C2S::ListSessions => send_sessions(app, tx, me, token_hash).await,
