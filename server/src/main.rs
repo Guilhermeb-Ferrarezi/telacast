@@ -33,7 +33,7 @@ use telacast_proto as p;
 use tokio::sync::{
     broadcast,
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    Semaphore,
+    watch, Semaphore,
 };
 use tracing::{error, info, warn};
 
@@ -127,11 +127,13 @@ impl Drop for ViewerGuard {
 }
 
 struct Room {
+    id: u64,
     tx: broadcast::Sender<Bytes>,
     /// Último quadro-chave: novos espectadores começam por ele.
     key: Option<Bytes>,
     channel: i64,
     user: i64,
+    stop: watch::Sender<bool>,
 }
 
 struct App {
@@ -140,8 +142,8 @@ struct App {
     conns: Mutex<HashMap<i64, Vec<(u64, Tx)>>>,
     rooms: Mutex<HashMap<i64, Room>>,
     live_revision: AtomicU64,
-    /// Espectadores de cada transmissão: (id da conexão de vídeo, usuário).
-    viewers: Mutex<HashMap<i64, Vec<(u64, i64)>>>,
+    /// Espectadores de cada transmissão: (id da conexão de vídeo, usuário, cancelamento).
+    viewers: Mutex<HashMap<i64, Vec<(u64, i64, watch::Sender<bool>)>>>,
     next: AtomicU64,
     /// Limita quantos hashes de senha rodam ao mesmo tempo (cada um usa ~19 MiB e CPU).
     hash_sem: Semaphore,
@@ -163,6 +165,7 @@ struct App {
 }
 
 /// Estado de voz de um usuário no servidor, mais o balde de fichas que limita os quadros dele.
+#[derive(Clone)]
 struct VoiceEntry {
     /// Conexão que entrou na voz (se a sessão dela for revogada, a pessoa sai da voz).
     cid: u64,
@@ -200,20 +203,20 @@ impl App {
     }
 
     /// Registra um espectador. `false` se a transmissão já está no limite.
-    fn viewers_add(&self, channel: i64, vid: u64, uid: i64) -> bool {
+    fn viewers_add(&self, channel: i64, vid: u64, uid: i64, stop: watch::Sender<bool>) -> bool {
         let mut m = self.viewers.lock().unwrap_or_else(|e| e.into_inner());
         let v = m.entry(channel).or_default();
         if v.len() >= MAX_VIEWERS {
             return false;
         }
-        v.push((vid, uid));
+        v.push((vid, uid, stop));
         true
     }
 
     fn viewers_remove(&self, channel: i64, vid: u64) {
         let mut m = self.viewers.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(v) = m.get_mut(&channel) {
-            v.retain(|(i, _)| *i != vid);
+            v.retain(|(i, _, _)| *i != vid);
             if v.is_empty() {
                 m.remove(&channel);
             }
@@ -223,7 +226,7 @@ impl App {
     /// Manda a lista de espectadores (sem repetir pessoa) ao transmissor e a cada espectador.
     fn viewers_notify(&self, channel: i64) {
         let mut users: Vec<i64> = Vec::new();
-        for (_, u) in self.viewers.lock().unwrap_or_else(|e| e.into_inner()).get(&channel).into_iter().flatten() {
+        for (_, u, _) in self.viewers.lock().unwrap_or_else(|e| e.into_inner()).get(&channel).into_iter().flatten() {
             if !users.contains(u) {
                 users.push(*u);
             }
@@ -276,6 +279,33 @@ impl App {
     }
 
     async fn voice_left(&self, uid: i64, old: &VoiceEntry) {
+        let viewer_stops: Vec<_> = self
+            .viewers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&old.channel)
+            .into_iter()
+            .flatten()
+            .filter(|(_, viewer_uid, _)| *viewer_uid == uid)
+            .map(|(_, _, stop)| stop.clone())
+            .collect();
+        for stop in viewer_stops {
+            let _ = stop.send(true);
+        }
+        let room = {
+            let mut rooms = self.rooms.lock().unwrap_or_else(|e| e.into_inner());
+            if rooms.get(&old.channel).is_some_and(|room| room.user == uid) {
+                rooms.remove(&old.channel)
+            } else {
+                None
+            }
+        };
+        if let Some(room) = room {
+            let _ = room.stop.send(true);
+            self.live_revision.fetch_add(1, Ordering::Relaxed);
+            let people = self.store.participants(old.channel).await.unwrap_or_default();
+            self.push_many(&people).await;
+        }
         self.broadcast_server(old.server, &S2C::VoiceLeft { user_id: uid, channel_id: old.channel }).await;
     }
 
@@ -526,12 +556,12 @@ impl App {
 
     async fn auth_stream(&self, token: &str, channel: i64) -> Option<i64> {
         let uid = self.store.session_user(&auth::hash_token(token)).await.ok().flatten()?;
-        if self.store.can_access(channel, uid).await.ok()? {
-            return Some(uid);
+        let (server, kind) = self.store.channel_server_kind(channel).await.ok().flatten()?;
+        if kind != 1 || !self.store.is_member(server, uid).await.ok()? {
+            return None;
         }
-        // canal de voz: transmite e assiste quem está nele agora (como no Discord)
-        let in_voice = self.voice.lock().unwrap_or_else(|e| e.into_inner()).get(&uid).is_some_and(|v| v.channel == channel);
-        in_voice.then_some(uid)
+        // A permissão de membro do servidor não basta: stream exige estar na call agora.
+        self.voice.lock().unwrap_or_else(|e| e.into_inner()).get(&uid).is_some_and(|v| v.channel == channel).then_some(uid)
     }
 }
 
@@ -1077,16 +1107,16 @@ async fn handle_authed(
             // um canal por vez: entrar noutro move (mantém mudo/surdo). Entrar no mesmo só reenvia o estado.
             let (old, state) = {
                 let mut v = app.voice.lock().unwrap_or_else(|e| e.into_inner());
-                let old = v.get(&me).map(|e| (e.channel, e.server));
-                if old.is_none_or(|(c, _)| c != channel_id) {
+                let old = v.get(&me).cloned();
+                if old.as_ref().is_none_or(|entry| entry.channel != channel_id) {
                     let (muted, deafened) = v.get(&me).map(|e| (e.muted, e.deafened)).unwrap_or((false, false));
                     v.insert(me, VoiceEntry { cid, channel: channel_id, server, muted, deafened, tokens: VOICE_BURST, last: Instant::now() });
                 }
                 (old, v.get(&me).map(|e| e.state(me)))
             };
             let Some(state) = state else { return true };
-            if let Some((old_channel, old_server)) = old.filter(|(c, _)| *c != channel_id) {
-                app.broadcast_server(old_server, &S2C::VoiceLeft { user_id: me, channel_id: old_channel }).await;
+            if let Some(old) = old.filter(|entry| entry.channel != channel_id) {
+                app.voice_left(me, &old).await;
             }
             app.broadcast_server(server, &S2C::VoiceUpdate(state)).await;
         }
@@ -1612,13 +1642,15 @@ async fn publish(
 }
 
 async fn run_publisher(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<App>) {
+    let room_id = app.next.fetch_add(1, Ordering::Relaxed);
+    let (stop_tx, mut stop_rx) = watch::channel(false);
     let tx = {
         let mut rooms = app.rooms.lock().unwrap_or_else(|e| e.into_inner());
         if rooms.contains_key(&channel) {
             None
         } else {
             let (tx, _) = broadcast::channel(16);
-            rooms.insert(channel, Room { tx: tx.clone(), key: None, channel, user: uid });
+            rooms.insert(channel, Room { id: room_id, tx: tx.clone(), key: None, channel, user: uid, stop: stop_tx });
             app.live_revision.fetch_add(1, Ordering::Relaxed);
             Some(tx)
         }
@@ -1631,21 +1663,32 @@ async fn run_publisher(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<A
     app.push_many(&people).await;
     info!("[canal {channel}] transmissão iniciada por {uid}");
 
-    while let Some(Ok(msg)) = socket.recv().await {
-        if let Message::Binary(data) = msg {
-            let Ok(packet) = p::parse_media_packet(&data) else {
-                warn!("[canal {channel}] pacote de mídia inválido do publicador {uid}");
-                break;
-            };
-            if packet.kind == p::MediaKind::H264Keyframe {
-                if let Some(room) = app.rooms.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&channel) {
-                    room.key = Some(data.clone());
+    loop {
+        tokio::select! {
+            _ = stop_rx.changed() => break,
+            incoming = socket.recv() => {
+                let Some(Ok(msg)) = incoming else { break };
+                if let Message::Binary(data) = msg {
+                    let Ok(packet) = p::parse_media_packet(&data) else {
+                        warn!("[canal {channel}] pacote de mídia inválido do publicador {uid}");
+                        break;
+                    };
+                    if packet.kind == p::MediaKind::H264Keyframe {
+                        if let Some(room) = app.rooms.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&channel) {
+                            if room.id == room_id {
+                                room.key = Some(data.clone());
+                            }
+                        }
+                    }
+                    let _ = tx.send(data); // sem espectadores: erro ignorado
                 }
             }
-            let _ = tx.send(data); // sem espectadores: erro ignorado
         }
     }
-    let removed = app.rooms.lock().unwrap_or_else(|e| e.into_inner()).remove(&channel); // encerra os espectadores
+    let removed = {
+        let mut rooms = app.rooms.lock().unwrap_or_else(|e| e.into_inner());
+        if rooms.get(&channel).is_some_and(|room| room.id == room_id) { rooms.remove(&channel) } else { None }
+    };
     if removed.is_some() {
         app.live_revision.fetch_add(1, Ordering::Relaxed);
     }
@@ -1668,15 +1711,26 @@ async fn watch(
 async fn run_viewer(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<App>) {
     let found = {
         let rooms = app.rooms.lock().unwrap_or_else(|e| e.into_inner());
-        rooms.get(&channel).map(|r| (r.tx.subscribe(), r.key.clone()))
+        rooms.get(&channel).map(|r| (r.tx.subscribe(), r.key.clone(), r.stop.subscribe()))
     };
-    let Some((mut rx, key)) = found else {
+    let Some((mut rx, key, mut stop_rx)) = found else {
         let _ = socket.send(Message::Text("ninguém está transmitindo neste canal".into())).await;
         return;
     };
     let vid = app.next.fetch_add(1, Ordering::Relaxed);
-    if !app.viewers_add(channel, vid, uid) {
-        let _ = socket.send(Message::Text("Esta transmissão está com o máximo de espectadores.".into())).await;
+    let (viewer_stop, mut viewer_stop_rx) = watch::channel(false);
+    // Fechar a corrida entre auth_stream e VoiceLeave: registre o espectador sob
+    // o mesmo lock que protege a presença na call para o leave conseguir cancelá-lo.
+    let registered = {
+        let voice = app.voice.lock().unwrap_or_else(|e| e.into_inner());
+        if voice.get(&uid).is_some_and(|entry| entry.channel == channel) {
+            app.viewers_add(channel, vid, uid, viewer_stop)
+        } else {
+            false
+        }
+    };
+    if !registered {
+        let _ = socket.send(Message::Text("Você precisa estar na call para assistir à transmissão.".into())).await;
         return;
     }
     let _guard = ViewerGuard { app: app.clone(), channel, vid };
@@ -1689,6 +1743,8 @@ async fn run_viewer(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<App>
     }
     loop {
         tokio::select! {
+            _ = stop_rx.changed() => return,
+            _ = viewer_stop_rx.changed() => return,
             frame = rx.recv() => match frame {
                 Ok(data) => {
                     if need_key {

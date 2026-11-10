@@ -125,7 +125,6 @@ struct GoLive {
     res: Option<u32>,
     /// 0 personalizado, 1 fluidez, 2 nitidez.
     preset: u8,
-    advanced: bool,
     share_system_audio: bool,
     audio_outputs: Vec<system_audio::AudioOutput>,
     audio_output: Option<String>,
@@ -146,7 +145,6 @@ impl GoLive {
             source: None,
             res: Some(1080),
             preset: 1,
-            advanced: false,
             share_system_audio: false,
             audio_outputs,
             audio_output,
@@ -1653,6 +1651,21 @@ impl eframe::App for App {
                     self.logout(&why);
                     self.login_ui(ui, &ctx);
                 } else {
+                    let publish_call_lost = self.publishing.as_ref().is_some_and(|(channel, _)| {
+                        !s.voice.iter().any(|v| v.user_id == s.me.id && v.channel_id == *channel)
+                    });
+                    let watch_call_lost = self.watching.as_ref().is_some_and(|(channel, _)| {
+                        !s.voice.iter().any(|v| v.user_id == s.me.id && v.channel_id == *channel)
+                    });
+                    let watched_stream_ended = self.watching.as_ref().is_some_and(|(channel, _)| {
+                        !s.snap.live.iter().any(|live| live.channel_id == *channel)
+                    });
+                    if publish_call_lost { self.stop_publish(); }
+                    if watch_call_lost || watched_stream_ended {
+                        self.stop_watch();
+                        self.fullscreen = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    }
                     let keep = self.session_ui(ui, &ctx, &mut s);
                     if keep {
                         self.session = Some(s);
@@ -2771,6 +2784,10 @@ impl App {
                 Act::LeaveVoice => {
                     s.gw.send(C2S::VoiceLeave);
                     s.voice_view = false;
+                    self.stop_publish();
+                    self.stop_watch();
+                    self.fullscreen = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                 }
                 Act::ToggleMute => {
                     if s.voice_deaf {
@@ -5153,6 +5170,9 @@ impl App {
             }
         }
         let st = h.status.lock().unwrap().clone();
+        if st == "desconectado" || st.starts_with("erro:") {
+            self.texture = None;
+        }
         let size = if full {
             ui.available_size()
         } else {
@@ -5557,160 +5577,121 @@ impl App {
                 let mut go_stop = false;
                 let gl = &mut self.golive;
                 let fps = &mut self.fps;
-                modal(ctx, "Transmitir", 540.0, &mut dismissed, |ui| {
-                    ui.set_width(500.0);
-                    ui.label(RichText::new("Compartilhar uma tela ou janela").size(12.0).color(MUTED));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut gl.tab, 0, "Telas");
-                        ui.selectable_value(&mut gl.tab, 1, "Janelas");
-                    });
-                    ui.add_space(6.0);
-                    egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(12.0, 8.0);
-                        let want_window = gl.tab == 1;
-                        let shown: Vec<usize> = (0..gl.items.len()).filter(|i| matches!(gl.items[*i].info.source, capture::Source::Window(_)) == want_window).collect();
-                        if shown.is_empty() {
-                            ui.label(RichText::new(if gl.busy || gl.items.is_empty() { "Procurando…" } else { "Nenhuma janela aberta para compartilhar." }).color(MUTED));
-                        }
-                        ui.horizontal_wrapped(|ui| {
-                            for i in shown {
-                                let (info, tex) = (&gl.items[i].info, &gl.items[i].tex);
-                                ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 4.0;
-                                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(156.0, 88.0), egui::Sense::click());
-                                    match tex {
-                                        Some(t) => {
-                                            egui::Image::new(t).corner_radius(egui::CornerRadius::same(6)).paint_at(ui, rect);
-                                        }
-                                        None => {
-                                            ui.painter().rect_filled(rect, 6.0, L2);
-                                        }
-                                    }
-                                    let sel = gl.source.as_ref() == Some(&info.source);
-                                    ui.painter().rect_stroke(
-                                        rect,
-                                        6.0,
-                                        egui::Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { AMBER } else if resp.hovered() { LINE2 } else { LINE }),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                    if resp.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    if resp.clicked() {
-                                        gl.source = Some(info.source.clone());
-                                    }
-                                    let cap = match &info.source {
-                                        capture::Source::Monitor(n) if info.title.is_empty() => format!("Tela {}", n + 1),
-                                        _ => info.title.clone(),
-                                    };
-                                    ui.add_sized([156.0, 14.0], egui::Label::new(RichText::new(cap).size(12.0).color(if sel { TEXT } else { MUTED })).truncate());
-                                });
-                            }
-                        });
-                    });
-                    ui.add_space(8.0);
-                    if !place.is_empty() {
-                        ui.label(caps("CANAL DE TRANSMISSÃO"));
-                        ui.label(RichText::new(&place).size(13.0).color(TEXT2));
-                        ui.add_space(6.0);
-                    }
-                    ui.label(caps("QUALIDADE DA TRANSMISSÃO"));
-                    let src_h = gl.selected().map(|i| i.height).unwrap_or(0);
-                    // a escolha anterior era maior que esta tela: usa a resolução da própria fonte
-                    if matches!(gl.res, Some(v) if src_h > 0 && v > src_h) {
-                        gl.res = None;
-                    }
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        if ui.selectable_label(gl.preset == 1, "Fluidez").clicked() {
-                            gl.preset = 1;
-                            gl.res = Some(if src_h > 0 { src_h.min(1080) } else { 1080 });
-                            *fps = 60;
-                            gl.kbps = None;
-                        }
-                        if ui.selectable_label(gl.preset == 2, "Nitidez").clicked() {
-                            gl.preset = 2;
-                            gl.res = None;
-                            *fps = 15;
-                            gl.kbps = None;
-                        }
-                        if gl.preset == 0 {
-                            ui.label(RichText::new("Personalizado").size(12.5).color(AMBER));
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Resolução").size(12.5).color(TEXT2));
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        for (h, label) in [(Some(480u32), "480p"), (Some(720), "720p"), (Some(1080), "1080p"), (Some(1440), "1440p"), (None, "Fonte")] {
-                            // não faz sentido ampliar além da tela
-                            let too_big = matches!(h, Some(v) if src_h > 0 && v > src_h);
-                            let r = ui.add_enabled(!too_big, egui::Button::selectable(gl.res == h, label));
-                            if r.clicked() {
-                                gl.res = h;
-                                gl.preset = 0;
-                                gl.kbps = None;
-                            }
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Taxa de quadros").size(12.5).color(TEXT2));
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        let rates: &[u32] = if gl.advanced { &[15, 30, 60, 90, 120, 144] } else { &[15, 30, 60] };
-                        for f in rates {
-                            if ui.add(egui::Button::selectable(*fps == *f, format!("{f} FPS"))).clicked() {
-                                *fps = *f;
-                                gl.preset = 0;
-                                gl.kbps = None;
-                            }
-                        }
-                    });
-                    ui.add_space(6.0);
-                    match gl.selected() {
-                        Some(info) => {
-                            let q = gl.quality(info, *fps);
-                            ui.label(RichText::new(publisher::describe(info.width, info.height, &q)).monospace().size(11.5).color(MUTED));
-                        }
-                        None => {
-                            ui.label(RichText::new("Escolha uma tela ou janela.").size(11.5).color(MUTED));
-                        }
-                    }
-                    ui.add_space(6.0);
-                    ui.checkbox(&mut gl.share_system_audio, "Compartilhar áudio do sistema");
-                    if gl.share_system_audio {
-                        ui.label(RichText::new(system_audio::capture_note()).size(11.0).color(MUTED));
-                        if gl.audio_outputs.is_empty() {
-                            ui.label(RichText::new(system_audio::unavailable_hint()).size(11.0).color(MUTED));
-                        } else {
-                            let selected = gl.audio_outputs.iter().find(|o| Some(&o.id) == gl.audio_output.as_ref()).map(|o| o.name.as_str()).unwrap_or("Saída de áudio");
-                            egui::ComboBox::from_id_salt("golive-audio-output")
-                                .selected_text(selected)
-                                .width(280.0)
-                                .show_ui(ui, |ui| {
-                                    for output in &gl.audio_outputs {
-                                        ui.selectable_value(&mut gl.audio_output, Some(output.id.clone()), &output.name);
+                modal(ctx, "Transmitir", 790.0, &mut dismissed, |ui| {
+                    ui.set_width(750.0);
+                    ui.label(RichText::new("Escolha o que compartilhar e ajuste a transmissão.").size(12.5).color(MUTED));
+                    ui.add_space(12.0);
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(392.0);
+                            ui.label(caps("FONTE"));
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut gl.tab, 0, "Telas");
+                                ui.selectable_value(&mut gl.tab, 1, "Janelas");
+                            });
+                            ui.add_space(6.0);
+                            egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true]).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+                                let want_window = gl.tab == 1;
+                                let shown: Vec<usize> = (0..gl.items.len()).filter(|i| matches!(gl.items[*i].info.source, capture::Source::Window(_)) == want_window).collect();
+                                if shown.is_empty() {
+                                    ui.label(RichText::new(if gl.busy || gl.items.is_empty() { "Procurando fontes…" } else { "Nenhuma janela aberta para compartilhar." }).color(MUTED));
+                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    for i in shown {
+                                        let (info, tex) = (&gl.items[i].info, &gl.items[i].tex);
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 5.0;
+                                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(176.0, 108.0), egui::Sense::click());
+                                            if let Some(t) = tex { egui::Image::new(t).corner_radius(egui::CornerRadius::same(7)).paint_at(ui, rect); }
+                                            else { ui.painter().rect_filled(rect, 7.0, L2); }
+                                            let sel = gl.source.as_ref() == Some(&info.source);
+                                            ui.painter().rect_stroke(rect, 7.0, egui::Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { AMBER } else if resp.hovered() { LINE2 } else { LINE }), egui::StrokeKind::Inside);
+                                            if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                                            if resp.clicked() { gl.source = Some(info.source.clone()); }
+                                            let cap = match &info.source {
+                                                capture::Source::Monitor(n) if info.title.is_empty() => format!("Tela {}", n + 1),
+                                                _ => info.title.clone(),
+                                            };
+                                            ui.add_sized([176.0, 16.0], egui::Label::new(RichText::new(cap).size(12.0).color(if sel { TEXT } else { MUTED })).truncate());
+                                        });
                                     }
                                 });
-                        }
-                    }
-                    ui.add_space(4.0);
-                    egui::CollapsingHeader::new("Avançado").default_open(gl.advanced).show(ui, |ui| {
-                        gl.advanced = true;
-                        let auto = gl.selected().map(|i| publisher::suggested_kbps(publisher::output_size(i.width, i.height, gl.res).1, *fps)).unwrap_or(8000);
-                        let mut mbps = gl.kbps.unwrap_or(auto) as f32 / 1000.0;
-                        ui.horizontal(|ui| {
-                            if ui.add(egui::Slider::new(&mut mbps, 1.0..=40.0).suffix(" Mbps")).changed() {
-                                gl.kbps = Some((mbps * 1000.0) as u32);
-                                gl.preset = 0;
+                            });
+                        });
+                        ui.add_space(18.0);
+                        ui.separator();
+                        ui.add_space(16.0);
+                        ui.vertical(|ui| {
+                            ui.set_width(325.0);
+                            if !place.is_empty() {
+                                ui.label(caps("DESTINO"));
+                                ui.label(RichText::new(&place).size(13.0).color(TEXT2));
+                                ui.add_space(12.0);
                             }
-                            if gl.kbps.is_some() && small_button(ui, "Automático", FIELD) {
-                                gl.kbps = None;
+                            ui.label(caps("QUALIDADE"));
+                            ui.add_space(5.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                if ui.selectable_label(gl.preset == 1, "Fluidez").clicked() {
+                                    gl.preset = 1;
+                                    let h = gl.selected().map(|i| i.height).unwrap_or(1080);
+                                    gl.res = Some(h.min(1080));
+                                    *fps = 60;
+                                    gl.kbps = None;
+                                }
+                                if ui.selectable_label(gl.preset == 2, "Nitidez").clicked() {
+                                    gl.preset = 2; gl.res = None; *fps = 15; gl.kbps = None;
+                                }
+                                if gl.preset == 0 { ui.label(RichText::new("Personalizado").size(12.5).color(AMBER)); }
+                            });
+                            let src_h = gl.selected().map(|i| i.height).unwrap_or(0);
+                            if matches!(gl.res, Some(v) if src_h > 0 && v > src_h) { gl.res = None; }
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("Resolução").size(12.5).color(TEXT2));
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(5.0, 4.0);
+                                for (h, label) in [(Some(480u32), "480p"), (Some(720), "720p"), (Some(1080), "1080p"), (Some(1440), "1440p"), (None, "Fonte")] {
+                                    let too_big = matches!(h, Some(v) if src_h > 0 && v > src_h);
+                                    if ui.add_enabled(!too_big, egui::Button::selectable(gl.res == h, label)).clicked() { gl.res = h; gl.preset = 0; gl.kbps = None; }
+                                }
+                            });
+                            ui.add_space(7.0);
+                            ui.label(RichText::new("Taxa de quadros").size(12.5).color(TEXT2));
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(5.0, 4.0);
+                                for f in [15, 30, 60, 90, 120, 144] {
+                                    if ui.add(egui::Button::selectable(*fps == f, format!("{f} FPS"))).clicked() { *fps = f; gl.preset = 0; gl.kbps = None; }
+                                }
+                            });
+                            ui.add_space(6.0);
+                            if let Some(info) = gl.selected() {
+                                let q = gl.quality(info, *fps);
+                                ui.label(RichText::new(publisher::describe(info.width, info.height, &q)).monospace().size(11.0).color(MUTED));
+                            } else { ui.label(RichText::new("Selecione uma fonte para ver a qualidade.").size(11.0).color(MUTED)); }
+                            ui.add_space(10.0);
+                            ui.label(caps("ÁUDIO E BITRATE"));
+                            ui.checkbox(&mut gl.share_system_audio, "Compartilhar áudio do sistema");
+                            if gl.share_system_audio {
+                                ui.label(RichText::new(system_audio::capture_note()).size(10.5).color(MUTED));
+                                if gl.audio_outputs.is_empty() { ui.label(RichText::new(system_audio::unavailable_hint()).size(10.5).color(MUTED)); }
+                                else {
+                                    let selected = gl.audio_outputs.iter().find(|o| Some(&o.id) == gl.audio_output.as_ref()).map(|o| o.name.as_str()).unwrap_or("Saída de áudio");
+                                    egui::ComboBox::from_id_salt("golive-audio-output").selected_text(selected).width(290.0).show_ui(ui, |ui| {
+                                        for output in &gl.audio_outputs { ui.selectable_value(&mut gl.audio_output, Some(output.id.clone()), &output.name); }
+                                    });
+                                }
                             }
+                            let auto = gl.selected().map(|i| publisher::suggested_kbps(publisher::output_size(i.width, i.height, gl.res).1, *fps)).unwrap_or(8000);
+                            let mut mbps = gl.kbps.unwrap_or(auto) as f32 / 1000.0;
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Bitrate").size(12.0).color(TEXT2));
+                                if ui.add(egui::Slider::new(&mut mbps, 1.0..=40.0).suffix(" Mbps")).changed() { gl.kbps = Some((mbps * 1000.0) as u32); gl.preset = 0; }
+                                if gl.kbps.is_some() && small_button(ui, "Auto", FIELD) { gl.kbps = None; }
+                            });
                         });
                     });
-                    ui.add_space(10.0);
+                    ui.add_space(14.0);
                     ui.horizontal(|ui| {
                         if small_button(ui, "Cancelar", FIELD) {
                             close = true;

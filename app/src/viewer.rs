@@ -28,6 +28,8 @@ pub fn start(url: String, ctx: Context) -> Handle {
             Ok(()) => "desconectado".to_string(),
             Err(e) => format!("erro: {e:#}"),
         };
+        // Não mantenha o último quadro visível depois que a call ou stream termina.
+        *f.lock().unwrap() = None;
         *st.lock().unwrap() = msg;
         ctx.request_repaint();
     });
