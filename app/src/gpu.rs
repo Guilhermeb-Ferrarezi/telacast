@@ -67,7 +67,9 @@ mod real {
             )
             .map_err(init)?;
         let cfg = &mut preset.presetCfg;
-        let gop = fps * 2;
+        // Um GOP de 1 s limita quanto tempo um espectador atrasado precisa
+        // esperar antes de descartar o buffer e voltar ao quadro ao vivo.
+        let gop = fps;
         cfg.gopLength = gop;
         cfg.frameIntervalP = 1; // sem quadros B: latência mínima
         let bps = kbps * 1000;

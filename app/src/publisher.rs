@@ -338,7 +338,7 @@ fn run(
             let cfg = EncoderConfig::new()
                 .bitrate(BitRate::from_bps(kbps * 1000))
                 .max_frame_rate(FrameRate::from_hz(fps as f32))
-                .intra_frame_period(IntraFramePeriod::from_num_frames(fps * 2))
+                .intra_frame_period(IntraFramePeriod::from_num_frames(fps))
                 .usage_type(UsageType::ScreenContentRealTime)
                 .num_threads(4);
             let mut enc = Encoder::with_api_config(OpenH264API::from_source(), cfg)?;

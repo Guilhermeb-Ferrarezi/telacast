@@ -2,7 +2,7 @@
 use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, FromSample, Sample, SampleFormat, SizedSample};
 use opus::{Channels, Decoder};
 use rtrb::{Consumer, Producer, RingBuffer};
-use std::{sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc}, time::Instant};
+use std::{sync::{atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}, Arc}, time::Instant};
 
 const RATE: u32 = 48_000;
 const QUEUE_FRAMES: usize = 12_000; // 250 ms de PCM estéreo
@@ -22,7 +22,7 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new(muted: Arc<AtomicBool>, anchor: Instant, base_pts: u64) -> Result<Self, String> {
+    pub fn new(muted: Arc<AtomicBool>, volume: Arc<AtomicU32>, anchor: Instant, base_pts: u64) -> Result<Self, String> {
         let device = cpal::default_host().default_output_device().ok_or("nenhuma saída de áudio disponível")?;
         let supported = device.default_output_config().map_err(|e| format!("saída de áudio: {e}"))?;
         let config = supported.config();
@@ -31,17 +31,17 @@ impl Player {
         let (prod, cons) = RingBuffer::<[f32; 2]>::new(QUEUE_FRAMES);
         let play_after_us = Arc::new(AtomicU64::new(u64::MAX));
         let stream = match supported.sample_format() {
-            SampleFormat::F32 => build_stream::<f32>(&device, &config, cons, muted.clone(), play_after_us.clone(), anchor, channels, rate),
-            SampleFormat::F64 => build_stream::<f64>(&device, &config, cons, muted.clone(), play_after_us.clone(), anchor, channels, rate),
-            SampleFormat::I8 => build_stream::<i8>(&device, &config, cons, muted.clone(), play_after_us.clone(), anchor, channels, rate),
-            SampleFormat::I16 => build_stream::<i16>(&device, &config, cons, muted.clone(), play_after_us.clone(), anchor, channels, rate),
-            SampleFormat::I24 => build_stream::<cpal::I24>(&device, &config, cons, muted.clone(), play_after_us.clone(), anchor, channels, rate),
-            SampleFormat::I32 => build_stream::<i32>(&device, &config, cons, muted.clone(), play_after_us.clone(), anchor, channels, rate),
-            SampleFormat::I64 => build_stream::<i64>(&device, &config, cons, muted.clone(), play_after_us.clone(), anchor, channels, rate),
-            SampleFormat::U8 => build_stream::<u8>(&device, &config, cons, muted.clone(), play_after_us.clone(), anchor, channels, rate),
-            SampleFormat::U16 => build_stream::<u16>(&device, &config, cons, muted.clone(), play_after_us.clone(), anchor, channels, rate),
-            SampleFormat::U32 => build_stream::<u32>(&device, &config, cons, muted.clone(), play_after_us.clone(), anchor, channels, rate),
-            SampleFormat::U64 => build_stream::<u64>(&device, &config, cons, muted.clone(), play_after_us.clone(), anchor, channels, rate),
+            SampleFormat::F32 => build_stream::<f32>(&device, &config, cons, muted.clone(), volume.clone(), play_after_us.clone(), anchor, channels, rate),
+            SampleFormat::F64 => build_stream::<f64>(&device, &config, cons, muted.clone(), volume.clone(), play_after_us.clone(), anchor, channels, rate),
+            SampleFormat::I8 => build_stream::<i8>(&device, &config, cons, muted.clone(), volume.clone(), play_after_us.clone(), anchor, channels, rate),
+            SampleFormat::I16 => build_stream::<i16>(&device, &config, cons, muted.clone(), volume.clone(), play_after_us.clone(), anchor, channels, rate),
+            SampleFormat::I24 => build_stream::<cpal::I24>(&device, &config, cons, muted.clone(), volume.clone(), play_after_us.clone(), anchor, channels, rate),
+            SampleFormat::I32 => build_stream::<i32>(&device, &config, cons, muted.clone(), volume.clone(), play_after_us.clone(), anchor, channels, rate),
+            SampleFormat::I64 => build_stream::<i64>(&device, &config, cons, muted.clone(), volume.clone(), play_after_us.clone(), anchor, channels, rate),
+            SampleFormat::U8 => build_stream::<u8>(&device, &config, cons, muted.clone(), volume.clone(), play_after_us.clone(), anchor, channels, rate),
+            SampleFormat::U16 => build_stream::<u16>(&device, &config, cons, muted.clone(), volume.clone(), play_after_us.clone(), anchor, channels, rate),
+            SampleFormat::U32 => build_stream::<u32>(&device, &config, cons, muted.clone(), volume.clone(), play_after_us.clone(), anchor, channels, rate),
+            SampleFormat::U64 => build_stream::<u64>(&device, &config, cons, muted.clone(), volume.clone(), play_after_us.clone(), anchor, channels, rate),
             other => return Err(format!("formato de saída não suportado: {other:?}")),
         }?;
         stream.play().map_err(|e| format!("início da saída de áudio: {e}"))?;
@@ -86,6 +86,7 @@ impl Player {
 struct Resampler {
     consumer: Consumer<[f32; 2]>,
     muted: Arc<AtomicBool>,
+    volume: Arc<AtomicU32>,
     play_after_us: Arc<AtomicU64>,
     anchor: Instant,
     channels: usize,
@@ -133,7 +134,8 @@ impl Resampler {
             }
             let left = self.current[0] + (self.next[0] - self.current[0]) * self.phase;
             let right = self.current[1] + (self.next[1] - self.current[1]) * self.phase;
-            let stereo = [left.clamp(-1.0, 1.0), right.clamp(-1.0, 1.0)];
+            let gain = self.volume.load(Ordering::Relaxed).min(100) as f32 / 100.0;
+            let stereo = [(left * gain).clamp(-1.0, 1.0), (right * gain).clamp(-1.0, 1.0)];
             for (i, sample) in frame.iter_mut().enumerate() {
                 let value = match i { 0 => stereo[0], 1 => stereo[1], _ => 0.0 };
                 *sample = T::from_sample(value);
@@ -148,6 +150,7 @@ fn build_stream<T: SizedSample + FromSample<f32>>(
     config: &cpal::StreamConfig,
     consumer: Consumer<[f32; 2]>,
     muted: Arc<AtomicBool>,
+    volume: Arc<AtomicU32>,
     play_after_us: Arc<AtomicU64>,
     anchor: Instant,
     channels: usize,
@@ -157,6 +160,7 @@ fn build_stream<T: SizedSample + FromSample<f32>>(
     let mut resampler = Resampler {
         consumer,
         muted,
+        volume,
         play_after_us,
         anchor,
         channels,
