@@ -1646,9 +1646,16 @@ async fn run_publisher(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<A
     let (stop_tx, mut stop_rx) = watch::channel(false);
     let tx = {
         let mut rooms = app.rooms.lock().unwrap_or_else(|e| e.into_inner());
-        if rooms.contains_key(&channel) {
+        // Reaplicar as configurações abre o novo WebSocket antes de o handler
+        // antigo terminar de limpar a sala. Permita a troca somente pelo mesmo
+        // usuário e sinalize o publicador anterior para encerrar; o `room_id`
+        // impede que a limpeza antiga remova esta sala nova.
+        if rooms.get(&channel).is_some_and(|room| room.user != uid) {
             None
         } else {
+            if let Some(previous) = rooms.remove(&channel) {
+                let _ = previous.stop.send(true);
+            }
             let (tx, _) = broadcast::channel(16);
             rooms.insert(channel, Room { id: room_id, tx: tx.clone(), key: None, channel, user: uid, stop: stop_tx });
             app.live_revision.fetch_add(1, Ordering::Relaxed);
