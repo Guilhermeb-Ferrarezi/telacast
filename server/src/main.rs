@@ -1756,8 +1756,11 @@ async fn run_viewer(mut socket: WebSocket, channel: i64, uid: i64, app: Arc<App>
                 Ok(data) => {
                     if need_key {
                         let Ok(packet) = p::parse_media_packet(&data) else { continue; };
-                        if packet.kind != p::MediaKind::H264Keyframe { continue; }
-                        need_key = false;
+                        if packet.kind == p::MediaKind::H264Keyframe {
+                            need_key = false;
+                        } else if packet.kind != p::MediaKind::SystemAudioOpus {
+                            continue;
+                        }
                     }
                     if socket.send(Message::Binary(data)).await.is_err() { return; }
                 }

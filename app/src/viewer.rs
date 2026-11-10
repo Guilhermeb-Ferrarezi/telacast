@@ -78,16 +78,38 @@ fn run(
     let stream_stop_thread = stream_stop.clone();
     let force_keyframe = Arc::new(AtomicBool::new(false));
     let force_keyframe_reader = force_keyframe.clone();
+    let reader_audio_muted = audio_muted.clone();
+    let reader_audio_volume = audio_volume.clone();
     let reader = std::thread::spawn(move || {
         let mut dropping_until_keyframe = false;
+        let mut audio_player = None;
+        let mut audio_timeline: Option<(Instant, u64)> = None;
         while !reader_stop_thread.load(Ordering::Relaxed)
             && !stream_stop_thread.load(Ordering::Relaxed)
         {
             match ws.read() {
                 Ok(Message::Binary(data)) => {
-                    let kind = telacast_proto::parse_media_packet(&data)
-                        .ok()
-                        .map(|p| p.kind);
+                    let packet = telacast_proto::parse_media_packet(&data).ok();
+                    let kind = packet.as_ref().map(|p| p.kind);
+                    // Áudio não entra na fila do decoder H.264. Assim, uma fila de
+                    // vídeo cheia (ou um quadro caro de decodificar) não descarta
+                    // os pacotes Opus junto com os quadros até o próximo keyframe.
+                    if let Some(packet) = packet.filter(|p| p.kind == telacast_proto::MediaKind::SystemAudioOpus) {
+                        let (anchor, base_pts) = *audio_timeline.get_or_insert_with(|| (Instant::now(), packet.pts_us));
+                        if audio_player.is_none() {
+                            audio_player = crate::system_audio_playback::Player::new(
+                                reader_audio_muted.clone(),
+                                reader_audio_volume.clone(),
+                                anchor,
+                                base_pts,
+                            ).ok();
+                        }
+                        if let Some(player) = audio_player.as_mut() {
+                            player.mute(reader_audio_muted.load(Ordering::Relaxed));
+                            let _ = player.push(packet.pts_us, packet.payload);
+                        }
+                        continue;
+                    }
                     if dropping_until_keyframe {
                         if kind != Some(telacast_proto::MediaKind::H264Keyframe) {
                             continue;
@@ -134,7 +156,6 @@ fn run(
         reader: Some(reader),
     };
     let mut dec = Decoder::new()?;
-    let mut player = None;
     let mut timeline: Option<(Instant, u64)> = None;
     let mut pending_video = VecDeque::<(Instant, ColorImage)>::new();
     let mut waiting_for_keyframe = false;
@@ -194,21 +215,7 @@ fn run(
                             }
                         }
                     }
-                    telacast_proto::MediaKind::SystemAudioOpus => {
-                        if player.is_none() {
-                            player = crate::system_audio_playback::Player::new(
-                                audio_muted.clone(),
-                                audio_volume.clone(),
-                                anchor,
-                                base_pts,
-                            )
-                            .ok();
-                        }
-                        if let Some(player) = player.as_mut() {
-                            player.mute(audio_muted.load(Ordering::Relaxed));
-                            let _ = player.push(packet.pts_us, packet.payload);
-                        }
-                    }
+                    telacast_proto::MediaKind::SystemAudioOpus => {}
                 }
             }
         }
