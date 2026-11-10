@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 mod capture;
+mod call_sounds;
 mod gateway;
 mod files;
 mod gpu;
@@ -1341,9 +1342,25 @@ impl Session {
                         }
                     }
                     S2C::VoiceUpdate(st) => {
-                        let new_dm_call = st.user_id != self.me.id
-                            && self.snap.dms.iter().any(|dm| dm.channel_id == st.channel_id)
-                            && !self.voice.iter().any(|v| v.user_id == st.user_id && v.channel_id == st.channel_id);
+                        let dm_call = self.snap.dms.iter().any(|dm| dm.channel_id == st.channel_id);
+                        let had_anyone = self.voice.iter().any(|v| v.channel_id == st.channel_id);
+                        let had_self = self.voice.iter().any(|v| v.channel_id == st.channel_id && v.user_id == self.me.id);
+                        let had_peer = self.voice.iter().any(|v| v.channel_id == st.channel_id && v.user_id != self.me.id);
+                        let new_dm_call = dm_call && st.user_id != self.me.id && !had_self && !had_anyone;
+                        if dm_call {
+                            let effect = if new_dm_call {
+                                Some(call_sounds::Effect::Incoming)
+                            } else if st.user_id == self.me.id && !had_self {
+                                Some(if had_peer { call_sounds::Effect::Connected } else { call_sounds::Effect::Outgoing })
+                            } else if st.user_id != self.me.id && had_self && !had_peer {
+                                Some(call_sounds::Effect::Connected)
+                            } else {
+                                None
+                            };
+                            if let Some(effect) = effect {
+                                call_sounds::play(self.voice_out.clone(), effect);
+                            }
+                        }
                         if new_dm_call {
                             let caller = self.user_name_of(st.user_id);
                             self.toast = Some((format!("{caller} está te ligando"), Instant::now()));
@@ -1359,6 +1376,11 @@ impl Session {
                         }
                     }
                     S2C::VoiceLeft { user_id, channel_id } => {
+                        let dm_call = self.snap.dms.iter().any(|dm| dm.channel_id == channel_id);
+                        let had_self = self.voice.iter().any(|v| v.channel_id == channel_id && v.user_id == self.me.id);
+                        if dm_call && (user_id == self.me.id || had_self) {
+                            call_sounds::play(self.voice_out.clone(), call_sounds::Effect::Ended);
+                        }
                         self.voice.retain(|v| !(v.user_id == user_id && v.channel_id == channel_id));
                         if user_id == self.me.id {
                             self.voice_view = false;
