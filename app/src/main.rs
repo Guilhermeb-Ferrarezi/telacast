@@ -1358,7 +1358,19 @@ impl Session {
                                 None
                             };
                             if let Some(effect) = effect {
-                                call_sounds::play(self.voice_out.clone(), effect);
+                                match effect {
+                                    call_sounds::Effect::Incoming | call_sounds::Effect::Outgoing => {
+                                        call_sounds::ring(self.voice_out.clone(), effect);
+                                    }
+                                    call_sounds::Effect::Connected => {
+                                        call_sounds::stop();
+                                        call_sounds::play(self.voice_out.clone(), effect);
+                                    }
+                                    call_sounds::Effect::Ended => {
+                                        call_sounds::stop();
+                                        call_sounds::play(self.voice_out.clone(), effect);
+                                    }
+                                }
                             }
                         }
                         if new_dm_call {
@@ -1378,8 +1390,11 @@ impl Session {
                     S2C::VoiceLeft { user_id, channel_id } => {
                         let dm_call = self.snap.dms.iter().any(|dm| dm.channel_id == channel_id);
                         let had_self = self.voice.iter().any(|v| v.channel_id == channel_id && v.user_id == self.me.id);
-                        if dm_call && (user_id == self.me.id || had_self) {
-                            call_sounds::play(self.voice_out.clone(), call_sounds::Effect::Ended);
+                        if dm_call {
+                            call_sounds::stop();
+                            if user_id == self.me.id || had_self {
+                                call_sounds::play(self.voice_out.clone(), call_sounds::Effect::Ended);
+                            }
                         }
                         self.voice.retain(|v| !(v.user_id == user_id && v.channel_id == channel_id));
                         if user_id == self.me.id {
