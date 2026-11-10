@@ -377,6 +377,8 @@ struct Session {
     nav_i: usize,
     nav_moving: bool,
     voice_since: Option<Instant>,
+    /// Tentativa de ligação direta aguardando atendimento (canal, prazo, fui eu quem ligou).
+    dm_call_timeout: Option<(i64, Instant, bool)>,
     /// Volume de cada pessoa que ouço (0.0 a 2.0; ausente = 1.0).
     voice_volumes: HashMap<i64, f32>,
     /// Quem assiste a cada transmissão (o servidor manda; vale para o transmissor e para os espectadores).
@@ -535,6 +537,7 @@ impl Session {
             nav_i: 0,
             nav_moving: false,
             voice_since: None,
+            dm_call_timeout: None,
             voice_volumes: HashMap::new(),
             viewers: HashMap::new(),
             voice_focus: None,
@@ -1108,6 +1111,8 @@ impl Session {
                     self.viewers.clear();
                     self.voice_focus = None;
                     self.stop_voice_engine();
+                    self.dm_call_timeout = None;
+                    call_sounds::stop();
                     self.voice.clear();
                     self.voice_view = false;
                     self.voice_since = None;
@@ -1347,6 +1352,18 @@ impl Session {
                         let had_self = self.voice.iter().any(|v| v.channel_id == st.channel_id && v.user_id == self.me.id);
                         let had_peer = self.voice.iter().any(|v| v.channel_id == st.channel_id && v.user_id != self.me.id);
                         let new_dm_call = dm_call && st.user_id != self.me.id && !had_self && !had_anyone;
+                        if new_dm_call {
+                            self.dm_call_timeout = Some((st.channel_id, Instant::now() + Duration::from_secs(60), false));
+                        } else if dm_call && st.user_id == self.me.id && !had_self {
+                            self.dm_call_timeout = if had_peer {
+                                None
+                            } else {
+                                Some((st.channel_id, Instant::now() + Duration::from_secs(60), true))
+                            };
+                        } else if dm_call && st.user_id != self.me.id && had_self && !had_peer {
+                            // A outra pessoa atendeu: não é mais uma tentativa pendente.
+                            self.dm_call_timeout = None;
+                        }
                         if dm_call {
                             let effect = if new_dm_call {
                                 Some(call_sounds::Effect::Incoming)
@@ -1392,7 +1409,10 @@ impl Session {
                         let had_self = self.voice.iter().any(|v| v.channel_id == channel_id && v.user_id == self.me.id);
                         if dm_call {
                             call_sounds::stop();
-                            if user_id == self.me.id || had_self {
+                            if self.dm_call_timeout.is_some_and(|(pending_channel, _, _)| pending_channel == channel_id) {
+                                self.dm_call_timeout = None;
+                            }
+                            if user_id != self.me.id && had_self {
                                 call_sounds::play(self.voice_out.clone(), call_sounds::Effect::Ended);
                             }
                         }
@@ -1407,6 +1427,22 @@ impl Session {
                     }
                     S2C::Auth { .. } => {}
                 },
+            }
+        }
+        if let Some((channel, deadline, caller)) = self.dm_call_timeout {
+            let now = Instant::now();
+            if now >= deadline {
+                self.dm_call_timeout = None;
+                call_sounds::stop();
+                if caller && self.voice.iter().any(|v| v.channel_id == channel && v.user_id == self.me.id) {
+                    self.gw.send(C2S::VoiceLeave);
+                    call_sounds::play(self.voice_out.clone(), call_sounds::Effect::Ended);
+                    self.toast = Some(("A ligação expirou: ninguém atendeu em 1 minuto".into(), now));
+                } else {
+                    self.toast = Some(("Chamada perdida".into(), now));
+                }
+            } else {
+                self.ctx.request_repaint_after(deadline.saturating_duration_since(now));
             }
         }
         None
@@ -2865,6 +2901,14 @@ impl App {
                     s.voice_view = true;
                 }
                 Act::LeaveVoice => {
+                    let leaving_dm_call = s.my_voice().is_some_and(|voice| {
+                        s.snap.dms.iter().any(|dm| dm.channel_id == voice.channel_id)
+                    });
+                    if leaving_dm_call {
+                        s.dm_call_timeout = None;
+                        call_sounds::stop();
+                        call_sounds::play(s.voice_out.clone(), call_sounds::Effect::Ended);
+                    }
                     s.gw.send(C2S::VoiceLeave);
                     s.voice_view = false;
                     self.stop_publish();
