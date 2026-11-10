@@ -13,7 +13,8 @@ use tungstenite::Message;
 
 const MAX_VIDEO_BACKLOG_US: u64 = 250_000;
 const PRESENTATION_DELAY: Duration = Duration::from_millis(60);
-const INCOMING_PACKET_QUEUE: usize = 4;
+// 32 pacotes absorvem picos curtos a 144 FPS (~220 ms) sem uma fila longa.
+const INCOMING_PACKET_QUEUE: usize = 32;
 
 pub struct Handle {
     pub stop: Arc<AtomicBool>,
